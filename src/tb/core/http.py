@@ -1,13 +1,18 @@
-"""HTTP transport, behind a protocol so the client is testable without a network.
+"""HTTP transport, behind a protocol so callers are testable without a network.
 
-Keeping this separate is not ceremony. The entire M1 test suite — the rate
-governor under adversarial bursts, the schema-drift matrix, the reconciler's
-findings — runs against `RecordingTransport`, which means those properties are
-verified deterministically rather than against whatever a live demo account
-happened to hold that morning.
+Shared by the Trading 212 adapter and the market-data providers. Keeping it
+here rather than under `broker/` is not tidiness: the data layer must not
+import from the broker package, because the whole point of the symbol map is
+that these are two independent venues that happen to be joined.
 
-`httpx` lives in the `broker` extra and is imported lazily, so the core install
-and the M0 control plane stay dependency-light.
+Keeping the protocol separate at all is what makes the test suites
+deterministic. The rate governor under adversarial bursts, the schema-drift
+matrix, the reconciler's findings, and every provider conformance test run
+against `RecordingTransport` rather than against whatever a live account or a
+vendor endpoint happened to return that morning.
+
+`httpx` is imported lazily, so the core install and the M0 control plane stay
+dependency-light.
 """
 
 from __future__ import annotations
@@ -48,7 +53,18 @@ class Transport(Protocol):
 class HttpxTransport:
     """The real transport."""
 
-    def __init__(self, *, verify: bool | str = True) -> None:
+    # Yahoo's chart endpoint is user-agent sensitive and will serve different
+    # content — or nothing — to something that looks automated. That is one of
+    # the costs of depending on a reverse-engineered API, and it is worth
+    # stating out loud rather than discovering as an empty response.
+    DEFAULT_USER_AGENT = "tradingbot/0.1 (+https://github.com/yashwanthmh/tradingbot)"
+    BROWSER_USER_AGENT = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    def __init__(self, *, verify: bool | str = True, user_agent: str | None = None) -> None:
+        user_agent = user_agent or self.DEFAULT_USER_AGENT
         try:
             import httpx
         except ImportError as exc:  # pragma: no cover - depends on install extras
@@ -63,7 +79,7 @@ class HttpxTransport:
         self._client = httpx.Client(
             verify=verify,
             follow_redirects=False,
-            headers={"User-Agent": "tradingbot/0.1 (+https://github.com/yashwanthmh/tradingbot)"},
+            headers={"User-Agent": user_agent},
         )
 
     def request(
@@ -76,7 +92,7 @@ class HttpxTransport:
         json_body: Any = None,
         timeout: float = 20.0,
     ) -> HttpResponse:
-        from tb.broker.t212.errors import TransportError
+        from tb.core.errors import TransportError
 
         try:
             response = self._client.request(

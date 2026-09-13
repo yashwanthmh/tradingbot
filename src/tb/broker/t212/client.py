@@ -53,8 +53,8 @@ from tb.broker.t212.models import (
 )
 from tb.broker.t212.ratelimit import RateGovernor, RateLimitHeaders
 from tb.broker.t212.raw_archive import RawArchive
-from tb.broker.t212.transport import HttpxTransport, Transport
 from tb.core.clock import now_utc
+from tb.core.http import HttpxTransport, Transport
 from tb.core.ids import new_id
 from tb.ledger.events import Actor, BrokerRateLimitedPayload, EventType
 from tb.ledger.store import Ledger

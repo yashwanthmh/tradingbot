@@ -18,17 +18,15 @@ from __future__ import annotations
 
 from tb.core.errors import HaltRequired, TbError
 
+# Re-exported: the transport is shared with the data layer, so the error itself
+# lives in tb.core.errors. Kept importable here because this is where broker
+# code looks for it. The redundant-looking `as` is the explicit re-export form —
+# without it a caller importing it from here is a type error.
+from tb.core.errors import TransportError as TransportError
+
 
 class BrokerError(TbError):
     """Base for everything the broker adapter raises."""
-
-
-class TransportError(BrokerError):
-    """The request did not complete. Retryable; the account is unchanged."""
-
-    def __init__(self, detail: str, *, endpoint: str | None = None) -> None:
-        super().__init__(f"transport failure{f' on {endpoint}' if endpoint else ''}: {detail}")
-        self.endpoint = endpoint
 
 
 class AuthError(BrokerError):

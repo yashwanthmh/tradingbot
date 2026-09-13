@@ -30,10 +30,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
+from zoneinfo import ZoneInfo
 
 from tb.core.canonical import hash_payload
 from tb.core.errors import TbError
@@ -99,6 +100,37 @@ class Session(StrEnum):
     REGULAR = "regular"
     EXTENDED = "extended"
     UNKNOWN = "unknown"
+
+
+US_EASTERN = ZoneInfo("America/New_York")
+US_REGULAR_OPEN = time(9, 30)
+US_REGULAR_CLOSE = time(16, 0)
+
+
+def classify_us_session(bar_open: datetime, resolution: Resolution) -> Session:
+    """Regular or extended, by Eastern clock time.
+
+    Deliberately clock-based rather than calendar-based. The US session moves
+    with Eastern DST, not with UTC, so the comparison has to happen in Eastern
+    time or it is an hour wrong for four months of the year — and a bar
+    misfiled as extended is excluded from the cross-venue price check, which is
+    how a symbol quietly stops being tradable.
+
+    Two known imprecisions, both benign, both resolved once `calendar.py` lands:
+    a half-day closes at 13:00 ET, and this would call 13:00-16:00 regular —
+    but there are no regular prints in that span to misfile. A market holiday
+    is likewise called regular, and again produces no bars. Neither can
+    manufacture a bar; they can only mislabel one that does not exist.
+    """
+    if resolution is Resolution.DAILY:
+        # A daily bar spans the session by definition.
+        return Session.REGULAR
+    if bar_open.tzinfo is None:
+        raise DataError("bar_open must be timezone-aware to classify its session")
+    eastern = bar_open.astimezone(US_EASTERN).timetz().replace(tzinfo=None)
+    if US_REGULAR_OPEN <= eastern < US_REGULAR_CLOSE:
+        return Session.REGULAR
+    return Session.EXTENDED
 
 
 class Provenance(StrEnum):
@@ -305,6 +337,22 @@ class Bar:
             raise DataError("now must be timezone-aware")
         return (now - self.available_at_utc).total_seconds()
 
+    def is_settled_at(self, now: datetime) -> bool:
+        """Whether this bar's period has finished.
+
+        A "latest bar" endpoint will happily hand back the bar currently being
+        formed. Its close is whatever the last print was a moment ago, its high
+        and low are partial, and its volume is a fraction of the final figure —
+        yet it is structurally indistinguishable from a finished bar once
+        stored. Every ingest path checks this, and an unsettled bar is dropped
+        rather than stored and corrected later: a "correction" that replaces a
+        partial bar with its final version is recorded as a revision, which
+        would swamp the signal that revision detection exists to find.
+        """
+        if now.tzinfo is None:
+            raise DataError("now must be timezone-aware")
+        return self.bar_close_utc <= now
+
     @property
     def typical_price(self) -> Decimal:
         return (self.high + self.low + self.close) / Decimal(3)
@@ -373,27 +421,56 @@ class Bar:
 
 
 def normalise_bar_open(
-    timestamp: datetime, *, convention: TimestampConvention, resolution: Resolution
+    timestamp: datetime,
+    *,
+    convention: TimestampConvention,
+    resolution: Resolution,
+    session_tz: ZoneInfo | None = None,
 ) -> datetime:
     """Put a provider's timestamp onto the bar-open axis.
 
     An `AMBIGUOUS` convention raises. That is the point: a provider whose
     stamping we have not established cannot be ingested, because the failure
     mode of guessing is a uniform one-bar lookahead rather than an error.
+
+    **Daily bars are anchored to midnight UTC of their session date**, which is
+    not cosmetic. Vendors stamp a daily bar somewhere inside its session — Yahoo
+    at the market open, Alpaca at local midnight — and `Resolution.DAILY` has a
+    24-hour duration, so an open-stamped daily bar would have a *close* 24 hours
+    later. A Monday bar stamped 14:30 UTC would therefore not become visible
+    until 14:30 Tuesday, an hour into the next session: a daily strategy would
+    run a full day behind, unable to see the close it was meant to decide on.
+    Anchoring at midnight puts `bar_close` at the following midnight UTC, which
+    is 19:00-20:00 Eastern on the session day — safely after the 16:00 close and
+    before the next pre-open, which is exactly the window a daily decision needs.
+
+    `session_tz` is the exchange's timezone, used only to decide *which* date a
+    stamp belongs to. Defaults to UTC, which is right for every market whose
+    session does not cross local midnight. It does for Asian venues, where a
+    stamp of 00:00 JST is 15:00 UTC the previous day — the universe is US
+    large-caps, but a provider serving Tokyo must pass its timezone in.
     """
     if timestamp.tzinfo is None:
         raise DataError("provider timestamps must be timezone-aware")
+    if convention is TimestampConvention.AMBIGUOUS:
+        raise AmbiguousTimestampError(
+            f"provider declares an ambiguous timestamp convention for {resolution.value} "
+            "bars. Refusing to ingest: treating a close-stamped bar as open-stamped shifts "
+            "every feature by one bar of future information, which looks like alpha."
+        )
     aware = timestamp.astimezone(UTC)
+
+    if resolution is Resolution.DAILY:
+        # The open/close convention is deliberately not applied here. A daily
+        # stamp falls inside its own session under either convention, so the
+        # session date is read off the stamp directly; shifting by a day first
+        # would move an open-stamped Monday bar to Sunday.
+        local_date = aware.astimezone(session_tz or UTC).date()
+        return datetime(local_date.year, local_date.month, local_date.day, tzinfo=UTC)
 
     if convention is TimestampConvention.BAR_OPEN:
         return aware
-    if convention is TimestampConvention.BAR_CLOSE:
-        return aware - resolution.duration
-    raise AmbiguousTimestampError(
-        f"provider declares an ambiguous timestamp convention for {resolution.value} bars. "
-        "Refusing to ingest: treating a close-stamped bar as open-stamped shifts every "
-        "feature by one bar of future information, which looks like alpha."
-    )
+    return aware - resolution.duration
 
 
 def knowledge_time(
@@ -446,6 +523,13 @@ class ProviderCapabilities:
     # the consolidated last price. Recorded because it bounds what any strategy
     # built on this feed can honestly claim.
     consolidated_tape: bool = False
+    # Whether the OHLC values are what the venue printed, or already adjusted
+    # by the vendor. Yahoo's chart endpoint back-adjusts historical OHLC for
+    # splits and gives no way to ask for raw, so a "raw price store" is not
+    # fully achievable from it — the stored value is the vendor's *current*
+    # adjusted view, which is exactly why revision detection matters more
+    # there. Alpaca accepts `adjustment=raw` and means it.
+    returns_raw_prices: bool = False
     note: str = ""
 
     def delay_for(self, resolution: Resolution) -> float:

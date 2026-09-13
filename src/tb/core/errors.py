@@ -48,6 +48,18 @@ class LedgerUnwritableError(LedgerError):
     """
 
 
+class TransportError(TbError):
+    """An HTTP request did not complete. Retryable; nothing changed remotely.
+
+    Lives here rather than beside a particular adapter because the transport is
+    shared between the broker and the market-data providers.
+    """
+
+    def __init__(self, detail: str, *, endpoint: str | None = None) -> None:
+        super().__init__(f"transport failure{f' on {endpoint}' if endpoint else ''}: {detail}")
+        self.endpoint = endpoint
+
+
 class HaltRequired(TbError):
     """The system must stop trading now.
 
