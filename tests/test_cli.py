@@ -272,3 +272,145 @@ def test_version() -> None:
     result = _run(["version"])
     assert result.exit_code == 0
     assert "tradingbot" in _out(result)
+
+
+# --------------------------------------------------------------------------
+# M1: broker, symbols, reconcile
+# --------------------------------------------------------------------------
+
+
+class TestBrokerCommands:
+    def test_limits_reports_the_table_and_the_arithmetic(self, env: dict[str, Any]) -> None:
+        """The universe ceiling is derived, not chosen.
+
+        Protective stops are limit-class orders at one per two seconds, so this
+        command is where that constraint becomes visible instead of buried.
+        """
+        _run(["init", *env["args"]])
+        result = _run(["broker", "limits", *env["args"]])
+        assert result.exit_code == 0
+        out = _out(result)
+        assert "/equity/orders/market" in out or "orders/market" in out
+        assert "not probed" in out
+        assert "governor budget for protection" in out
+
+    def test_probe_without_credentials_explains_the_practice_mode_trap(
+        self, env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(DEMO_KEY_VAR, raising=False)
+        monkeypatch.delenv(LIVE_KEY_VAR, raising=False)
+        _run(["init", *env["args"]])
+        result = _run(["broker", "probe", *env["args"]])
+        assert result.exit_code == 2
+        assert "Practice mode" in _out(result)
+
+    def test_probe_refuses_a_live_key_by_default(
+        self, env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """There is no reason to characterise an API with real money."""
+        monkeypatch.delenv(DEMO_KEY_VAR, raising=False)
+        monkeypatch.setenv(LIVE_KEY_VAR, "live-key-abcd1234")
+        _run(["init", *env["args"]])
+        result = _run(["broker", "probe", *env["args"]])
+        assert result.exit_code == 2
+        assert "real-money" in _out(result)
+
+    def test_drift_is_empty_on_a_fresh_ledger(self, env: dict[str, Any]) -> None:
+        _run(["init", *env["args"]])
+        result = _run(["broker", "drift", *env["args"]])
+        assert result.exit_code == 0
+        assert "no unparsed responses" in _out(result)
+
+    def test_replay_of_an_unknown_message_exits_one(self, env: dict[str, Any]) -> None:
+        _run(["init", *env["args"]])
+        result = _run(["broker", "replay", "msg_nope", *env["args"]])
+        assert result.exit_code == 1
+
+
+class TestSymbolCommands:
+    def _seed(self, env: dict[str, Any]) -> None:
+        """Cache a couple of instruments so the audit needs no credentials."""
+        from decimal import Decimal
+
+        from tb.broker.port import Instrument
+        from tb.broker.t212.probe import cache_instruments
+        from tb.config.loader import load_hard_limits
+        from tb.ledger.store import Ledger
+
+        pinned = load_hard_limits(env["limits"])
+        with Ledger(env["db"], config_hash=pinned.config_hash) as ledger:
+            cache_instruments(
+                ledger,
+                [
+                    Instrument(
+                        ticker="AAPL_US_EQ",
+                        currency_code="USD",
+                        instrument_type="STOCK",
+                        min_trade_quantity=Decimal("0.1"),
+                    ),
+                    Instrument(ticker="VODl_EQ", currency_code="GBX", instrument_type="STOCK"),
+                ],
+            )
+
+    def test_audit_reports_nothing_tradable_before_verification(self, env: dict[str, Any]) -> None:
+        """The correct default for a join this dangerous.
+
+        Derivation proposes a symbol; only a price comparison against the
+        broker's own quote confirms it, and that needs the M2 data layer.
+        """
+        _run(["init", *env["args"]])
+        self._seed(env)
+        result = _run(["symbols", "audit", *env["args"]])
+        assert result.exit_code == 0
+        out = _out(result)
+        assert "verified (tradable)" in out
+        assert "nothing is verified" in out
+        assert "Exits are never gated" in out
+
+    def test_audit_maps_a_us_listing_and_refuses_a_non_us_one_for_alpaca(
+        self, env: dict[str, Any]
+    ) -> None:
+        _run(["init", *env["args"]])
+        self._seed(env)
+        _run(["symbols", "audit", "--provider", "alpaca", *env["args"]])
+
+        shown = _run(["symbols", "show", "AAPL_US_EQ", *env["args"]])
+        assert "AAPL" in _out(shown)
+
+        unmapped = _run(["symbols", "show", "VODl_EQ", *env["args"]])
+        assert unmapped.exit_code == 0
+        assert "none" in _out(unmapped)
+
+    def test_audit_maps_a_london_listing_for_yfinance(self, env: dict[str, Any]) -> None:
+        _run(["init", *env["args"]])
+        self._seed(env)
+        _run(["symbols", "audit", "--provider", "yfinance", *env["args"]])
+        shown = _run(["symbols", "show", "VODl_EQ", *env["args"]])
+        assert "VOD.L" in _out(shown)
+
+    def test_show_reports_the_asymmetric_gate(self, env: dict[str, Any]) -> None:
+        _run(["init", *env["args"]])
+        self._seed(env)
+        _run(["symbols", "audit", *env["args"]])
+        result = _run(["symbols", "show", "AAPL_US_EQ", *env["args"]])
+        out = _out(result)
+        assert "may open a position" in out
+        assert "may close a position" in out
+        assert "never gated" in out
+
+    def test_show_of_an_unknown_ticker_exits_one(self, env: dict[str, Any]) -> None:
+        _run(["init", *env["args"]])
+        result = _run(["symbols", "show", "NOSUCH_EQ", *env["args"]])
+        assert result.exit_code == 1
+        assert "tb symbols audit" in _out(result)
+
+
+class TestReconcileCommand:
+    def test_reconcile_without_credentials_exits_two(
+        self, env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(DEMO_KEY_VAR, raising=False)
+        monkeypatch.delenv(LIVE_KEY_VAR, raising=False)
+        _run(["init", *env["args"]])
+        result = _run(["reconcile", *env["args"]])
+        assert result.exit_code == 2

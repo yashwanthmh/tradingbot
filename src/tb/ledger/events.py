@@ -43,6 +43,7 @@ class AggregateType(StrEnum):
     RUN = "run"
     CONFIG = "config"
     SAFETY = "safety"
+    BROKER = "broker"
     STRATEGY = "strategy"
     DECISION = "decision"
     ORDER = "order"
@@ -75,6 +76,18 @@ class EventType(StrEnum):
     KILLSWITCH_ENGAGED = "killswitch.engaged"
     KILLSWITCH_RELEASED = "killswitch.released"
     HEARTBEAT_STALE = "heartbeat.stale"
+
+    # --- broker (M1) ---
+    BROKER_PROBED = "broker.probed"
+    BROKER_SCHEMA_DRIFT = "broker.schema_drift"
+    BROKER_RATE_LIMITED = "broker.rate_limited"
+    BROKER_SNAPSHOT_TAKEN = "broker.snapshot_taken"
+    RECONCILE_COMPLETED = "reconcile.completed"
+
+    # --- symbol mapping / cross-venue (M1) ---
+    SYMBOLS_AUDITED = "symbols.audited"
+    SYMBOL_BLOCKED = "symbol.blocked"
+    SYMBOL_UNBLOCKED = "symbol.unblocked"
 
 
 class EventPayload(BaseModel):
@@ -228,6 +241,116 @@ class HeartbeatStalePayload(EventPayload):
 
 
 # --------------------------------------------------------------------------
+# Broker
+# --------------------------------------------------------------------------
+
+
+class BrokerProbedPayload(EventPayload):
+    """What the capability probe actually found.
+
+    The rate limits and auth format in the code are conservative guesses —
+    Trading 212's API is in beta and its docs are not reliably reachable. This
+    event is the record of what the live endpoint really does, so the adapter
+    is built against observed reality rather than a reconstruction.
+    """
+
+    environment: str
+    auth_scheme: str
+    endpoints_probed: int
+    endpoints_ok: int
+    base_currency: str | None = None
+    observations: list[dict[str, Any]] = Field(default_factory=list)
+    disagreements: list[str] = Field(default_factory=list)
+
+
+class BrokerSchemaDriftPayload(EventPayload):
+    """A field the system actually consumes changed shape.
+
+    Unknown *extra* fields are ignored by design — taking the bot down because
+    the broker added a field would be worse than not reading it. But a consumed
+    field that went missing, went null, or changed type is a halt: the
+    alternative is trading on a number we guessed at.
+    """
+
+    endpoint: str
+    url_path: str
+    msg_id: str
+    model: str
+    error_detail: str
+    status_code: int | None = None
+
+
+class BrokerRateLimitedPayload(EventPayload):
+    endpoint: str
+    status_code: int
+    retry_after_seconds: float | None = None
+    observed_limit: int | None = None
+    observed_period_seconds: int | None = None
+    configured_limit: int | None = None
+    configured_period_seconds: int | None = None
+
+
+class BrokerSnapshotPayload(EventPayload):
+    """A point-in-time read of what the account actually holds."""
+
+    snap_id: str
+    environment: str
+    n_positions: int
+    n_open_orders: int
+    currency: str | None = None
+    free_cash: Decimal | None = None
+    total_value: Decimal | None = None
+    invested: Decimal | None = None
+    max_price_disagreement_bps: float | None = None
+
+
+class ReconcileCompletedPayload(EventPayload):
+    recon_id: str
+    verdict: str
+    n_unknown_intents: int
+    n_orphan_orders: int
+    n_position_mismatches: int
+    n_unprotected_positions: int
+    n_price_disagreements: int
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+    actions: list[str] = Field(default_factory=list)
+    dry_run: bool = False
+
+
+# --------------------------------------------------------------------------
+# Symbol mapping
+# --------------------------------------------------------------------------
+
+
+class SymbolsAuditedPayload(EventPayload):
+    provider: str
+    n_instruments: int
+    n_mapped: int
+    n_unmapped: int
+    n_low_confidence: int
+    n_blocked: int
+    unmapped_sample: list[str] = Field(default_factory=list)
+
+
+class SymbolBlockedPayload(EventPayload):
+    """A symbol stopped accepting new entries.
+
+    The execution venue is not the data venue, so a signal can be computed on
+    one venue's price and filled at another's. Beyond the configured band that
+    divergence means something is wrong — a stale feed, a corporate action, or
+    a mismapped ticker — and none of those are conditions to open a position in.
+    """
+
+    t212_ticker: str
+    data_symbol: str
+    reason: str
+    disagreement_bps: float | None = None
+    limit_bps: float | None = None
+    broker_price: Decimal | None = None
+    data_price: Decimal | None = None
+
+
+# --------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------
 
@@ -244,6 +367,14 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.KILLSWITCH_ENGAGED: KillswitchPayload,
     EventType.KILLSWITCH_RELEASED: KillswitchPayload,
     EventType.HEARTBEAT_STALE: HeartbeatStalePayload,
+    EventType.BROKER_PROBED: BrokerProbedPayload,
+    EventType.BROKER_SCHEMA_DRIFT: BrokerSchemaDriftPayload,
+    EventType.BROKER_RATE_LIMITED: BrokerRateLimitedPayload,
+    EventType.BROKER_SNAPSHOT_TAKEN: BrokerSnapshotPayload,
+    EventType.RECONCILE_COMPLETED: ReconcileCompletedPayload,
+    EventType.SYMBOLS_AUDITED: SymbolsAuditedPayload,
+    EventType.SYMBOL_BLOCKED: SymbolBlockedPayload,
+    EventType.SYMBOL_UNBLOCKED: SymbolBlockedPayload,
 }
 
 # The default aggregate each event type is filed under, so callers do not have
@@ -261,6 +392,14 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     EventType.KILLSWITCH_ENGAGED: AggregateType.SAFETY,
     EventType.KILLSWITCH_RELEASED: AggregateType.SAFETY,
     EventType.HEARTBEAT_STALE: AggregateType.SAFETY,
+    EventType.BROKER_PROBED: AggregateType.BROKER,
+    EventType.BROKER_SCHEMA_DRIFT: AggregateType.BROKER,
+    EventType.BROKER_RATE_LIMITED: AggregateType.BROKER,
+    EventType.BROKER_SNAPSHOT_TAKEN: AggregateType.BROKER,
+    EventType.RECONCILE_COMPLETED: AggregateType.BROKER,
+    EventType.SYMBOLS_AUDITED: AggregateType.DATA,
+    EventType.SYMBOL_BLOCKED: AggregateType.DATA,
+    EventType.SYMBOL_UNBLOCKED: AggregateType.DATA,
 }
 
 

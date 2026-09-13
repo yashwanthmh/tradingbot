@@ -57,6 +57,28 @@ jobs:
           uv run tb resume -r "CI drill complete"
           uv run tb ledger verify
 
+      - name: Broker adapter smoke test (no network)
+        env:
+          TB_VAR_DIR: var
+        run: |
+          # These read the local endpoint table and archive; none of them
+          # reaches the network.
+          uv run tb broker limits
+          uv run tb broker drift
+
+      - name: Probe refuses to characterise a real-money account
+        env:
+          TB_VAR_DIR: var
+          T212_LIVE_API_KEY: ci-placeholder-live-key
+        run: |
+          # There is no reason to characterise an API using real money, so the
+          # refusal is structural. If this ever succeeds, that guard is gone.
+          if uv run tb broker probe; then
+            echo "::error::tb broker probe ran against a live key — the demo-only guard is broken"
+            exit 1
+          fi
+          echo "probe correctly refused a live key"
+
       - name: Verify the ledger survives a tamper attempt
         env:
           TB_VAR_DIR: var

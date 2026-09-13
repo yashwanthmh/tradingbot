@@ -27,7 +27,7 @@ from pathlib import Path
 
 from tb.core.canonical import GENESIS_HASH
 
-LEDGER_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
 
 # --------------------------------------------------------------------------
 # Tables
@@ -130,6 +130,137 @@ _TABLES: tuple[str, ...] = (
         value TEXT NOT NULL
     )
     """,
+    # ---------------------------------------------------------------- v2 (M1)
+    # Every broker response, raw. Trading 212's API is in beta and its docs are
+    # not reliably reachable, so the archive is how a shape change six weeks
+    # from now gets diagnosed and replayed instead of guessed at. `parse_error`
+    # is populated on drift, which makes this table the forensic record.
+    """
+    CREATE TABLE IF NOT EXISTS broker_messages (
+        msg_id             TEXT    PRIMARY KEY,
+        run_id             TEXT,
+        intent_id          TEXT,
+        environment        TEXT    NOT NULL,
+        endpoint           TEXT    NOT NULL,
+        method             TEXT    NOT NULL,
+        url_path           TEXT    NOT NULL,
+        status_code        INTEGER,
+        ratelimit_json     TEXT,
+        request_json       TEXT,
+        raw_body           TEXT,
+        received_at        TEXT    NOT NULL,
+        duration_ms        REAL,
+        parse_ok           INTEGER NOT NULL,
+        parse_error        TEXT
+    )
+    """,
+    # Instrument metadata, cached because /instruments is rate limited to about
+    # one call per fifty seconds and returns a very large payload.
+    """
+    CREATE TABLE IF NOT EXISTS instruments (
+        ticker             TEXT    PRIMARY KEY,
+        instrument_type    TEXT,
+        isin               TEXT,
+        currency_code      TEXT,
+        short_name         TEXT,
+        full_name          TEXT,
+        exchange_id        INTEGER,
+        working_schedule_id INTEGER,
+        min_trade_quantity TEXT,
+        max_open_quantity  TEXT,
+        added_on           TEXT,
+        fetched_at         TEXT    NOT NULL,
+        raw_json           TEXT
+    )
+    """,
+    # The bridge between the execution venue and the data venue. A mismapping
+    # here produces a perfectly valid-looking signal filled on the wrong
+    # instrument, so the mapping is stored, audited and versioned rather than
+    # derived on the fly from a string transform.
+    """
+    CREATE TABLE IF NOT EXISTS symbol_map (
+        t212_ticker        TEXT    PRIMARY KEY,
+        data_symbol        TEXT    NOT NULL,
+        provider           TEXT    NOT NULL,
+        currency_code      TEXT,
+        exchange_hint      TEXT,
+        confidence         TEXT    NOT NULL,
+        derivation         TEXT    NOT NULL,
+        verified_at        TEXT,
+        last_disagreement_bps REAL,
+        last_checked_at    TEXT,
+        blocked            INTEGER NOT NULL DEFAULT 0,
+        blocked_reason     TEXT
+    )
+    """,
+    # Both the broker's view and ours, side by side, with the divergence
+    # between the data feed and the broker's own quote recorded per symbol.
+    """
+    CREATE TABLE IF NOT EXISTS positions_snapshot (
+        snap_id            TEXT    NOT NULL,
+        run_id             TEXT,
+        ts                 TEXT    NOT NULL,
+        source             TEXT    NOT NULL,
+        ticker             TEXT    NOT NULL,
+        quantity           TEXT    NOT NULL,
+        average_price      TEXT,
+        current_price_broker TEXT,
+        current_price_data TEXT,
+        price_disagreement_bps REAL,
+        ppl                TEXT,
+        initial_fill_date  TEXT,
+        raw_json           TEXT,
+        PRIMARY KEY (snap_id, ticker)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cash_snapshot (
+        snap_id   TEXT PRIMARY KEY,
+        run_id    TEXT,
+        ts        TEXT NOT NULL,
+        currency  TEXT,
+        free      TEXT,
+        total     TEXT,
+        invested  TEXT,
+        ppl       TEXT,
+        result    TEXT,
+        blocked   TEXT,
+        pie_cash  TEXT,
+        raw_json  TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS reconciliations (
+        recon_id                TEXT PRIMARY KEY,
+        run_id                  TEXT,
+        started_at              TEXT NOT NULL,
+        finished_at             TEXT,
+        verdict                 TEXT,
+        n_unknown_intents       INTEGER NOT NULL DEFAULT 0,
+        n_orphan_orders         INTEGER NOT NULL DEFAULT 0,
+        n_position_mismatches   INTEGER NOT NULL DEFAULT 0,
+        n_unprotected_positions INTEGER NOT NULL DEFAULT 0,
+        n_price_disagreements   INTEGER NOT NULL DEFAULT 0,
+        findings_json           TEXT,
+        actions_json            TEXT
+    )
+    """,
+    # What the probe actually observed, per endpoint. The rate limits in the
+    # code are conservative guesses until this table says otherwise.
+    """
+    CREATE TABLE IF NOT EXISTS endpoint_observations (
+        endpoint          TEXT PRIMARY KEY,
+        environment       TEXT NOT NULL,
+        observed_limit    INTEGER,
+        observed_period_s INTEGER,
+        configured_limit  INTEGER,
+        configured_period_s INTEGER,
+        agrees            INTEGER,
+        last_status       INTEGER,
+        last_seen_at      TEXT NOT NULL,
+        note              TEXT
+    )
+    """,
 )
 
 # --------------------------------------------------------------------------
@@ -180,6 +311,14 @@ _INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_event_log_ts ON event_log (ts_utc)",
     "CREATE INDEX IF NOT EXISTS ix_halts_open ON halts (cleared_at)",
     "CREATE INDEX IF NOT EXISTS ix_chain_anchor_seq ON chain_anchor (seq)",
+    # v2 (M1)
+    "CREATE INDEX IF NOT EXISTS ix_broker_messages_endpoint "
+    "ON broker_messages (endpoint, received_at)",
+    "CREATE INDEX IF NOT EXISTS ix_broker_messages_intent ON broker_messages (intent_id)",
+    "CREATE INDEX IF NOT EXISTS ix_broker_messages_drift "
+    "ON broker_messages (parse_ok, received_at)",
+    "CREATE INDEX IF NOT EXISTS ix_positions_snapshot_ts ON positions_snapshot (ts)",
+    "CREATE INDEX IF NOT EXISTS ix_symbol_map_blocked ON symbol_map (blocked)",
 )
 
 

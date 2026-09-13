@@ -45,6 +45,26 @@ app = typer.Typer(
 ledger_app = typer.Typer(help="Inspect and verify the audit ledger.", no_args_is_help=True)
 app.add_typer(ledger_app, name="ledger")
 
+# M1: the broker adapter, symbol map and reconciler.
+from tb.cli_broker import broker_app, reconcile_command, symbols_app  # noqa: E402
+
+app.add_typer(broker_app, name="broker")
+app.add_typer(symbols_app, name="symbols")
+
+
+@app.command("reconcile")
+def reconcile(
+    limits: Annotated[Path | None, typer.Option("--limits", show_default=False)] = None,
+    db: Annotated[Path | None, typer.Option("--db", show_default=False)] = None,
+) -> None:
+    """Establish what the account actually holds, and report what disagrees.
+
+    Read-only in M1: it finds every discrepancy and can repair none of them.
+    Repair arrives in M4, behind the risk engine.
+    """
+    reconcile_command(limits=limits, db=db, dry_run=True)
+
+
 # Rich falls back to 80 columns when output is not a terminal, which mangles the
 # things this CLI exists to print: absolute paths, hashes, dotted event names.
 # Use the real terminal width when there is one, and something roomier when the

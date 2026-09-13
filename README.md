@@ -106,6 +106,15 @@ with which observed values against which limits, filled at what price with which
 tb replay --fill <fill_id>     # reconstruct the entire decision from the ledger
 ```
 
+Every broker response is archived raw as well, including failures. For a beta
+API whose documentation is not reliably reachable, that archive is the
+difference between diagnosing a shape change and guessing at one:
+
+```bash
+tb broker drift                # responses that stopped parsing
+tb broker replay <msg_id>      # the exact body that arrived
+```
+
 ## Status
 
 Built in milestones, ordered so the project-killing unknowns die first — *can I trust the
@@ -114,7 +123,7 @@ data*, then *can I reconcile broker state*, then *is there any edge after costs*
 | | Milestone | State |
 |---|---|---|
 | M0 | Ledger, hard limits, kill switch, run state | **done** |
-| M1 | Broker adapter (read-only), rate governor, reconciler, symbol map | |
+| M1 | Broker adapter (read-only), rate governor, reconciler, symbol map | **done** |
 | M2 | Point-in-time data layer, provider bake-off | |
 | M3 | Cost model, non-cheating backtester, strategy DSL | |
 | M4 | Risk engine, live loop, crash drills | |
@@ -129,10 +138,30 @@ data*, then *can I reconcile broker state*, then *is there any edge after costs*
 ```bash
 uv sync --all-extras
 cp .env.example .env          # then fill in your keys
-tb doctor                     # checks limits, permissions, secrets hygiene
 tb init                       # creates the ledger and writes the genesis event
+tb doctor                     # checks limits, permissions, secrets hygiene
 tb status
 ```
+
+Then characterise the API against your **demo** account. Everything in the
+endpoint table and the response models is a reconstruction — the official
+reference was not reachable when this was built — so the probe is how those
+assumptions become observations:
+
+```bash
+tb broker probe               # ~150s: shapes, rate limits, auth header format
+tb broker limits              # configured vs observed, and what it implies
+tb symbols audit              # Trading 212 tickers -> market-data symbols
+tb reconcile                  # what the account actually holds
+```
+
+`tb broker probe` refuses to run against a real-money account. It takes a
+couple of minutes because the rate governor assumes its budget is spent on a
+cold start, so the first call to a one-per-fifty-seconds endpoint waits a full
+period — it prints progress so you can tell it apart from a hang.
+
+Nothing in M1 can place or cancel an order, and that is enforced rather than
+trusted: the client rejects any endpoint outside its read-only set.
 
 Trading 212 issues a **separate API key per environment**, and the app must be switched to
 Practice mode *before* you generate the demo key or you will get a live one. The two keys

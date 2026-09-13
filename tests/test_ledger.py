@@ -31,6 +31,7 @@ from tb.ledger.events import (
     GenesisPayload,
     RunStartedPayload,
 )
+from tb.ledger.schema import LEDGER_SCHEMA_VERSION
 from tb.ledger.store import Ledger
 from tb.ledger.verify import FindingKind, verify_chain
 
@@ -504,7 +505,7 @@ class TestReading:
             row = led.get(1)
         assert row is not None
         assert row["config_hash"] == pinned.config_hash
-        assert row["schema_version"] == 1
+        assert row["schema_version"] == LEDGER_SCHEMA_VERSION
 
     def test_read_only_ledger_refuses_writes(self, ledger: Ledger, ledger_path: Path) -> None:
         ledger.close()
