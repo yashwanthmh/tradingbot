@@ -1,0 +1,40 @@
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# Runtime state: ledger DBs, kill switch, heartbeats, raw API archives
+var/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Market data cache
+data/bars/
+data/snapshots/
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

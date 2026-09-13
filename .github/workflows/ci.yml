@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --all-extras
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Type-check
+        run: uv run mypy
+
+      # CI runs as a non-root user, so the permission-dependent safety checks
+      # that a root development container has to skip actually execute here:
+      # the unreadable-kill-switch path and the writable-limits-file report.
+      - name: Test
+        run: uv run pytest -v
+
+      - name: Control plane smoke test
+        env:
+          TB_VAR_DIR: var
+          T212_DEMO_API_KEY: ci-placeholder-key-not-real
+        run: |
+          uv run tb init
+          uv run tb doctor
+          uv run tb status
+          uv run tb ledger anchor --path var/chain-heads.jsonl
+          uv run tb ledger verify
+          uv run tb halt -r "CI drill"
+          uv run tb status
+          uv run tb resume -r "CI drill complete"
+          uv run tb ledger verify
+
+      - name: Verify the ledger survives a tamper attempt
+        env:
+          TB_VAR_DIR: var
+        run: |
+          # Prove the alarm fires, not just that the lock holds. Drop the
+          # append-only triggers the way a real adversary with file access
+          # would, edit a row, and require `tb ledger verify` to exit non-zero.
+          python - <<'PY'
+          import sqlite3
+          conn = sqlite3.connect("var/ledger.db")
+          for trigger in ("event_log_no_update", "event_log_no_delete"):
+              conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+          conn.execute("UPDATE event_log SET actor = 'human' WHERE seq = 2")
+          conn.commit()
+          conn.close()
+          PY
+          if uv run tb ledger verify; then
+            echo "::error::tampering went undetected — the audit ledger is not trustworthy"
+            exit 1
+          fi
+          echo "tamper detected as expected"

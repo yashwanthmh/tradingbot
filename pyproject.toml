@@ -1,0 +1,92 @@
+[project]
+name = "tradingbot"
+version = "0.1.0"
+description = "Autonomous long-only equity trading bot for Trading 212, with a hash-chained audit ledger and code-enforced risk guardrails."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    "typer>=0.12",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+# Added in M1 (broker adapter) — kept out of the core install so M0 stays light.
+broker = [
+    "httpx>=0.27",
+    "tenacity>=9.0",
+]
+# Added in M2/M3 (data layer, backtester).
+data = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "duckdb>=1.1",
+    "pyarrow>=17.0",
+    "pandas-market-calendars>=4.4",
+]
+
+[project.scripts]
+tb = "tb.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=5.0",
+    "hypothesis>=6.112",
+    "ruff>=0.7",
+    "mypy>=1.13",
+    "types-pyyaml>=6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tb"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle / pyflakes
+    "I",             # isort
+    "UP",            # pyupgrade
+    "B",             # bugbear
+    "SIM",           # simplify
+    "RUF",
+    "S",             # bandit (security)
+    "DTZ",           # naive-datetime bans — important for a trading system
+]
+ignore = [
+    "S101",   # assert is fine in tests and for invariants
+    "B008",   # typer uses function calls in defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B011"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+files = ["src/tb", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["yaml.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --strict-markers --strict-config"
+markers = [
+    "slow: takes more than a second",
+    "network: hits a real external API (skipped by default)",
+    "drill: an operational drill rather than a unit test",
+]
+filterwarnings = ["error"]

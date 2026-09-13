@@ -1,0 +1,146 @@
+# ============================================================================
+#  HARD LIMITS — the control layer
+# ============================================================================
+#
+#  This file bounds everything the bot is permitted to do. It is loaded once at
+#  startup, its hash is pinned into the ledger, and the hash is re-verified on
+#  every cycle: a mismatch halts trading.
+#
+#  Deployment expectation: mounted READ-ONLY, owned by a different OS user than
+#  the one running the bot. "The agent cannot modify this" has to be a kernel
+#  fact, not a convention — `tb doctor` reports whether that is actually true.
+#
+#  The bot has full autonomy over WHICH strategies get funded and how much,
+#  within these numbers. It has no ability to enlarge its own blast radius:
+#  raising any ceiling here is a human action.
+#
+#  Changing a value takes effect on the next process start, not mid-run.
+# ============================================================================
+
+schema_version: 1
+
+# Currency of every *_ccy figure below. Asserted against the base currency the
+# broker reports for the account at startup; a mismatch is fatal, because a
+# ceiling of 500 means something very different in GBP than in JPY.
+currency: GBP
+
+capital:
+  # The single most important number here. An absolute cash ceiling on total
+  # capital the bot may ever have deployed, independent of what the account
+  # actually holds. Percentages scale with the account; this does not.
+  absolute_ceiling_ccy: 500.00
+
+  # Percentage caps, applied against account equity, then intersected with the
+  # absolute ceiling above. The tighter of the two always wins.
+  max_deployed_pct: 10.0
+  per_position_pct: 1.0
+  max_positions: 10
+
+  # Smallest order the bot may place. Newly promoted strategies start here and
+  # ratchet up only as realised statistics hold.
+  floor_notional_ccy: 15.00
+
+loss:
+  # Realised + unrealised loss against the day's opening equity. Stops opening.
+  daily_halt_pct: 2.0
+  # Rolling 5-trading-day loss. Stops opening.
+  rolling_5d_halt_pct: 4.0
+  # Drawdown from the all-time equity high-water mark. This one FLATTENS every
+  # position and halts, rather than merely declining to open new ones.
+  max_drawdown_flatten_pct: 6.0
+  # Per-strategy and per-lineage lifetime loss budgets. Exhaustion retires the
+  # strategy (or blocks the whole lineage, so a renamed child cannot continue).
+  per_strategy_budget_ccy: 50.00
+  per_lineage_budget_ccy: 100.00
+
+execution:
+  # Cost is the binding constraint on this venue, not alpha. Trading 212 is
+  # commission-free but charges 0.15% per FX conversion and UK buys carry 0.5%
+  # stamp duty, so a round trip costs ~30-55bps while minute-bar gross edge is
+  # 5-20bps. These two rules are what keep the search loop out of that trap.
+  min_holding_minutes: 60
+  max_cost_to_edge_ratio: 0.33
+
+  # Runaway-loop containment. Most catastrophic bot losses are not bad
+  # predictions, they are a loop that placed ten thousand orders.
+  max_orders_per_day: 40
+  max_orders_per_symbol_per_day: 4
+
+  # Universe size is derived from the rate-limit arithmetic, not taste: a
+  # protective stop is a limit-class order at 1 per 2s, so a full portfolio turn
+  # across N symbols needs 2N seconds of governor budget just for protection.
+  max_universe_symbols: 25
+
+  # Entry always precedes protection (Trading 212 has no bracket/OCO orders), so
+  # there is an unavoidable window in which a position has no broker-side stop.
+  # Position size is capped such that a gap of this size across that window is
+  # survivable inside the daily loss budget.
+  unprotected_gap_pct_assumption: 15.0
+
+  # A signal computed on one venue's prices and executed on another's. Beyond
+  # this divergence between the data feed and the broker's own quote, the symbol
+  # is blocked for new entries.
+  max_cross_venue_disagreement_bps: 75.0
+
+  # Never act on a bar older than this. Free feeds are often delayed; acting on
+  # a stale bar while believing it is live is how backtests become fiction.
+  max_bar_staleness_seconds: 180
+
+  # No entries in the opening or closing auction chaos.
+  no_entry_first_minutes: 15
+  no_entry_last_minutes: 20
+
+anomaly:
+  # Halt if today's activity exceeds the trailing 95th percentile by this
+  # multiple. Cheapest control in the system.
+  halt_if_daily_orders_exceed_p95_by: 3.0
+  halt_if_daily_notional_exceeds_p95_by: 3.0
+  # Absolute backstop for the cold-start case, before any percentile history
+  # exists to compare against.
+  absolute_max_orders_per_hour: 20
+
+regime:
+  # A strategy can be killed; a regime cannot. So this lives in the risk layer,
+  # above the allocator: when the reference index is below its long moving
+  # average, every strategy's gross exposure is scaled by the factor below.
+  reference_symbol: SPY
+  exposure_ma_days: 200
+  exposure_factor_below_ma: 0.5
+
+promotion:
+  # Autonomous promotion: a strategy that clears the gate goes live at floor
+  # notional with no human approval. Set paper_shadow_sessions above 0 to
+  # reinstate a mandatory demo-trading period before real capital.
+  paper_shadow_sessions: 0
+  paper_shadow_min_trades: 0
+
+  # Because there is no shadow period, the backtest gate is the only thing
+  # between a noise strategy and real money. These thresholds carry that weight.
+  min_oos_deflated_sharpe: 0.5
+  max_oos_drawdown_pct: 15.0
+  min_oos_trades: 30
+  max_probability_of_backtest_overfitting: 0.25
+  # Fraction of a null-strategy population the gate may promote. Asserted by the
+  # test suite as a release gate: a 3% false-promotion rate against a searcher
+  # proposing a thousand specs a week puts thirty random strategies into
+  # production a week.
+  max_null_promotion_rate: 0.01
+
+  # Asymmetric size ratchet: up slowly, down fast.
+  ratchet_min_days_between_promotions: 5
+  ratchet_rungs_lost_on_breach: 2
+  ratchet_max_rung: 4
+
+safety:
+  # Where the kill switch and heartbeat live. Presence of the kill file halts
+  # trading; so does anything that makes the state undeterminable.
+  kill_switch_path: var/run/KILL
+  heartbeat_path: var/run/heartbeat
+  heartbeat_stale_seconds: 120
+  # On boot, if a held position has no live protective stop: flatten it, or
+  # attempt to place a stop. Flatten is the default because "place a stop now"
+  # after an unknown gap is a decision made with no information.
+  on_unprotected_position: flatten   # flatten | protect
+  # An intent whose state cannot be resolved against the broker halts the bot
+  # and requires human acknowledgement. Guessing about real money is worse.
+  halt_on_unreconciled: true
