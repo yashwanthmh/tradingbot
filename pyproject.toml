@@ -80,6 +80,12 @@ files = ["src/tb", "tests"]
 module = ["yaml.*"]
 ignore_missing_imports = true
 
+# These ship no py.typed marker. They are read-time only (never imported by the
+# live trading loop), so the untyped surface is contained.
+[[tool.mypy.overrides]]
+module = ["pyarrow.*", "duckdb.*", "pandas_market_calendars.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

@@ -34,7 +34,7 @@ ENV_PATH_VAR = "TB_HARD_LIMITS_PATH"
 
 # The schema versions this build knows how to interpret. A limits file from the
 # future is refused rather than partially understood.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({2})
 
 
 @dataclass(frozen=True, slots=True)

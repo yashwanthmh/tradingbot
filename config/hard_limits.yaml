@@ -17,7 +17,7 @@
 #  Changing a value takes effect on the next process start, not mid-run.
 # ============================================================================
 
-schema_version: 1
+schema_version: 2
 
 # Currency of every *_ccy figure below. Asserted against the base currency the
 # broker reports for the account at startup; a mismatch is fatal, because a
@@ -130,6 +130,54 @@ promotion:
   ratchet_min_days_between_promotions: 5
   ratchet_rungs_lost_on_breach: 2
   ratchet_max_rung: 4
+
+data:
+  # Trading 212 serves no market data, so the feed is a separate vendor with
+  # separate failure modes. These bound what the bot is allowed to believe.
+
+  # A bar is only actionable within this window of becoming *knowable* —
+  # measured against available_at (bar close + provider delay + ingest), never
+  # against bar time. A provider whose observed delay exceeds this may supply
+  # history but may not drive a live decision.
+  max_provider_delay_seconds: 180
+
+  # Which resolutions the bot may trade live. Daily closes are consolidated,
+  # revision-stable, and a three-minute staleness bound is irrelevant to a
+  # once-a-day decision. Minute resolution stays out until the bake-off shows
+  # the feed is representative enough — Alpaca's free tier is IEX only, a few
+  # percent of consolidated volume, and its systematic disagreement sits in the
+  # same 5-20bps band as the entire gross edge.
+  allowed_live_resolutions: [daily]
+
+  # Promotion gate against feed noise: a strategy's expected edge must exceed
+  # the p95 provider disagreement by this multiple. Without it the bot would
+  # trade an edge smaller than the error bar on its own prices.
+  min_edge_to_feed_noise_ratio: 3.0
+
+  # The regime gate needs history before it means anything. A 200-day moving
+  # average wants roughly ten months of sessions; below this the exposure
+  # factor stays at its reduced value rather than defaulting to full exposure.
+  # "Not enough data" must never read as "no signal, so go ahead."
+  min_history_days_for_regime: 250
+
+  # Only *unexplained* gaps count against a feed. A missing minute on a thin
+  # name over IEX is normal; a missing minute on a megacap is not.
+  max_unexplained_gap_pct: 1.0
+
+  # Prices are stored as integers scaled by 10^this, never as floats: a float
+  # round-trip through Parquet changes hashes and quietly breaks reproducibility.
+  price_scale: 6
+
+  # Backfill depth. Daily goes back years because the promotion gate needs
+  # enough history to be statistically meaningful; minute is shallow because
+  # that is all a free feed has.
+  backfill_years_daily: 10
+  backfill_days_minute: 30
+
+  # Revision detection only covers what gets refetched, so a restatement twenty
+  # days back is invisible unless something looks. This fraction of stored
+  # history is resampled and re-compared on a schedule.
+  revision_canary_sample_pct: 2.0
 
 safety:
   # Where the kill switch and heartbeat live. Presence of the kill file halts

@@ -186,6 +186,50 @@ class PromotionLimits(_Section):
     ratchet_max_rung: int = Field(ge=1, le=20)
 
 
+class DataLimits(_Section):
+    """What the bot is allowed to believe about its own prices.
+
+    Trading 212 serves no market data, so the feed is a separate vendor with
+    separate failure modes — and two of them are easy to miss. A *delayed* feed
+    creates a lookahead exactly the size of the delay, because the earliest
+    actionable moment for a bar is `bar_close + delay + ingest` rather than
+    bar close. An *unrepresentative* feed is worse and quieter: Alpaca's free
+    tier is IEX only, a few percent of consolidated volume, so its systematic
+    disagreement with the consolidated tape sits in the same 5-20bps band as
+    the entire gross edge being traded. The first is bounded here by
+    `max_provider_delay_seconds`; the second by `min_edge_to_feed_noise_ratio`
+    and by `allowed_live_resolutions`.
+    """
+
+    max_provider_delay_seconds: int = Field(ge=1)
+    # Daily only until the bake-off produces evidence. Kept as a list so
+    # widening it is a visible, reviewable edit rather than a flag flip.
+    allowed_live_resolutions: list[str] = Field(min_length=1)
+    min_edge_to_feed_noise_ratio: float = Field(gt=0.0)
+    min_history_days_for_regime: int = Field(ge=1)
+    max_unexplained_gap_pct: Percent
+    # Prices are stored as integers scaled by 10^price_scale. Floats would
+    # round-trip through Parquet and change every hash computed over them.
+    price_scale: int = Field(ge=2, le=12)
+    backfill_years_daily: int = Field(ge=1, le=50)
+    backfill_days_minute: int = Field(ge=1, le=3650)
+    revision_canary_sample_pct: float = Field(ge=0.0, le=100.0)
+
+    @model_validator(mode="after")
+    def _check_resolutions(self) -> DataLimits:
+        known = {"daily", "hourly", "minute"}
+        unknown = [r for r in self.allowed_live_resolutions if r not in known]
+        if unknown:
+            raise ValueError(
+                f"allowed_live_resolutions contains unknown values {unknown}; "
+                f"known resolutions are {sorted(known)}"
+            )
+        return self
+
+    def permits_live(self, resolution: str) -> bool:
+        return resolution in self.allowed_live_resolutions
+
+
 class SafetyLimits(_Section):
     """Kill switch, heartbeat, and what to do about state we cannot explain."""
 
@@ -210,6 +254,7 @@ class HardLimits(_Section):
     anomaly: AnomalyLimits
     regime: RegimeLimits
     promotion: PromotionLimits
+    data: DataLimits
     safety: SafetyLimits
 
     @model_validator(mode="after")
@@ -234,3 +279,30 @@ class HardLimits(_Section):
     def worst_case_unprotected_loss_pct(self) -> float:
         """Equity lost if one position gaps through its unprotected window."""
         return self.capital.per_position_pct * self.execution.unprotected_gap_pct_assumption / 100.0
+
+    @model_validator(mode="after")
+    def _check_data_coherence(self) -> HardLimits:
+        # The staleness bound and the provider delay bound describe the same
+        # window from two sides. A data layer that admitted a feed slower than
+        # the decision layer will act on would fetch bars it is then forbidden
+        # to use — a system that looks alive and never trades.
+        if self.data.max_provider_delay_seconds > self.execution.max_bar_staleness_seconds:
+            raise ValueError(
+                f"data.max_provider_delay_seconds ({self.data.max_provider_delay_seconds}s) "
+                f"exceeds execution.max_bar_staleness_seconds "
+                f"({self.execution.max_bar_staleness_seconds}s): a bar admitted by the data "
+                "layer would then be refused by the decision layer, so the bot would fetch "
+                "prices it can never act on"
+            )
+        # A 200-day moving average needs roughly 200 sessions. If the regime
+        # gate could run on less, "insufficient history" would quietly become
+        # "no signal" — which reads as full exposure, the most expensive
+        # possible default.
+        if self.data.min_history_days_for_regime < self.regime.exposure_ma_days:
+            raise ValueError(
+                f"data.min_history_days_for_regime ({self.data.min_history_days_for_regime}) is "
+                f"below regime.exposure_ma_days ({self.regime.exposure_ma_days}): the regime "
+                "gate would be permitted to run on history too short to compute its own "
+                "moving average"
+            )
+        return self

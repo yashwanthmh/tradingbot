@@ -27,7 +27,7 @@ from pathlib import Path
 
 from tb.core.canonical import GENESIS_HASH
 
-LEDGER_SCHEMA_VERSION = 2
+LEDGER_SCHEMA_VERSION = 3
 
 # --------------------------------------------------------------------------
 # Tables
@@ -261,6 +261,190 @@ _TABLES: tuple[str, ...] = (
         note              TEXT
     )
     """,
+    # ---------------------------------------------------------------- v3 (M2)
+    # The catalog. A Parquet file is part of the dataset only because a row here
+    # (and the event that wrote it) says so — never because it happens to be on
+    # disk. That inversion is what makes orphan files ignorable garbage and a
+    # missing file a loud integrity failure instead of silent data loss.
+    """
+    CREATE TABLE IF NOT EXISTS data_partitions (
+        file_sha256       TEXT    PRIMARY KEY,
+        relative_path     TEXT    NOT NULL,
+        instrument_uid    TEXT    NOT NULL,
+        resolution        TEXT    NOT NULL,
+        provider          TEXT    NOT NULL,
+        first_bar_open    TEXT    NOT NULL,
+        last_bar_open     TEXT    NOT NULL,
+        row_count         INTEGER NOT NULL,
+        byte_size         INTEGER NOT NULL,
+        rows_hash         TEXT    NOT NULL,
+        sealed_at         TEXT    NOT NULL,
+        sealing_event_seq INTEGER NOT NULL,
+        superseded_by     TEXT,
+        schema_version    INTEGER NOT NULL
+    )
+    """,
+    # Incremental bars land here, inside the same transaction as their
+    # provenance event, and are compacted into Parquet at session close. Writing
+    # a Parquet file per poll would produce thousands of tiny files; writing to
+    # the ledger keeps the event and the data atomic, which is the property that
+    # matters more than either.
+    #
+    # Note the three time axes. `available_at_utc` is stored rather than derived
+    # because the provider's delay is itself a revisable fact, and the whole
+    # point is to know what was knowable *then*, not what we would compute now.
+    """
+    CREATE TABLE IF NOT EXISTS bars_hot (
+        instrument_uid    TEXT    NOT NULL,
+        resolution        TEXT    NOT NULL,
+        bar_open_utc      TEXT    NOT NULL,
+        available_at_utc  TEXT    NOT NULL,
+        ingested_at_utc   TEXT    NOT NULL,
+        provider          TEXT    NOT NULL,
+        provenance        TEXT    NOT NULL,
+        session           TEXT    NOT NULL,
+        open_scaled       INTEGER NOT NULL,
+        high_scaled       INTEGER NOT NULL,
+        low_scaled        INTEGER NOT NULL,
+        close_scaled      INTEGER NOT NULL,
+        volume            INTEGER,
+        price_scale       INTEGER NOT NULL,
+        currency          TEXT,
+        row_hash          TEXT    NOT NULL,
+        sealed_into       TEXT,
+        PRIMARY KEY (instrument_uid, resolution, bar_open_utc, ingested_at_utc, provider)
+    )
+    """,
+    # Every observed restatement, kept forever. Yahoo silently back-adjusts
+    # history, so a bar fetched today can differ from the same bar fetched
+    # tomorrow; without this table that difference is invisible and every
+    # feature hash computed over the old value becomes a quiet lie.
+    """
+    CREATE TABLE IF NOT EXISTS bar_revisions (
+        revision_id       TEXT    PRIMARY KEY,
+        instrument_uid    TEXT    NOT NULL,
+        resolution        TEXT    NOT NULL,
+        bar_open_utc      TEXT    NOT NULL,
+        provider          TEXT    NOT NULL,
+        kind              TEXT    NOT NULL,
+        first_seen_at     TEXT    NOT NULL,
+        first_values_json TEXT,
+        revised_at        TEXT    NOT NULL,
+        new_values_json   TEXT,
+        delta_bps         REAL,
+        detected_by       TEXT    NOT NULL
+    )
+    """,
+    # Dated, revisable facts. Factors are DERIVED from these and never stored:
+    # a materialised factor column is how a table ends up silently containing
+    # tomorrow's split.
+    """
+    CREATE TABLE IF NOT EXISTS corporate_actions (
+        action_id         TEXT    PRIMARY KEY,
+        instrument_uid    TEXT    NOT NULL,
+        action_type       TEXT    NOT NULL,
+        effective_date    TEXT    NOT NULL,
+        known_at_utc      TEXT    NOT NULL,
+        declared_date     TEXT,
+        ratio_num         INTEGER,
+        ratio_den         INTEGER,
+        gross_amount      TEXT,
+        currency          TEXT,
+        new_symbol        TEXT,
+        source_provider   TEXT    NOT NULL,
+        payload_hash      TEXT,
+        superseded_by     TEXT,
+        reconciled_with_broker INTEGER NOT NULL DEFAULT 0,
+        reconcile_note    TEXT
+    )
+    """,
+    # Append-only dated membership. Survivorship bias cannot be fixed
+    # retroactively on free data, only stopped from growing: without these rows
+    # every backtest silently runs over the names that still exist today.
+    """
+    CREATE TABLE IF NOT EXISTS universe_snapshots (
+        snapshot_id       TEXT    NOT NULL,
+        taken_at          TEXT    NOT NULL,
+        instrument_uid    TEXT    NOT NULL,
+        t212_ticker       TEXT,
+        data_symbol       TEXT,
+        rank              INTEGER,
+        selection_reason  TEXT,
+        dollar_volume     TEXT,
+        currency          TEXT,
+        PRIMARY KEY (snapshot_id, instrument_uid)
+    )
+    """,
+    # Limits are GBP; the universe is USD. Without a point-in-time rate there is
+    # no sizing against absolute_ceiling_ccy and no P&L in the account currency.
+    """
+    CREATE TABLE IF NOT EXISTS fx_rates (
+        pair              TEXT    NOT NULL,
+        as_of_date        TEXT    NOT NULL,
+        available_at_utc  TEXT    NOT NULL,
+        ingested_at_utc   TEXT    NOT NULL,
+        rate              TEXT    NOT NULL,
+        provider          TEXT    NOT NULL,
+        provenance        TEXT    NOT NULL,
+        PRIMARY KEY (pair, as_of_date, ingested_at_utc)
+    )
+    """,
+    # A sealed vintage is M3's entire input. A backtest whose vintage_id is not
+    # here is not admissible evidence for promotion.
+    """
+    CREATE TABLE IF NOT EXISTS data_snapshots (
+        vintage_id              TEXT PRIMARY KEY,
+        as_of_utc               TEXT NOT NULL,
+        manifest_hash           TEXT NOT NULL,
+        window_start            TEXT,
+        window_end              TEXT,
+        resolutions             TEXT NOT NULL,
+        instrument_uids         TEXT NOT NULL,
+        file_sha256s            TEXT NOT NULL,
+        row_count               INTEGER NOT NULL,
+        calendar_hash           TEXT,
+        action_table_hash       TEXT,
+        fx_table_hash           TEXT,
+        universe_snapshot_id    TEXT,
+        provider_delays_json    TEXT,
+        sealed_from             TEXT,
+        first_live_observation_at TEXT,
+        survivorship_flag       TEXT NOT NULL,
+        pit_completeness_flag   TEXT NOT NULL,
+        sealing_event_seq       INTEGER NOT NULL
+    )
+    """,
+    # A rebuildable projection, stated as such. If it ever disagrees with what
+    # the events say, the events win and this gets rebuilt.
+    """
+    CREATE TABLE IF NOT EXISTS bar_coverage (
+        instrument_uid    TEXT    NOT NULL,
+        resolution        TEXT    NOT NULL,
+        provider          TEXT    NOT NULL,
+        first_bar_open    TEXT,
+        last_bar_open     TEXT,
+        row_count         INTEGER NOT NULL,
+        n_gaps_unexplained INTEGER NOT NULL DEFAULT 0,
+        last_audited_at   TEXT,
+        PRIMARY KEY (instrument_uid, resolution, provider)
+    )
+    """,
+    # What each provider's delay and coverage actually turned out to be. The
+    # delay in the code is a conservative default; this is the observation.
+    """
+    CREATE TABLE IF NOT EXISTS provider_observations (
+        provider          TEXT    NOT NULL,
+        resolution        TEXT    NOT NULL,
+        observed_at       TEXT    NOT NULL,
+        delay_p50_s       REAL,
+        delay_p95_s       REAL,
+        delay_max_s       REAL,
+        n_samples         INTEGER NOT NULL,
+        live_capable      INTEGER,
+        note              TEXT,
+        PRIMARY KEY (provider, resolution, observed_at)
+    )
+    """,
 )
 
 # --------------------------------------------------------------------------
@@ -319,6 +503,21 @@ _INDEXES: tuple[str, ...] = (
     "ON broker_messages (parse_ok, received_at)",
     "CREATE INDEX IF NOT EXISTS ix_positions_snapshot_ts ON positions_snapshot (ts)",
     "CREATE INDEX IF NOT EXISTS ix_symbol_map_blocked ON symbol_map (blocked)",
+    # v3 (M2)
+    "CREATE INDEX IF NOT EXISTS ix_bars_hot_lookup "
+    "ON bars_hot (instrument_uid, resolution, bar_open_utc)",
+    "CREATE INDEX IF NOT EXISTS ix_bars_hot_unsealed ON bars_hot (sealed_into)",
+    "CREATE INDEX IF NOT EXISTS ix_bars_hot_available ON bars_hot (available_at_utc)",
+    "CREATE INDEX IF NOT EXISTS ix_data_partitions_lookup "
+    "ON data_partitions (instrument_uid, resolution, first_bar_open)",
+    "CREATE INDEX IF NOT EXISTS ix_data_partitions_live ON data_partitions (superseded_by)",
+    "CREATE INDEX IF NOT EXISTS ix_actions_lookup "
+    "ON corporate_actions (instrument_uid, effective_date)",
+    "CREATE INDEX IF NOT EXISTS ix_actions_known ON corporate_actions (known_at_utc)",
+    "CREATE INDEX IF NOT EXISTS ix_bar_revisions_bar "
+    "ON bar_revisions (instrument_uid, resolution, bar_open_utc)",
+    "CREATE INDEX IF NOT EXISTS ix_universe_snapshots_taken ON universe_snapshots (taken_at)",
+    "CREATE INDEX IF NOT EXISTS ix_fx_lookup ON fx_rates (pair, as_of_date)",
 )
 
 

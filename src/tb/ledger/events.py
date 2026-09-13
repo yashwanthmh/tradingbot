@@ -89,6 +89,18 @@ class EventType(StrEnum):
     SYMBOL_BLOCKED = "symbol.blocked"
     SYMBOL_UNBLOCKED = "symbol.unblocked"
 
+    # --- data layer (M2) ---
+    DATA_PARTITION_SEALED = "data.partition_sealed"
+    DATA_BAR_REVISION_DETECTED = "data.bar_revision_detected"
+    DATA_SNAPSHOT_SEALED = "data.snapshot_sealed"
+    DATA_AUDIT_COMPLETED = "data.audit_completed"
+    DATA_PROVIDER_DEGRADED = "data.provider_degraded"
+    DATA_STALENESS_BREACH = "data.staleness_breach"
+    DATA_ACTION_RECORDED = "data.action_recorded"
+    DATA_ACTION_RECONCILED = "data.action_reconciled"
+    DATA_UNIVERSE_SNAPSHOT_TAKEN = "data.universe_snapshot_taken"
+    DATA_BAKEOFF_COMPLETED = "data.bakeoff_completed"
+
 
 class EventPayload(BaseModel):
     """Base for every payload.
@@ -351,6 +363,192 @@ class SymbolBlockedPayload(EventPayload):
 
 
 # --------------------------------------------------------------------------
+# Data layer
+# --------------------------------------------------------------------------
+
+
+class PartitionSealedPayload(EventPayload):
+    """A Parquet file became part of the dataset.
+
+    This event is what *makes* it part of the dataset. A file on disk with no
+    sealing event is ignorable garbage; an event naming a missing file is a
+    loud integrity failure. Defining membership by the ledger rather than by a
+    directory listing is what keeps the two stores from silently diverging.
+    """
+
+    file_sha256: str
+    relative_path: str
+    instrument_uid: str
+    resolution: str
+    provider: str
+    first_bar_open: str
+    last_bar_open: str
+    row_count: int
+    byte_size: int
+    rows_hash: str
+    supersedes: list[str] = Field(default_factory=list)
+
+
+class BarRevisionPayload(EventPayload):
+    """A bar we had already stored came back different, or vanished.
+
+    Yahoo silently back-adjusts history, so this is expected rather than
+    exceptional — and it is the evidence when a live result diverges from the
+    backtest that supposedly validated it.
+    """
+
+    revision_id: str
+    instrument_uid: str
+    resolution: str
+    bar_open_utc: str
+    provider: str
+    # `changed` | `deleted` | `late_insert` — deletions and late arrivals are
+    # invisible to a row-by-row diff, so the comparison runs over the set.
+    kind: str
+    delta_bps: float | None = None
+    detected_by: str
+    first_values: dict[str, Any] | None = None
+    new_values: dict[str, Any] | None = None
+
+
+class SnapshotSealedPayload(EventPayload):
+    """A dataset vintage, frozen and hashed.
+
+    M3's entire input. A backtest whose `vintage_id` is not in this log is not
+    admissible evidence for promotion, which is what stops a strategy being
+    validated against data that has since been restated underneath it.
+    """
+
+    vintage_id: str
+    as_of_utc: str
+    manifest_hash: str
+    window_start: str | None = None
+    window_end: str | None = None
+    resolutions: list[str] = Field(default_factory=list)
+    n_instruments: int
+    n_files: int
+    row_count: int
+    calendar_hash: str | None = None
+    action_table_hash: str | None = None
+    fx_table_hash: str | None = None
+    universe_snapshot_id: str | None = None
+    sealed_from: str | None = None
+    first_live_observation_at: str | None = None
+    # `unmeasured` until dated universe snapshots span the backtest window.
+    survivorship_flag: str
+    # `vendor_current_view` until live observation covers the window — i.e. the
+    # as-of machinery is inert over backfilled history and says so.
+    pit_completeness_flag: str
+    provider_delays: dict[str, float] = Field(default_factory=dict)
+
+
+class DataAuditPayload(EventPayload):
+    audit_id: str
+    n_instruments: int
+    n_bars_checked: int
+    n_findings: int
+    n_blocking: int
+    # Only `unexplained` gaps count against a feed; a missing minute on a thin
+    # name over IEX is normal, and lumping them together is uninterpretable.
+    gaps_unexplained: int = 0
+    gaps_explained: int = 0
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ProviderDegradedPayload(EventPayload):
+    """A provider stopped being usable for its declared purpose."""
+
+    provider: str
+    resolution: str
+    reason: str
+    observed_delay_p95_s: float | None = None
+    max_allowed_delay_s: float | None = None
+    live_capable: bool
+
+
+class StalenessBreachPayload(EventPayload):
+    """No provider could supply a fresh enough bar to decide on.
+
+    Recorded rather than silently skipped: how often this fires is the
+    empirical answer to whether the free feed can support the cadence.
+    """
+
+    instrument_uid: str
+    resolution: str
+    newest_available_at: str | None = None
+    decision_time: str
+    age_seconds: float | None = None
+    limit_seconds: int
+    action: str
+
+
+class ActionRecordedPayload(EventPayload):
+    action_id: str
+    instrument_uid: str
+    action_type: str
+    effective_date: str
+    known_at_utc: str
+    ratio_num: int | None = None
+    ratio_den: int | None = None
+    gross_amount: Decimal | None = None
+    currency: str | None = None
+    source_provider: str
+    # True when the residual detector inferred it from a price jump with no
+    # corresponding action row — i.e. an unannounced split.
+    inferred_from_price_jump: bool = False
+
+
+class ActionReconciledPayload(EventPayload):
+    """A provider dividend checked against cash the broker actually credited.
+
+    The highest-value check in the data layer: a dividend with no matching
+    credit means either the action data is wrong, or we are tracking a
+    different company than the one we hold.
+    """
+
+    action_id: str
+    instrument_uid: str
+    matched: bool
+    provider_amount: Decimal | None = None
+    broker_amount: Decimal | None = None
+    detail: str
+
+
+class UniverseSnapshotPayload(EventPayload):
+    snapshot_id: str
+    n_members: int
+    n_candidates_considered: int
+    selection_rule: str
+    members: list[str] = Field(default_factory=list)
+    currency: str | None = None
+
+
+class BakeoffPayload(EventPayload):
+    """The paid-data verdict, as arithmetic.
+
+    The headline is not freshness but representativeness: IEX is a few percent
+    of consolidated volume, so its systematic disagreement sits in the same
+    5-20bps band as the entire gross edge being traded.
+    """
+
+    bakeoff_id: str
+    window_start: str
+    window_end: str
+    resolution: str
+    providers: list[str] = Field(default_factory=list)
+    n_symbols: int
+    n_compared_bars: int
+    disagreement_median_bps: float | None = None
+    disagreement_p95_bps: float | None = None
+    disagreement_p99_bps: float | None = None
+    missing_bar_fraction: dict[str, float] = Field(default_factory=dict)
+    observed_delay_p95_s: dict[str, float] = Field(default_factory=dict)
+    cycles_meeting_staleness_bound_pct: float | None = None
+    verdict: str
+    rationale: str
+
+
+# --------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------
 
@@ -375,6 +573,16 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.SYMBOLS_AUDITED: SymbolsAuditedPayload,
     EventType.SYMBOL_BLOCKED: SymbolBlockedPayload,
     EventType.SYMBOL_UNBLOCKED: SymbolBlockedPayload,
+    EventType.DATA_PARTITION_SEALED: PartitionSealedPayload,
+    EventType.DATA_BAR_REVISION_DETECTED: BarRevisionPayload,
+    EventType.DATA_SNAPSHOT_SEALED: SnapshotSealedPayload,
+    EventType.DATA_AUDIT_COMPLETED: DataAuditPayload,
+    EventType.DATA_PROVIDER_DEGRADED: ProviderDegradedPayload,
+    EventType.DATA_STALENESS_BREACH: StalenessBreachPayload,
+    EventType.DATA_ACTION_RECORDED: ActionRecordedPayload,
+    EventType.DATA_ACTION_RECONCILED: ActionReconciledPayload,
+    EventType.DATA_UNIVERSE_SNAPSHOT_TAKEN: UniverseSnapshotPayload,
+    EventType.DATA_BAKEOFF_COMPLETED: BakeoffPayload,
 }
 
 # The default aggregate each event type is filed under, so callers do not have
@@ -400,6 +608,16 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     EventType.SYMBOLS_AUDITED: AggregateType.DATA,
     EventType.SYMBOL_BLOCKED: AggregateType.DATA,
     EventType.SYMBOL_UNBLOCKED: AggregateType.DATA,
+    EventType.DATA_PARTITION_SEALED: AggregateType.DATA,
+    EventType.DATA_BAR_REVISION_DETECTED: AggregateType.DATA,
+    EventType.DATA_SNAPSHOT_SEALED: AggregateType.DATA,
+    EventType.DATA_AUDIT_COMPLETED: AggregateType.DATA,
+    EventType.DATA_PROVIDER_DEGRADED: AggregateType.DATA,
+    EventType.DATA_STALENESS_BREACH: AggregateType.DATA,
+    EventType.DATA_ACTION_RECORDED: AggregateType.DATA,
+    EventType.DATA_ACTION_RECONCILED: AggregateType.DATA,
+    EventType.DATA_UNIVERSE_SNAPSHOT_TAKEN: AggregateType.DATA,
+    EventType.DATA_BAKEOFF_COMPLETED: AggregateType.DATA,
 }
 
 
