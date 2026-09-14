@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
@@ -314,6 +314,28 @@ class Bar:
     @property
     def bar_close_utc(self) -> datetime:
         return self.bar_open_utc + self.resolution.duration
+
+    @property
+    def session_date(self) -> date:
+        """The trading session this bar belongs to.
+
+        One implementation, because the two resolutions read differently and
+        getting it wrong is silent. A **daily** bar is anchored at midnight UTC
+        of its session date (see `normalise_bar_open`), so its session date is
+        the *UTC* date. An **intraday** bar carries a real instant during the
+        session, so its session date is the *Eastern* date — 21:30 UTC is
+        16:30 Eastern the same day, but 01:00 UTC is 20:00 Eastern the day
+        before.
+
+        Read the wrong way round, a daily bar's midnight-UTC anchor becomes
+        19:00 Eastern the previous evening. Every date-keyed lookup then lands
+        one session early: a corporate action stops matching its own ex-date, a
+        coverage gap gets attributed to a day the market was shut, and both
+        failures look like the data rather than the arithmetic.
+        """
+        if self.resolution is Resolution.DAILY:
+            return self.bar_open_utc.astimezone(UTC).date()
+        return self.bar_open_utc.astimezone(US_EASTERN).date()
 
     @property
     def delay_seconds(self) -> float:
