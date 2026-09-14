@@ -93,6 +93,11 @@ UNKNOWN = _Unknown()
 MaybeBar: TypeAlias = "Bar | _Unknown"
 MaybePrice: TypeAlias = "Decimal | _Unknown"
 
+# The sentinel's type, under a public name. Other modules need it to spell
+# `Something | Unknown` in a signature — `_Unknown` is private and importing it
+# across modules would be the wrong shape of dependency.
+Unknown: TypeAlias = _Unknown
+
 
 # --------------------------------------------------------------------------
 # Bar sources

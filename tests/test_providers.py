@@ -636,6 +636,72 @@ def test_yahoo_sends_a_browser_user_agent_and_no_credentials() -> None:
     assert not any("KEY" in name.upper() for name in headers)
 
 
+@pytest.mark.parametrize("symbol", ["GBPUSD=X", "^GSPC"])
+def test_yahoo_reports_no_volume_rather_than_zero_for_fx_and_indices(symbol: str) -> None:
+    """0 and "not reported" are different claims, and the difference is fatal.
+
+    Spot FX and indices have no share count; Yahoo sends a literal 0. Stored as
+    0, an FX bar with a real price range trips `Bar`'s synthetic-bar guard — the
+    check that catches forward-filled equity bars — so every FX bar is dropped
+    and the rate table ends up empty. A sizing path that can never convert is
+    then blocked on a GBP ceiling it cannot evaluate.
+    """
+    transport = RecordingTransport(
+        responses={
+            "/v8/finance/chart/": json_response(
+                yahoo_body(
+                    epochs=[MINUTE_EPOCHS[0]],
+                    opens=[1.27],
+                    highs=[1.2750],
+                    lows=[1.2680],
+                    closes=[1.2730],
+                    volumes=[0],
+                )
+            )
+        }
+    )
+    provider = YahooProvider(transport=transport, pacer=_instant_pacer())
+    (bar,) = provider.fetch_bars(
+        symbol,
+        instrument_uid=f"sym:{symbol}",
+        resolution=Resolution.MINUTE,
+        start=datetime(2026, 3, 4, tzinfo=UTC),
+        end=datetime(2026, 3, 5, tzinfo=UTC),
+    ).bars
+    assert bar.volume is None
+
+
+def test_yahoo_keeps_a_real_zero_volume_for_an_equity() -> None:
+    """An equity bar with zero volume and zero range is a genuine flat minute.
+
+    The FX exemption must not become a blanket one: on an equity, zero volume
+    *is* a measurement, and the synthetic-bar guard depends on it.
+    """
+    transport = RecordingTransport(
+        responses={
+            "/v8/finance/chart/": json_response(
+                yahoo_body(
+                    epochs=[MINUTE_EPOCHS[0]],
+                    opens=[100.0],
+                    highs=[100.0],
+                    lows=[100.0],
+                    closes=[100.0],
+                    volumes=[0],
+                )
+            )
+        }
+    )
+    provider = YahooProvider(transport=transport, pacer=_instant_pacer())
+    (bar,) = provider.fetch_bars(
+        SYMBOL,
+        instrument_uid=UID,
+        resolution=Resolution.MINUTE,
+        start=datetime(2026, 3, 4, tzinfo=UTC),
+        end=datetime(2026, 3, 5, tzinfo=UTC),
+    ).bars
+    assert bar.volume == 0
+
+
 def test_yahoo_declares_that_it_does_not_return_raw_prices() -> None:
     """The honest limitation, asserted so a refactor cannot quietly flip it.
 

@@ -240,6 +240,7 @@ class YahooProvider:
 
         regular_window = _regular_window(meta)
         session_tz = _exchange_tz(meta)
+        volume_is_meaningful = symbol_has_volume(symbol)
         ingested = now_utc()
         delay = _DECLARED_DELAY[resolution]
         bars: list[Bar] = []
@@ -271,6 +272,13 @@ class YahooProvider:
                 continue
 
             volume = volumes[index] if index < len(volumes) else None
+            if not volume_is_meaningful:
+                # Spot FX and index symbols have no share count, and Yahoo sends
+                # a literal 0 for them. Stored as 0 that is a *measurement* of
+                # no trading, which collides with `Bar`'s synthetic-bar guard
+                # and would drop every FX bar — silently producing an empty rate
+                # table. None is the honest value: not reported.
+                volume = None
             try:
                 bar = Bar(
                     instrument_uid=instrument_uid,
@@ -447,6 +455,22 @@ def _unwrap(payload: Any, symbol: str) -> tuple[dict[str, Any] | None, list[str]
     if not isinstance(first, dict):
         raise DataError(f"yahoo result for {symbol} is not an object")
     return first, []
+
+
+def symbol_has_volume(symbol: str) -> bool:
+    """Whether a share count means anything for this Yahoo symbol.
+
+    Vendor symbology, which is exactly the kind of knowledge an adapter should
+    hold: Yahoo suffixes spot FX with `=X` (`GBPUSD=X`) and prefixes indices
+    with `^` (`^GSPC`). Neither has a share count, and Yahoo reports a literal
+    `0` rather than omitting the field.
+
+    That matters because 0 and "not reported" are different claims. Stored as
+    0, an FX bar with a real price range trips `Bar`'s synthetic-bar guard — the
+    check that catches forward-filled equity bars — and every FX bar is dropped,
+    leaving an empty rate table and a sizing path that can never convert.
+    """
+    return not (symbol.endswith("=X") or symbol.startswith("^"))
 
 
 def _exchange_tz(meta: dict[str, Any]) -> ZoneInfo | None:
