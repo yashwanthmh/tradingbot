@@ -201,11 +201,20 @@ before the feed's own error is small enough to trade through — set against the
 ~30bps a round trip already costs. Until that measurement passes,
 `data.allowed_live_resolutions` stays `[daily]`.
 
-Two API keys are needed for the data layer, both data-only and read from
-`ALPACA_DATA_KEY_ID` / `ALPACA_DATA_SECRET_KEY`. The SDK-standard
-`APCA_API_KEY_ID` is deliberately *not* read as a fallback: on a funded Alpaca
-account that key can place orders, and this process executes through Trading
-212.
+Alpaca needs two keys, read from `ALPACA_DATA_KEY_ID` /
+`ALPACA_DATA_SECRET_KEY`. Generate them at
+[alpaca.markets](https://alpaca.markets/data) — sign up, select the **paper**
+account, then *API Keys* → *Generate New Keys*; the secret is shown once.
+
+Generate them on a paper account specifically. Alpaca issues keys **per
+account, not per scope**, so there is no data-only key to ask for — a key made
+on a funded live account can place orders on it. Paper keys serve this same
+market-data API on the free plan and cannot move real money, which is the
+property the `ALPACA_DATA_*` naming is reaching for but cannot itself enforce.
+The SDK-standard `APCA_API_KEY_ID` is deliberately *not* read as a fallback for
+the same reason, and a key found under that name is reported by `tb doctor`
+rather than used. The free Basic plan is IEX-only, which is what `tb data
+bakeoff` exists to measure.
 
 Trading 212 issues a **separate API key per environment**, and the app must be switched to
 Practice mode *before* you generate the demo key or you will get a live one. The two keys

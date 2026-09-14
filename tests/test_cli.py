@@ -16,6 +16,8 @@ import pytest
 from typer.testing import CliRunner
 
 from tb.cli import app
+from tb.data.providers.alpaca import KEY_ID_VAR as ALPACA_KEY_ID_VAR
+from tb.data.providers.alpaca import SECRET_VAR as ALPACA_SECRET_VAR
 from tb.ops.secrets import DEMO_KEY_VAR, LIVE_KEY_VAR
 
 runner = CliRunner()
@@ -218,12 +220,46 @@ class TestDoctor:
         self, env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         secret = "t212demo_SUPERSECRETVALUE99"
+        data_secret = "alpaca_ALSOSUPERSECRET77"
         monkeypatch.delenv(LIVE_KEY_VAR, raising=False)
         monkeypatch.setenv(DEMO_KEY_VAR, secret)
+        monkeypatch.setenv(ALPACA_KEY_ID_VAR, "alpaca-key-id-1234")
+        monkeypatch.setenv(ALPACA_SECRET_VAR, data_secret)
         _run(["init", *env["args"]])
         result = _run(["doctor", *env["args"]])
         assert secret not in _out(result)
+        assert data_secret not in _out(result)
         assert "SUPERSECRET" not in _out(result)
+
+    def test_doctor_warns_but_still_passes_without_market_data_keys(
+        self, env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Yahoo-only is a supported way to run, so this must not be fatal."""
+        monkeypatch.delenv(LIVE_KEY_VAR, raising=False)
+        monkeypatch.setenv(DEMO_KEY_VAR, "demo-key-abcd1234")
+        for var in (ALPACA_KEY_ID_VAR, ALPACA_SECRET_VAR):
+            monkeypatch.delenv(var, raising=False)
+        _run(["init", *env["args"]])
+        result = _run(["doctor", *env["args"]])
+        assert result.exit_code == 0
+        assert "yahoo only" in _out(result)
+
+    def test_doctor_names_a_key_set_under_a_variable_nothing_reads(
+        self, env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The whole point of the panel: name the typo, not the provider."""
+        monkeypatch.delenv(LIVE_KEY_VAR, raising=False)
+        monkeypatch.setenv(DEMO_KEY_VAR, "demo-key-abcd1234")
+        for var in (ALPACA_KEY_ID_VAR, ALPACA_SECRET_VAR):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("ALPACA_API_KEY_ID", "wrong-name-key")
+        _run(["init", *env["args"]])
+        result = _run(["doctor", *env["args"]])
+        assert result.exit_code == 0
+        output = _out(result)
+        assert "ALPACA_API_KEY_ID" in output
+        assert ALPACA_KEY_ID_VAR in output
+        assert "wrong-name-key" not in output
 
     def test_doctor_reports_an_undeterminable_kill_switch_as_a_problem(
         self,

@@ -35,6 +35,14 @@ Alpaca's own SDK reads `APCA_API_KEY_ID`, and on a funded Alpaca account that
 same key can place orders. This process executes through Trading 212 and has no
 business holding a key that can trade somewhere else, so the SDK names are not
 read as a fallback; they are reported as a finding.
+
+The naming is a convention, not a permission boundary, and it is worth being
+precise about which: Alpaca issues keys **per account, not per scope**, so there
+is no data-only key to generate. What actually bounds the blast radius is the
+*account* the key belongs to — generate it on a **paper** account, which serves
+this same market-data API on the free plan and cannot move real money. The
+variable names make the intent legible and stop the SDK's key being picked up by
+accident; they cannot make an over-privileged key safe.
 """
 
 from __future__ import annotations
@@ -77,6 +85,10 @@ SECRET_VAR = "ALPACA_DATA_SECRET_KEY"  # noqa: S105
 # The names Alpaca's SDK uses. Read only to *report* them, never to authenticate
 # with: a key under this name is likely a full-permission trading key.
 SDK_KEY_VARS = ("APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
+# The spelling `.env.example` shipped with through M2, which no code ever read.
+# Detected by name so that mistake reports itself here, rather than surfacing
+# three commands later as "provider unavailable".
+MISNAMED_KEY_VARS = ("ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY")
 
 # The free plan. Pinned as a constant rather than a parameter: `sip` would 403
 # on a free account, and worse, a paid account switching to it mid-history
@@ -153,12 +165,17 @@ class AlpacaProvider:
         secret = (os.environ.get(SECRET_VAR) or "").strip()
         if not key_id or not secret:
             hint = ""
-            if any(os.environ.get(var) for var in SDK_KEY_VARS):
+            if any(os.environ.get(var) for var in MISNAMED_KEY_VARS):
+                hint = (
+                    f" ({'/'.join(MISNAMED_KEY_VARS)} is set — close, but not the name read "
+                    "here. Rename to the names above.)"
+                )
+            elif any(os.environ.get(var) for var in SDK_KEY_VARS):
                 hint = (
                     f" ({'/'.join(SDK_KEY_VARS)} is set, but those are deliberately not read: "
                     "on a funded Alpaca account such a key can place orders, and this process "
-                    "executes through Trading 212. Generate data-only keys and export them "
-                    "under the names above.)"
+                    "executes through Trading 212. Generate keys on a paper account and export "
+                    "them under the names above.)"
                 )
             raise ProviderUnavailable(
                 f"alpaca credentials not found. Set {KEY_ID_VAR} and {SECRET_VAR}.{hint}"
@@ -169,19 +186,54 @@ class AlpacaProvider:
     def credential_findings(cls) -> tuple[str, ...]:
         """Anything worth reporting about the Alpaca credentials in scope.
 
-        Surfaced by `tb status` rather than raised, because an over-privileged
-        key is a posture problem, not a reason to refuse to fetch a price.
+        Surfaced by `tb doctor` rather than raised. Everything here is a posture
+        or configuration problem, never a reason to refuse to fetch a price:
+        Alpaca is optional, and a Yahoo-only store is a supported way to run.
+
+        The case worth catching early is a key exported under a name nothing
+        reads. Without this, the mistake stays silent until `tb data backfill`
+        fails several commands later — and it fails complaining about a missing
+        provider, which points at the wrong thing entirely.
         """
         findings: list[str] = []
+        key_id = (os.environ.get(KEY_ID_VAR) or "").strip()
+        secret = (os.environ.get(SECRET_VAR) or "").strip()
+
         for var in SDK_KEY_VARS:
             if os.environ.get(var):
                 findings.append(
                     f"{var} is set. This process never reads it, but a key under that name "
                     "usually carries trading permission on Alpaca — unnecessary blast radius "
-                    f"for a process that only needs prices. Use {KEY_ID_VAR}/{SECRET_VAR} "
-                    "with data-only keys."
+                    f"for a process that only needs prices. Use {KEY_ID_VAR}/{SECRET_VAR}, "
+                    "generated on a paper account."
                 )
+        for var in MISNAMED_KEY_VARS:
+            if os.environ.get(var):
+                findings.append(
+                    f"{var} is set, and nothing reads it. The names read here are "
+                    f"{KEY_ID_VAR}/{SECRET_VAR} — rename, or the feed stays unconfigured "
+                    "while looking configured."
+                )
+
+        if key_id and not secret:
+            findings.append(f"{KEY_ID_VAR} is set but {SECRET_VAR} is not; both are required.")
+        elif secret and not key_id:
+            findings.append(f"{SECRET_VAR} is set but {KEY_ID_VAR} is not; both are required.")
+        elif not key_id and not secret:
+            findings.append(
+                f"no Alpaca credentials ({KEY_ID_VAR}/{SECRET_VAR}). Yahoo-only is a supported "
+                "way to run, but raw prices and `tb data bakeoff` both need Alpaca — so the "
+                "minute-resolution question stays unmeasured and live resolutions stay [daily]."
+            )
         return tuple(findings)
+
+    @classmethod
+    def configured(cls) -> bool:
+        """Whether both credentials are present, without building a client."""
+        return bool(
+            (os.environ.get(KEY_ID_VAR) or "").strip()
+            and (os.environ.get(SECRET_VAR) or "").strip()
+        )
 
     @property
     def capabilities(self) -> ProviderCapabilities:

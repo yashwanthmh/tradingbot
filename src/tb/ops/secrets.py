@@ -16,6 +16,11 @@ The rules enforced here:
   gets the orders is not a state worth resolving by precedence rules.
 * A key that looks like a placeholder is reported, because a 400 from the
   broker at 09:30 is a worse place to learn this.
+
+Market-data credentials are *not* checked here. They are optional — every
+Yahoo-only workflow runs without them — and the logic belongs next to the
+variable names it reads, so it lives in `AlpacaProvider.credential_findings()`.
+`tb doctor` prints both.
 """
 
 from __future__ import annotations

@@ -22,6 +22,9 @@ from tb import __version__
 from tb.config.loader import PinnedLimits, load_hard_limits
 from tb.core.errors import TbError
 from tb.core.ids import new_run_id
+from tb.data.providers.alpaca import KEY_ID_VAR as ALPACA_KEY_ID_VAR
+from tb.data.providers.alpaca import SECRET_VAR as ALPACA_SECRET_VAR
+from tb.data.providers.alpaca import AlpacaProvider
 from tb.ledger.anchor import FileAnchorSink, GitAnchorSink, anchor_head
 from tb.ledger.events import Actor
 from tb.ledger.store import Ledger, default_ledger_path
@@ -212,6 +215,23 @@ def doctor(limits: LimitsOpt = None, db: DbOpt = None) -> None:
     if secrets.severity is Severity.FAIL:
         problems += 1
     elif secrets.findings:
+        warnings += 1
+
+    # The market-data feed, reported here and never fatal: Yahoo-only is a
+    # supported way to run. What this catches is a key exported under a name
+    # nothing reads, which otherwise stays silent until a backfill fails
+    # complaining about a missing provider.
+    data_findings = AlpacaProvider.credential_findings()
+    configured = AlpacaProvider.configured()
+    console.print(
+        f"{OK if configured else WARN} market data: "
+        f"[bold]{'alpaca + yahoo' if configured else 'yahoo only'}[/bold]"
+    )
+    console.print(f"  alpaca key {redact(os.environ.get(ALPACA_KEY_ID_VAR))}")
+    console.print(f"  alpaca secret {redact(os.environ.get(ALPACA_SECRET_VAR))}")
+    for finding in data_findings:
+        console.print(f"  {WARN} {escape(finding)}")
+    if data_findings:
         warnings += 1
 
     console.print(Panel.fit("[bold]Safety[/bold]", border_style="dim"))

@@ -42,7 +42,12 @@ from tb.data.provider import (
     to_scaled,
 )
 from tb.data.providers import AlpacaProvider, CsvFixtureProvider, YahooProvider, write_bar_csv
-from tb.data.providers.alpaca import KEY_ID_VAR, SDK_KEY_VARS, SECRET_VAR
+from tb.data.providers.alpaca import (
+    KEY_ID_VAR,
+    MISNAMED_KEY_VARS,
+    SDK_KEY_VARS,
+    SECRET_VAR,
+)
 
 UID = "isin:US0378331005"
 SYMBOL = "AAPL"
@@ -1001,8 +1006,79 @@ def test_alpaca_refuses_to_read_the_sdk_key_names(monkeypatch: pytest.MonkeyPatc
     assert "a-trading-key" not in message
 
     findings = AlpacaProvider.credential_findings()
-    assert len(findings) == len(SDK_KEY_VARS)
-    assert all("blast radius" in finding for finding in findings)
+    sdk_findings = [f for f in findings if "blast radius" in f]
+    assert len(sdk_findings) == len(SDK_KEY_VARS)
+    assert not AlpacaProvider.configured()
+
+
+def test_alpaca_reports_a_key_exported_under_a_name_nothing_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure this repo shipped with, caught where it is diagnosable.
+
+    `.env.example` named `ALPACA_API_KEY_ID`, which no code reads. Following it
+    left the feed unconfigured, and the only symptom arrived several commands
+    later as `ProviderUnavailable` — an error about a missing provider, which
+    points at the wrong thing entirely.
+    """
+    monkeypatch.delenv(KEY_ID_VAR, raising=False)
+    monkeypatch.delenv(SECRET_VAR, raising=False)
+    for var in SDK_KEY_VARS:
+        monkeypatch.delenv(var, raising=False)
+    for var in MISNAMED_KEY_VARS:
+        monkeypatch.setenv(var, "a-real-key-under-the-wrong-name")
+
+    findings = AlpacaProvider.credential_findings()
+    assert [f for f in findings if MISNAMED_KEY_VARS[0] in f]
+    assert all("a-real-key-under-the-wrong-name" not in f for f in findings)
+
+    with pytest.raises(ProviderUnavailable) as caught:
+        AlpacaProvider.from_env()
+    message = str(caught.value)
+    assert MISNAMED_KEY_VARS[0] in message
+    assert KEY_ID_VAR in message
+    assert "a-real-key-under-the-wrong-name" not in message
+
+
+def test_alpaca_reports_half_a_credential_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(KEY_ID_VAR, "data-key")
+    monkeypatch.delenv(SECRET_VAR, raising=False)
+    for var in SDK_KEY_VARS + MISNAMED_KEY_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+    findings = AlpacaProvider.credential_findings()
+    assert len(findings) == 1
+    assert SECRET_VAR in findings[0]
+    assert not AlpacaProvider.configured()
+
+
+def test_alpaca_reports_nothing_once_both_names_are_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KEY_ID_VAR, "data-key")
+    monkeypatch.setenv(SECRET_VAR, "data-secret")
+    for var in SDK_KEY_VARS + MISNAMED_KEY_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+    assert AlpacaProvider.credential_findings() == ()
+    assert AlpacaProvider.configured()
+
+
+def test_env_example_only_names_alpaca_variables_the_code_reads() -> None:
+    """The test that would have caught the original defect.
+
+    A template naming a variable nothing reads is worse than no template: it
+    looks authoritative, and the resulting failure names the provider rather
+    than the typo.
+    """
+    template = Path(__file__).resolve().parents[1] / ".env.example"
+    named = {
+        line.split("=", 1)[0].lstrip("# ").strip()
+        for line in template.read_text().splitlines()
+        if "=" in line and line.lstrip("# ").strip().startswith("ALPACA")
+    }
+    assert named, "the template stopped mentioning Alpaca at all"
+    assert named == {KEY_ID_VAR, SECRET_VAR}
 
 
 def test_alpaca_from_env_builds_when_the_data_keys_are_present(
