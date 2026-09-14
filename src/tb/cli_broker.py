@@ -480,10 +480,16 @@ def symbols_audit(
 ) -> None:
     """Derive and report the Trading 212 -> data-provider symbol mapping.
 
-    Derivation alone never makes an instrument tradable. Promotion to
-    `verified` needs a price comparison against the broker's own quote, which
-    needs the market-data layer from M2 — so on a fresh install this command
-    correctly reports everything as not yet tradable.
+    Derivation alone never makes an instrument tradable. There are two verified
+    tiers above it, and the distinction is what stops the whole system
+    deadlocking: `cross_verified` is two feeds plus reference data agreeing,
+    which needs no broker quote and authorises a floor-notional entry;
+    `verified` is the broker's own quote agreeing, which only becomes possible
+    once a position exists, and permits full size.
+
+    `enterable` is the number to watch. While it is zero, the bot cannot open
+    its first position at all — run `tb data backfill` so the cross-provider
+    tier has bars to compare.
     """
     pinned = _load(limits)
     with _ledger(db, pinned) as ledger:
@@ -517,10 +523,22 @@ def symbols_audit(
         table.add_row("instruments", str(summary["n_instruments"]))
         table.add_row("mapped", str(summary["n_mapped"]))
         table.add_row("unmapped", f"[yellow]{summary['n_unmapped']}[/yellow]")
-        table.add_row("verified (tradable)", f"[green]{summary['n_verified']}[/green]")
+        table.add_row(
+            "verified by broker quote (full size)", f"[green]{summary['n_verified']}[/green]"
+        )
+        table.add_row(
+            "cross-verified (floor size only)",
+            f"[green]{summary['n_cross_verified']}[/green]",
+        )
         table.add_row("derived (not tradable yet)", str(summary["n_derived"]))
         table.add_row("ambiguous", f"[yellow]{summary['n_ambiguous']}[/yellow]")
         table.add_row("blocked", f"[red]{summary['n_blocked']}[/red]")
+        table.add_row(
+            "enterable",
+            f"[green]{summary['n_enterable']}[/green]"
+            if summary["n_enterable"]
+            else "[red]0[/red]",
+        )
         console.print(table)
         console.print(f"\n[dim]this run derived: {counts}[/dim]")
 
@@ -542,11 +560,20 @@ def symbols_audit(
             for mapping in ambiguous:
                 console.print(f"  • {mapping.t212_ticker} -> {mapping.data_symbol}")
 
-        if summary["n_verified"] == 0:
+        if summary["n_enterable"] == 0:
             console.print(
-                f"\n{WARN} nothing is verified, so nothing may be entered. Verification "
-                "compares the broker's quote against the data feed, which needs the "
-                "market-data layer (M2). Exits are never gated on this."
+                f"\n{WARN} nothing is enterable yet, so the first position cannot be "
+                "opened. The cross-provider tier needs two feeds' bars to compare — run "
+                "`tb data backfill` and re-run this. Note that the broker only quotes "
+                "instruments it already holds, which is why that tier exists at all. "
+                "Exits are never gated on any of this."
+            )
+        elif summary["n_verified"] == 0:
+            console.print(
+                f"\n{OK} {summary['n_cross_verified']} symbol(s) are cross-verified, so a "
+                "floor-notional entry is possible. Full size needs the broker's own "
+                "quote, which arrives once a position is held — that first entry is the "
+                "evidence-gathering trade."
             )
 
 
@@ -576,6 +603,14 @@ def symbols_show(
         table.add_row("provider", mapping.provider)
         table.add_row("currency", mapping.currency_code or "—")
         table.add_row("confidence", mapping.confidence.value)
+        table.add_row(
+            "size permitted",
+            "full"
+            if mapping.permits_full_size
+            else "floor notional only"
+            if mapping.may_enter
+            else "[red]none[/red]",
+        )
         table.add_row("derivation", escape(mapping.derivation))
         table.add_row("verified at", mapping.verified_at or "[yellow]never[/yellow]")
         table.add_row(

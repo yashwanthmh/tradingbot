@@ -67,20 +67,52 @@ _MINOR_UNIT_CURRENCIES = frozenset({"GBX", "GBP_MINOR", "ZAC"})
 
 
 class Confidence(StrEnum):
-    """How much the mapping is trusted.
+    """How much the mapping is trusted, in two verified tiers.
 
-    Only `VERIFIED` permits a new entry. `DERIVED` means the rules produced a
-    plausible symbol that nothing has confirmed.
+    Two tiers rather than one, because one tier deadlocks. Trading 212 reports
+    `currentPrice` only on `/equity/portfolio` — that is, only for positions
+    **already held**. So a broker quote is obtainable only for a symbol we own,
+    and if owning one requires a broker quote first, the first position can
+    never be opened. `tb symbols audit` printing "nothing is verified" was not a
+    pending TODO; it was that deadlock.
+
+    * `CROSS_VERIFIED` (weak) is corroboration that does not need the broker:
+      two independent feeds agreeing on the price, plus matching currency and
+      name against the broker's own instrument record. It authorises the
+      **first floor-notional entry and nothing more** — which is what breaks
+      the cycle, at a bounded cost.
+    * `VERIFIED` (strong) is the broker's own quote agreeing with the feed,
+      which becomes possible once the position exists. It permits full size.
+
+    The weak tier is deliberately cheap to obtain and expensive to rely on: its
+    whole job is to risk one floor-notional position in order to unlock the
+    evidence the strong tier needs.
     """
 
     VERIFIED = "verified"
+    CROSS_VERIFIED = "cross_verified"
     DERIVED = "derived"
     AMBIGUOUS = "ambiguous"
     UNMAPPED = "unmapped"
 
     @property
     def tradable(self) -> bool:
+        """Whether a new position may be opened at all — at *some* size."""
+        return self in (Confidence.VERIFIED, Confidence.CROSS_VERIFIED)
+
+    @property
+    def permits_full_size(self) -> bool:
+        """Whether the position may exceed the floor notional.
+
+        Only the broker's own quote earns this. Cross-provider agreement says
+        two vendors describe the same instrument; it does not say the broker
+        agrees that the ticker we are about to send maps to it.
+        """
         return self is Confidence.VERIFIED
+
+    @property
+    def floor_size_only(self) -> bool:
+        return self is Confidence.CROSS_VERIFIED
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,8 +145,17 @@ class SymbolMapping:
 
     @property
     def may_enter(self) -> bool:
-        """New positions need a verified, unblocked mapping."""
+        """New positions need a verified, unblocked mapping — at some size.
+
+        Coarse on purpose: whether the *size* is capped to the floor notional is
+        `permits_full_size`, and the gate that enforces it is
+        `tb.data.verification.SymbolVerifier.entry_permission`.
+        """
         return self.confidence.tradable and not self.blocked
+
+    @property
+    def permits_full_size(self) -> bool:
+        return self.confidence.permits_full_size and not self.blocked
 
     @property
     def may_exit(self) -> bool:
@@ -446,9 +487,20 @@ class SymbolMap:
             return False, (
                 f"{t212_ticker} -> {mapping.data_symbol or '(none)'} is "
                 f"{mapping.confidence.value}, not verified ({mapping.derivation}). "
-                "A derived mapping has not been confirmed against the broker's own quote."
+                "A derived mapping has been confirmed by nothing at all — neither a "
+                "second feed nor the broker's own quote."
             )
-        return True, "mapping verified"
+        if mapping.confidence.floor_size_only:
+            # Said out loud rather than left to the caller to infer. A bool that
+            # means "yes, but only at the floor" read as plain "yes" is the whole
+            # risk of having a weak tier at all.
+            return True, (
+                "cross-provider verified only: FLOOR NOTIONAL ONLY. Two feeds agree and "
+                "the reference data matches, but the broker has not confirmed this "
+                "mapping — it cannot until a position exists. Size with "
+                "`SymbolVerifier.entry_permission`, which enforces the cap."
+            )
+        return True, "broker-quote verified; full size permitted"
 
     def may_exit(self, t212_ticker: str) -> tuple[bool, str]:
         """Always permitted. See `SymbolMapping.may_exit`."""
@@ -482,15 +534,32 @@ class SymbolMap:
             actor=Actor.SYSTEM,
         )
 
-    def verify(self, comparison: PriceComparison, *, limit_bps: float) -> None:
-        """Promote a derived mapping to verified after prices agree."""
+    def verify(
+        self,
+        comparison: PriceComparison,
+        *,
+        limit_bps: float,
+        confidence: Confidence = Confidence.VERIFIED,
+    ) -> None:
+        """Promote a mapping to a verified tier after prices agree.
+
+        `confidence` names which tier the evidence supports. It defaults to the
+        strong tier so the M1 call sites keep their meaning, and
+        `SymbolVerifier` passes `CROSS_VERIFIED` for the weak one — see
+        `tb.data.verification` for why one tier deadlocks.
+        """
+        if not confidence.tradable:
+            raise ValueError(
+                f"verify() was asked to record {confidence.value}, which is not a "
+                "verified tier. Use block() to record a failure."
+            )
         timestamp = now_iso()
         self._ledger.conn.execute(
             "UPDATE symbol_map SET confidence = ?, verified_at = ?, "
             "last_disagreement_bps = ?, last_checked_at = ?, blocked = 0, "
             "blocked_reason = NULL WHERE t212_ticker = ?",
             (
-                Confidence.VERIFIED.value,
+                confidence.value,
                 timestamp,
                 comparison.disagreement_bps,
                 timestamp,
@@ -524,10 +593,13 @@ class SymbolMap:
         for instrument in instruments:
             mapping = derive_mapping(instrument, provider=self._provider)
             existing = self.get(instrument.ticker)
-            # Preserve an existing verification rather than demoting it.
-            if existing is not None and existing.confidence is Confidence.VERIFIED:
+            # Preserve an existing verification rather than demoting it. Both
+            # tiers are preserved: re-deriving would otherwise reset every
+            # cross-verified symbol to untradable on each audit, re-creating the
+            # deadlock one audit at a time.
+            if existing is not None and existing.confidence.tradable:
                 if existing.data_symbol == mapping.data_symbol:
-                    counts[Confidence.VERIFIED.value] += 1
+                    counts[existing.confidence.value] += 1
                     continue
                 # The derived symbol changed, which invalidates the old
                 # verification: whatever was confirmed is not what we would use.
@@ -552,6 +624,9 @@ class SymbolMap:
             "n_mapped": sum(1 for m in rows if m.data_symbol),
             "n_unmapped": sum(1 for m in rows if not m.data_symbol),
             "n_verified": sum(1 for m in rows if m.confidence is Confidence.VERIFIED),
+            "n_cross_verified": sum(1 for m in rows if m.confidence is Confidence.CROSS_VERIFIED),
+            # What the deadlock check actually asks: is *anything* enterable?
+            "n_enterable": sum(1 for m in rows if m.may_enter),
             "n_derived": sum(1 for m in rows if m.confidence is Confidence.DERIVED),
             "n_ambiguous": sum(1 for m in rows if m.confidence is Confidence.AMBIGUOUS),
             "n_blocked": sum(1 for m in rows if m.blocked),

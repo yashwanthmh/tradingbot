@@ -352,19 +352,23 @@ class TestSymbolCommands:
                 ],
             )
 
-    def test_audit_reports_nothing_tradable_before_verification(self, env: dict[str, Any]) -> None:
-        """The correct default for a join this dangerous.
+    def test_audit_reports_nothing_enterable_before_verification(self, env: dict[str, Any]) -> None:
+        """The correct default for a join this dangerous, and it names the remedy.
 
-        Derivation proposes a symbol; only a price comparison against the
-        broker's own quote confirms it, and that needs the M2 data layer.
+        Derivation proposes a symbol; nothing has confirmed it. `enterable` is
+        the number that matters — while it is zero the first position cannot be
+        opened — so the message says which command produces the bars the
+        cross-provider tier needs, rather than leaving a dead end.
         """
         _run(["init", *env["args"]])
         self._seed(env)
         result = _run(["symbols", "audit", *env["args"]])
         assert result.exit_code == 0
         out = _out(result)
-        assert "verified (tradable)" in out
-        assert "nothing is verified" in out
+        assert "cross-verified" in out
+        assert "enterable" in out
+        assert "nothing is enterable yet" in out
+        assert "tb data backfill" in out
         assert "Exits are never gated" in out
 
     def test_audit_maps_a_us_listing_and_refuses_a_non_us_one_for_alpaca(
