@@ -586,6 +586,62 @@ class BarStore:
         ).fetchall()
         return sorted(str(row["instrument_uid"]) for row in rows)
 
+    # -- the catalog, for sealing a vintage --------------------------------
+
+    def live_partitions(
+        self,
+        *,
+        instrument_uid: str | None = None,
+        resolution: Resolution | None = None,
+    ) -> list[PartitionInfo]:
+        """Every catalog row that is still part of the dataset.
+
+        `superseded_by IS NULL` is the whole filter: a compaction re-seals the
+        union of overlapping partitions and retires the originals, so including
+        them would count the same bars twice in a vintage's row total and make
+        its manifest depend on compaction history.
+        """
+        sql = "SELECT * FROM data_partitions WHERE superseded_by IS NULL"
+        params: list[Any] = []
+        if instrument_uid is not None:
+            sql += " AND instrument_uid = ?"
+            params.append(instrument_uid)
+        if resolution is not None:
+            sql += " AND resolution = ?"
+            params.append(resolution.value)
+        sql += " ORDER BY instrument_uid, resolution, first_bar_open"
+        return [_row_to_partition(row) for row in self._ledger.conn.execute(sql, params)]
+
+    def partition_by_hash(self, file_sha256: str) -> PartitionInfo | None:
+        row = self._ledger.conn.execute(
+            "SELECT * FROM data_partitions WHERE file_sha256 = ?", (file_sha256,)
+        ).fetchone()
+        return None if row is None else _row_to_partition(row)
+
+    def read_partition(self, relative_path: str) -> list[Bar]:
+        """Read one named partition file.
+
+        Public because a sealed vintage is defined as a *set of file hashes*,
+        and reading it means reading exactly those files — not whatever the
+        catalog currently says about an instrument. That distinction is what
+        makes a vintage immutable under later ingestion.
+        """
+        return self._read_partition(relative_path)
+
+    def file_hash_on_disk(self, relative_path: str) -> str | None:
+        path = self._root / relative_path
+        return _file_sha256(path) if path.exists() else None
+
+    def has_hot_rows(self) -> bool:
+        """Whether any bars are still staged rather than sealed.
+
+        A vintage must reference only immutable Parquet, so sealing one while
+        rows sit in `bars_hot` would produce a snapshot missing the newest
+        data — silently, because the catalog would look complete.
+        """
+        row = self._ledger.conn.execute("SELECT 1 FROM bars_hot LIMIT 1").fetchone()
+        return row is not None
+
     # -- integrity ---------------------------------------------------------
 
     def verify_partitions(self) -> list[str]:
@@ -900,3 +956,18 @@ __all__ = [
     "RevisionKind",
     "rows_hash",
 ]
+
+
+def _row_to_partition(row: sqlite3.Row) -> PartitionInfo:
+    return PartitionInfo(
+        file_sha256=str(row["file_sha256"]),
+        relative_path=str(row["relative_path"]),
+        instrument_uid=str(row["instrument_uid"]),
+        resolution=Resolution(str(row["resolution"])),
+        provider=str(row["provider"]),
+        first_bar_open=from_iso(str(row["first_bar_open"])),
+        last_bar_open=from_iso(str(row["last_bar_open"])),
+        row_count=int(row["row_count"]),
+        byte_size=int(row["byte_size"]),
+        rows_hash=str(row["rows_hash"]),
+    )
