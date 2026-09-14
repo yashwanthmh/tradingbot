@@ -420,10 +420,22 @@ class BarStore:
         ordered = dedupe_vintages(bars)
         uids = {bar.instrument_uid for bar in ordered}
         resolutions = {bar.resolution for bar in ordered}
+        providers = {bar.provider for bar in ordered}
         if len(uids) != 1 or len(resolutions) != 1:
             raise DataError(
                 "a partition holds one instrument at one resolution; got "
                 f"{len(uids)} instrument(s) and {len(resolutions)} resolution(s)"
+            )
+        if providers != {provider}:
+            # Asserted, not tolerated. A partition labelled with one provider
+            # but containing another's bars makes the catalog lie about where
+            # its rows came from — and the cross-provider check, which is the
+            # only defence against a mismapped ticker, would then be comparing
+            # a feed against itself.
+            raise DataError(
+                f"a partition holds one provider's bars; sealing as {provider!r} but the "
+                f"bars come from {sorted(providers)}. Two providers' observations of the "
+                "same period are different data and belong in different partitions."
             )
         uid = ordered[0].instrument_uid
         resolution = ordered[0].resolution
@@ -522,7 +534,7 @@ class BarStore:
             bars = list(self._hot_bars(uid, res, provider))
             if not bars:
                 continue
-            existing = self._sealed_partitions(uid, res)
+            existing = self._sealed_partitions(uid, res, provider=provider)
             supersedes = [
                 str(row["file_sha256"])
                 for row in existing
@@ -767,14 +779,33 @@ class BarStore:
             )
         return [_dict_to_bar(row) for row in table.to_pylist()]
 
-    def _sealed_partitions(self, instrument_uid: str, resolution: Resolution) -> list[sqlite3.Row]:
-        return list(
-            self._ledger.conn.execute(
-                "SELECT * FROM data_partitions WHERE instrument_uid = ? AND resolution = ? "
-                "AND superseded_by IS NULL ORDER BY first_bar_open",
-                (instrument_uid, resolution.value),
-            ).fetchall()
+    def _sealed_partitions(
+        self,
+        instrument_uid: str,
+        resolution: Resolution,
+        *,
+        provider: str | None = None,
+    ) -> list[sqlite3.Row]:
+        """Live partitions for an instrument, optionally for one provider only.
+
+        `provider` matters for supersession and not for reading. Two providers'
+        bars for the same instrument and period are *different observations*,
+        both legitimate, and each lives in its own partition — the catalog has a
+        `provider` column for exactly that reason. Without the filter,
+        compaction treated an overlapping Alpaca partition as something a Yahoo
+        seal should replace, merged both providers' rows into one file, and
+        labelled the result with whichever provider happened to compact second.
+        The cross-provider check then had nothing left to compare.
+        """
+        sql = (
+            "SELECT * FROM data_partitions WHERE instrument_uid = ? AND resolution = ? "
+            "AND superseded_by IS NULL"
         )
+        params: list[Any] = [instrument_uid, resolution.value]
+        if provider is not None:
+            sql += " AND provider = ?"
+            params.append(provider)
+        return list(self._ledger.conn.execute(sql + " ORDER BY first_bar_open", params))
 
     def _hot_groups(
         self, instrument_uid: str | None, resolution: Resolution | None

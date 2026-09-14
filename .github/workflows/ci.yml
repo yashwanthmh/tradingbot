@@ -66,8 +66,86 @@ jobs:
           uv run tb broker limits
           uv run tb broker drift
 
-      - name: Probe refuses to characterise a real-money account
+      - name: Data layer smoke test (no network)
         env:
+          TB_VAR_DIR: var
+        run: |
+          # Every command here reads the local store; none reaches the network.
+          uv run tb data audit
+          uv run tb data verify
+          uv run tb data vintages
+          uv run tb data coverage
+          # An empty store must refuse to seal rather than produce a vintage
+          # over no data — that would be admissible-looking evidence for a
+          # backtest that examined nothing.
+          if uv run tb data seal; then
+            echo "::error::tb data seal produced a vintage from an empty store"
+            exit 1
+          fi
+          echo "seal correctly refused an empty store"
+
+      - name: A sealed vintage refuses to load once its files change
+        env:
+          TB_VAR_DIR: var
+        run: |
+          # The immutability guarantee, exercised end to end. Yahoo restates
+          # history routinely, so a vintage that loaded with different bytes
+          # would make every promotion resting on it unfalsifiable.
+          python - <<'PY'
+          from datetime import UTC, datetime, timedelta
+          from decimal import Decimal
+          from pathlib import Path
+
+          from tb.data.barstore import BarStore
+          from tb.data.calendar import TradingCalendar
+          from tb.data.provider import Bar, BarBatch, Provenance, Resolution, Session
+          from tb.data.snapshot import SnapshotStore
+          from tb.ledger.store import Ledger
+
+          cal = TradingCalendar()
+          uid = "isin:US0378331005"
+          days = [s.day for s in cal.sessions_between(
+              datetime(2026, 3, 2).date(), datetime(2026, 3, 6).date()
+          )]
+
+          with Ledger(Path("var/ledger.db")) as ledger:
+              store = BarStore(ledger, root=Path("var/bars"))
+              bars = []
+              for index, day in enumerate(days):
+                  opened = datetime(day.year, day.month, day.day, tzinfo=UTC)
+                  price = Decimal("100.00") + Decimal(index)
+                  bars.append(Bar(
+                      instrument_uid=uid, resolution=Resolution.DAILY,
+                      bar_open_utc=opened,
+                      available_at_utc=opened + timedelta(days=1),
+                      ingested_at_utc=opened + timedelta(days=1),
+                      provider="ci", provenance=Provenance.BACKFILL,
+                      session=Session.REGULAR, open=price, high=price,
+                      low=price, close=price, volume=1_000_000,
+                  ))
+              store.ingest(BarBatch(
+                  bars=tuple(bars), provider="ci", symbol="AAPL",
+                  resolution=Resolution.DAILY,
+                  requested_start=bars[0].bar_open_utc,
+                  requested_end=bars[-1].bar_open_utc,
+              ))
+              vintage = SnapshotStore(ledger, store, calendar=cal).seal(
+                  resolutions=[Resolution.DAILY]
+              )
+              Path("var/vintage_id").write_text(vintage.vintage_id)
+              print(f"sealed {vintage.vintage_id}")
+          PY
+          VINTAGE=$(cat var/vintage_id)
+          uv run tb data verify "$VINTAGE"
+          # Now alter the bytes the vintage names and require a refusal.
+          find var/bars -name '*.parquet' -exec sh -c 'printf tampered > "$1"' _ {} \;
+          if uv run tb data verify "$VINTAGE"; then
+            echo "::error::a vintage loaded after its files changed — immutability is not enforced"
+            exit 1
+          fi
+          echo "vintage correctly refused altered files"
+
+      - name: Probe refuses to characterise a real-money account        env:
           TB_VAR_DIR: var
           T212_LIVE_API_KEY: ci-placeholder-live-key
         run: |

@@ -124,7 +124,7 @@ data*, then *can I reconcile broker state*, then *is there any edge after costs*
 |---|---|---|
 | M0 | Ledger, hard limits, kill switch, run state | **done** |
 | M1 | Broker adapter (read-only), rate governor, reconciler, symbol map | **done** |
-| M2 | Point-in-time data layer, provider bake-off | |
+| M2 | Point-in-time data layer, provider bake-off | **done** |
 | M3 | Cost model, non-cheating backtester, strategy DSL | |
 | M4 | Risk engine, live loop, crash drills | |
 | M5 | Registry, promotion gate, capital allocator | |
@@ -162,6 +162,50 @@ period — it prints progress so you can tell it apart from a hang.
 
 Nothing in M1 can place or cancel an order, and that is enforced rather than
 trusted: the client rejects any endpoint outside its read-only set.
+
+Then build the dataset. These run in this order because each needs the one
+before it:
+
+```bash
+tb universe build             # pick the symbols, record a dated snapshot
+tb data backfill              # fetch history (Yahoo for daily depth)
+tb data backfill --provider alpaca --resolution minute
+tb data actions               # splits and dividends as dated facts
+tb data audit                 # exits 1 if anything blocks
+tb data bakeoff               # the paid-data decision, as arithmetic
+tb data seal                  # a vintage_id M3 can cite
+```
+
+Three things about the data layer that are load-bearing rather than
+decorative:
+
+**Every bar carries three time axes.** Event time, *knowledge* time
+(`bar_close + provider_delay + ingest`, stored rather than recomputed), and
+vintage time. The staleness bound is evaluated against knowledge time, never
+bar time — a fifteen-minute-delayed feed produces bars whose timestamps look
+current, and measuring the wrong axis is exactly what makes such a feed appear
+usable.
+
+**A backtest whose `vintage_id` is not in the ledger is not admissible
+evidence.** Yahoo back-adjusts history as a matter of course, so re-running the
+same backtest against "the store" next month legitimately produces different
+numbers with nothing recording why. `tb data seal` freezes a named, hashed set
+of files — plus the action, FX, calendar and universe hashes — and loading one
+re-hashes every file and refuses on a mismatch.
+
+**`tb data bakeoff` answers "is this the bar the market saw", not "did the bar
+arrive in time".** Alpaca's free tier is IEX-only, ~2% of consolidated volume,
+so its disagreement with the tape sits in the same 5-20bps band as the whole
+gross edge. The output is one number — the gross edge a strategy would need
+before the feed's own error is small enough to trade through — set against the
+~30bps a round trip already costs. Until that measurement passes,
+`data.allowed_live_resolutions` stays `[daily]`.
+
+Two API keys are needed for the data layer, both data-only and read from
+`ALPACA_DATA_KEY_ID` / `ALPACA_DATA_SECRET_KEY`. The SDK-standard
+`APCA_API_KEY_ID` is deliberately *not* read as a fallback: on a funded Alpaca
+account that key can place orders, and this process executes through Trading
+212.
 
 Trading 212 issues a **separate API key per environment**, and the app must be switched to
 Practice mode *before* you generate the demo key or you will get a live one. The two keys

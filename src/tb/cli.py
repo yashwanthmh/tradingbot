@@ -51,6 +51,12 @@ from tb.cli_broker import broker_app, reconcile_command, symbols_app  # noqa: E4
 app.add_typer(broker_app, name="broker")
 app.add_typer(symbols_app, name="symbols")
 
+# M2: the point-in-time data layer.
+from tb.cli_data import data_app, universe_app  # noqa: E402
+
+app.add_typer(data_app, name="data")
+app.add_typer(universe_app, name="universe")
+
 
 @app.command("reconcile")
 def reconcile(

@@ -173,66 +173,75 @@ class DataAuditor:
         for resolution in resolutions:
             latest_by_uid: dict[str, Bar] = {}
             for uid in uids:
-                bars = dedupe_latest(self._store.bars_for(uid, resolution))
-                if not bars:
+                everything = dedupe_latest(self._store.bars_for(uid, resolution))
+                if not everything:
                     continue
-                report.n_bars_checked += len(bars)
-                if bars:
-                    latest_by_uid[uid] = bars[-1]
+                report.n_bars_checked += len(everything)
+                latest_by_uid[uid] = everything[-1]
 
-                window_start = start or bars[0].bar_open_utc.date()
-                window_end = end or bars[-1].bar_open_utc.date()
                 thin = volumes.get(uid, Decimal(0)) < THIN_NAME_DOLLAR_VOLUME
 
-                coverage, coverage_findings = check_coverage(
-                    bars,
-                    instrument_uid=uid,
-                    resolution=resolution,
-                    start=window_start,
-                    end=window_end,
-                    calendar=self._calendar,
-                    max_unexplained_pct=self._max_gap_pct,
-                    halted_dates=halts.get(uid, ()),
-                    thin_name=thin,
-                )
-                report.coverage.append(coverage)
-                report.findings.extend(coverage_findings)
+                # Per provider, not per instrument. Two feeds' bars for the same
+                # instrument interleave by bar time into something that is not a
+                # time series: `check_ordering` would see every period twice,
+                # `check_jumps` would compare one feed's close to the other's
+                # open, and `check_coverage` over the union would report perfect
+                # coverage even where one feed had nothing at all. Each feed's
+                # own series is the only thing these checks can read.
+                for provider in sorted({bar.provider for bar in everything}):
+                    bars = [bar for bar in everything if bar.provider == provider]
+                    window_start = start or bars[0].bar_open_utc.date()
+                    window_end = end or bars[-1].bar_open_utc.date()
 
-                report.findings.extend(
-                    check_ordering(bars, instrument_uid=uid, resolution=resolution)
-                )
-                report.findings.extend(
-                    check_knowledge_times(bars, instrument_uid=uid, resolution=resolution)
-                )
-                report.findings.extend(
-                    check_stale_repeats(bars, instrument_uid=uid, resolution=resolution)
-                )
-                report.findings.extend(
-                    check_intrabar_range(bars, instrument_uid=uid, resolution=resolution)
-                )
-                report.findings.extend(
-                    check_zero_volume_sessions(bars, instrument_uid=uid, resolution=resolution)
-                )
-                report.findings.extend(
-                    check_provenance(bars, instrument_uid=uid, resolution=resolution)
-                )
-
-                if resolution is Resolution.DAILY:
-                    # The jump detector runs on daily bars only. At minute
-                    # resolution every overnight gap is a "jump" and the signal
-                    # drowns; and on an adjusted series the jump has already
-                    # been removed, so a detector that never fires reads as
-                    # evidence of absence.
-                    jump_findings, suspicions = check_jumps(
+                    coverage, coverage_findings = check_coverage(
                         bars,
                         instrument_uid=uid,
                         resolution=resolution,
-                        known_actions=self._actions.actions_for(uid, as_of=moment),
+                        start=window_start,
+                        end=window_end,
+                        calendar=self._calendar,
+                        max_unexplained_pct=self._max_gap_pct,
+                        halted_dates=halts.get(uid, ()),
+                        thin_name=thin,
                     )
-                    report.findings.extend(jump_findings)
-                    report.suspicions.extend(suspicions)
+                    report.coverage.append(coverage)
+                    report.findings.extend(coverage_findings)
 
-                self._write_coverage(coverage, bars)
+                    report.findings.extend(
+                        check_ordering(bars, instrument_uid=uid, resolution=resolution)
+                    )
+                    report.findings.extend(
+                        check_knowledge_times(bars, instrument_uid=uid, resolution=resolution)
+                    )
+                    report.findings.extend(
+                        check_stale_repeats(bars, instrument_uid=uid, resolution=resolution)
+                    )
+                    report.findings.extend(
+                        check_intrabar_range(bars, instrument_uid=uid, resolution=resolution)
+                    )
+                    report.findings.extend(
+                        check_zero_volume_sessions(bars, instrument_uid=uid, resolution=resolution)
+                    )
+                    report.findings.extend(
+                        check_provenance(bars, instrument_uid=uid, resolution=resolution)
+                    )
+
+                    if resolution is Resolution.DAILY:
+                        # The jump detector runs on daily bars only. At minute
+                        # resolution every overnight gap is a "jump" and the
+                        # signal drowns; and on an adjusted series the jump has
+                        # already been removed, so a detector that never fires
+                        # reads as evidence of absence.
+                        jump_findings, suspicions = check_jumps(
+                            bars,
+                            instrument_uid=uid,
+                            resolution=resolution,
+                            known_actions=self._actions.actions_for(uid, as_of=moment),
+                        )
+                        report.findings.extend(jump_findings)
+                        report.suspicions.extend(suspicions)
+
+                    self._write_coverage(coverage, bars)
 
             report.findings.extend(
                 check_frozen_feed(latest_by_uid, now=moment, limit_seconds=self._max_delay)

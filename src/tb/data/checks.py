@@ -354,12 +354,18 @@ def check_ordering(
 ) -> tuple[Finding, ...]:
     """Bars must arrive in time order with no duplicate periods.
 
-    A duplicate `bar_open_utc` from the same provider at the same vintage means
-    the read path collapsed vintages wrongly, and every feature over the window
-    is then computed on a doubled bar.
+    Expects **one provider's** series. Two providers' bars for the same period
+    are different observations, both legitimate, so a duplicate is keyed on
+    `(bar_open, provider)` — and a multi-provider series interleaved by bar
+    time is not a time series at all, which is why `audit.py` groups by
+    provider before calling this.
+
+    A genuine duplicate — same period, same provider, same vintage — means the
+    read path collapsed vintages wrongly, and every feature over the window is
+    then computed on a doubled bar.
     """
     findings: list[Finding] = []
-    seen: dict[datetime, Bar] = {}
+    seen: dict[tuple[datetime, str], Bar] = {}
     previous: Bar | None = None
     for bar in bars:
         if previous is not None and bar.bar_open_utc < previous.bar_open_utc:
@@ -377,7 +383,8 @@ def check_ordering(
                     ),
                 )
             )
-        existing = seen.get(bar.bar_open_utc)
+        key = (bar.bar_open_utc, bar.provider)
+        existing = seen.get(key)
         if existing is not None and existing.ingested_at_utc == bar.ingested_at_utc:
             findings.append(
                 Finding(
@@ -388,12 +395,12 @@ def check_ordering(
                     at=bar.bar_open_utc,
                     detail=(
                         f"two bars for {bar.bar_open_utc.isoformat()} at the same vintage "
-                        "from the same provider — a vintage collapse, which doubles this "
+                        f"from {bar.provider} — a vintage collapse, which doubles this "
                         "bar's weight in every feature over the window"
                     ),
                 )
             )
-        seen[bar.bar_open_utc] = bar
+        seen[key] = bar
         previous = bar
     return tuple(findings)
 
