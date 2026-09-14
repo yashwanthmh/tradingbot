@@ -1,0 +1,150 @@
+# The paid-data decision, taken somewhere with a network.
+#
+# `tb data bakeoff` needs real bars from two feeds over the same window, and
+# the development sandbox this repo is built in cannot reach either provider —
+# its egress policy denies data.alpaca.markets and query1.finance.yahoo.com
+# outright. A GitHub runner can, and the Alpaca credentials are already here as
+# repository secrets, so this is where the measurement actually happens.
+#
+# Manual dispatch only. It is a measurement, not a check: it costs provider
+# quota, its answer changes slowly, and running it per push would tell you
+# nothing new while burning the rate limit that the real backfill needs.
+#
+# **This job holds no trading credentials.** T212_DEMO_API_KEY and
+# T212_LIVE_API_KEY are deliberately absent from the env below, so nothing here
+# can place, cancel or even read an order. It fetches prices and does
+# arithmetic.
+
+name: Data bake-off
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Provider symbols to compare (comma-separated)"
+        default: "AAPL,MSFT,NVDA,AMZN,GOOGL,META,JPM,XOM,UNH,SPY"
+        required: false
+      minute_days:
+        description: "Days of minute history (Yahoo serves ~30 at 1m)"
+        default: "25"
+        required: false
+      resolution:
+        description: "Resolution to measure: minute or daily"
+        default: "minute"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never two of these at once: they would race for the same provider quota and
+  # both get throttled, producing a delay distribution that measures the
+  # collision rather than the feed.
+  group: data-bakeoff
+  cancel-in-progress: false
+
+jobs:
+  bakeoff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TB_VAR_DIR: var
+      ALPACA_DATA_KEY_ID: ${{ secrets.ALPACA_DATA_KEY_ID }}
+      ALPACA_DATA_SECRET_KEY: ${{ secrets.ALPACA_DATA_SECRET_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.11"
+
+      - name: Sync dependencies
+        run: uv sync --all-extras
+
+      - name: Check the credentials arrived
+        run: |
+          # Fail early and legibly. Without this the first symptom is a 401
+          # inside a fetch loop, reported per symbol, forty lines down.
+          if [ -z "${ALPACA_DATA_KEY_ID}" ] || [ -z "${ALPACA_DATA_SECRET_KEY}" ]; then
+            echo "::error::ALPACA_DATA_KEY_ID / ALPACA_DATA_SECRET_KEY are not set as repository secrets"
+            exit 1
+          fi
+          uv run tb init
+          # doctor redacts every credential it prints; see ops/secrets.redact.
+          uv run tb doctor
+
+      - name: Backfill the reference feed (Yahoo)
+        run: |
+          uv run tb data backfill \
+            --provider yahoo \
+            --resolution '${{ inputs.resolution }}' \
+            --days '${{ inputs.minute_days }}' \
+            --data-symbols '${{ inputs.symbols }}' \
+            --no-fx
+
+      - name: Backfill the feed under test (Alpaca IEX)
+        run: |
+          uv run tb data backfill \
+            --provider alpaca \
+            --resolution '${{ inputs.resolution }}' \
+            --days '${{ inputs.minute_days }}' \
+            --data-symbols '${{ inputs.symbols }}' \
+            --no-fx
+
+      - name: Audit what arrived
+        run: |
+          # Non-blocking on purpose: the bake-off's whole subject is a feed with
+          # known holes, so an audit that halted here would prevent measuring
+          # the thing being measured. The findings are still recorded and
+          # uploaded, and `|| true` applies to the exit code only.
+          uv run tb data audit --resolution '${{ inputs.resolution }}' || true
+
+      - name: The measurement
+        id: bakeoff
+        run: |
+          uv run tb data bakeoff \
+            --resolution '${{ inputs.resolution }}' \
+            --primary alpaca \
+            --secondary yahoo \
+            | tee var/bakeoff-report.txt
+
+      - name: Seal a vintage so the number is citable
+        run: |
+          # A bake-off nobody can reproduce is an anecdote. The vintage hashes
+          # the exact files the verdict was computed over.
+          uv run tb data seal || echo "::warning::seal refused; the store may hold no sealed partitions"
+          uv run tb ledger verify
+
+      - name: Summarise onto the run page
+        if: always()
+        run: |
+          {
+            echo '## Bake-off verdict'
+            echo
+            echo '```'
+            cat var/bakeoff-report.txt 2>/dev/null || echo "(no report produced)"
+            echo '```'
+            echo
+            echo "Symbols: \`${{ inputs.symbols }}\`"
+            echo "Resolution: \`${{ inputs.resolution }}\` over ~${{ inputs.minute_days }} days"
+            echo
+            echo 'Bars here are keyed `sym:TICKER` rather than by ISIN — research'
+            echo 'identities, reported by `tb data audit` and not admissible as'
+            echo 'point-in-time evidence for a promotion.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the store and the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bakeoff-${{ github.run_number }}
+          # The ledger and the Parquet store. Neither can contain the Alpaca
+          # credential: the provider passes only query params to the raw
+          # archive, never its headers, and the archive scrubs what it is given.
+          path: |
+            var/
+          retention-days: 30
+          if-no-files-found: warn

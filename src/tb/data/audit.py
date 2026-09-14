@@ -249,6 +249,7 @@ class DataAuditor:
 
         report.findings.extend(check_revision_clusters(self._recent_revisions()))
         report.findings.extend(self._check_partitions())
+        report.findings.extend(self._check_identities())
 
         if emit_event:
             self._emit(report)
@@ -288,6 +289,41 @@ class DataAuditor:
                 )
             )
         return tuple(findings)
+
+    def _check_identities(self) -> tuple[Finding, ...]:
+        """Report instruments whose identity is only as stable as a ticker.
+
+        `make_instrument_uid` prefers an ISIN and falls back to `t212:` then
+        `sym:`, marking each so this check can find them. A `sym:` uid is what
+        `tb data backfill --data-symbols` produces: real bars, fetched for
+        research, keyed by a string the vendor can reassign to another issuer.
+
+        INFO rather than BLOCKING. These bars are legitimate and the trading
+        path cannot reach them — it resolves through the symbol map to an
+        `isin:` or `t212:` uid, which never matches. What makes them worth a
+        line is that a sealed vintage will *include* them, so a backtest could
+        cite one without noticing its universe was partly research fixtures.
+        """
+        research = sorted(uid for uid in self._store.instruments() if uid.startswith("sym:"))
+        if not research:
+            return ()
+        shown = ", ".join(research[:8]) + (
+            f" and {len(research) - 8} more" if len(research) > 8 else ""
+        )
+        return (
+            Finding(
+                kind=CheckKind.RESEARCH_ONLY_IDENTITY,
+                severity=Severity.INFO,
+                detail=(
+                    f"{len(research)} instrument(s) keyed by ticker rather than ISIN: {shown}. "
+                    "A reused ticker can splice two issuers' histories into one series."
+                ),
+                suggested_action=(
+                    "fine for a bake-off; do not cite a vintage containing these as "
+                    "point-in-time evidence for a promotion"
+                ),
+            ),
+        )
 
     def _recent_revisions(self, limit: int = 5000) -> list[dict[str, Any]]:
         rows = self._ledger.conn.execute(

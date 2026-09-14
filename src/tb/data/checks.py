@@ -80,6 +80,7 @@ class CheckKind(StrEnum):
     PARTITION_MISSING = "partition_missing"
     PARTITION_ALTERED = "partition_altered"
     PARTITION_ORPHAN = "partition_orphan"
+    RESEARCH_ONLY_IDENTITY = "research_only_identity"
 
 
 class GapCause(StrEnum):

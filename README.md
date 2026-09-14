@@ -176,6 +176,32 @@ tb data bakeoff               # the paid-data decision, as arithmetic
 tb data seal                  # a vintage_id M3 can cite
 ```
 
+`--symbols` takes Trading 212 tickers and resolves them through the symbol map,
+which is the path the trading loop uses. `--data-symbols` takes provider symbols
+directly and skips the map, for research only — the bake-off measures *data
+providers*, not the broker, so requiring broker credentials to run it was a
+coupling that made the measurement impossible without them:
+
+```bash
+tb data backfill --provider yahoo  --resolution minute --data-symbols AAPL,MSFT,SPY
+tb data backfill --provider alpaca --resolution minute --data-symbols AAPL,MSFT,SPY
+tb data bakeoff  --resolution minute
+```
+
+Bars fetched that way are keyed `sym:TICKER` instead of by ISIN, which is
+self-marking on purpose: the trading path resolves to an `isin:` or `t212:` uid
+and never matches one, and `tb data audit` reports them so a vintage containing
+research fixtures cannot be mistaken for point-in-time evidence.
+
+There is also a **`Data bake-off` workflow** (`.github/workflows/data-bakeoff.yml`,
+manual dispatch) that runs the whole sequence on a GitHub runner using
+`ALPACA_DATA_KEY_ID` / `ALPACA_DATA_SECRET_KEY` from repository secrets, prints
+the verdict to the run summary and uploads the store. It exists because a
+development sandbox may have no egress to either provider, and because a
+measurement worth citing should be reproducible rather than something someone
+ran once by hand. It holds **no** Trading 212 credentials, so nothing in it can
+reach an order endpoint.
+
 Three things about the data layer that are load-bearing rather than
 decorative:
 

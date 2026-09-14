@@ -281,6 +281,13 @@ def data_backfill(
         str | None,
         typer.Option("--symbols", help="Comma-separated T212 tickers. Default: the universe."),
     ] = None,
+    data_symbols: Annotated[
+        str | None,
+        typer.Option(
+            "--data-symbols",
+            help="Research only: provider symbols, bypassing the symbol map. Not tradable.",
+        ),
+    ] = None,
     fx: Annotated[
         bool, typer.Option("--fx/--no-fx", help="Also fetch the account-currency rate.")
     ] = True,
@@ -299,6 +306,20 @@ def data_backfill(
     are assumed rather than measured. Any vintage built only from these is
     stamped `vendor_current_view`, which is honest rather than
     point-in-time.
+
+    `--symbols` takes *Trading 212* tickers and resolves them through the symbol
+    map, which is what the trading path uses. `--data-symbols` takes provider
+    symbols directly and skips the map entirely. That exists because the
+    bake-off measures **data providers**, not the broker, and requiring a
+    broker-derived symbol map to run it was a coupling that made the
+    measurement impossible anywhere without Trading 212 credentials — including
+    CI, which is the only place with unrestricted egress here.
+
+    Bars fetched that way are keyed `sym:SYMBOL` rather than by ISIN. That is
+    deliberately self-marking: the trading path resolves an instrument through
+    the symbol map to an `isin:` or `t212:` uid and will never match a `sym:`
+    one, so research bars cannot become trading inputs by accident, and
+    `tb data audit` reports them as research-only identities.
     """
     pinned = _load(limits)
     res = _resolution(resolution)
@@ -308,18 +329,59 @@ def data_backfill(
         symbol_map = SymbolMap(ledger, provider=provider)
         instruments = {i.ticker: i for i in cached_instruments(ledger)}
 
-        if symbols:
-            tickers = [t.strip() for t in symbols.split(",") if t.strip()]
+        # (ticker-or-symbol, data symbol, instrument_uid). Built up front so the
+        # fetch loop does not branch on which flag produced it.
+        targets: list[tuple[str, str, str]] = []
+        problems: list[str] = []
+        if symbols and data_symbols:
+            err_console.print(
+                f"{BAD} pass --symbols or --data-symbols, not both: they key bars under "
+                "different identities, and mixing them in one run would split an "
+                "instrument's history across two uids.",
+                soft_wrap=True,
+            )
+            raise typer.Exit(2)
+
+        if data_symbols:
+            for raw in data_symbols.split(","):
+                symbol = raw.strip().upper()
+                if symbol:
+                    targets.append((symbol, symbol, make_instrument_uid(data_symbol=symbol)))
+            console.print(
+                f"{WARN} research mode: {len(targets)} symbol(s) keyed by ticker, not ISIN. "
+                "Not tradable, and not point-in-time.",
+                soft_wrap=True,
+            )
         else:
-            snapshot = UniverseStore(ledger).latest()
-            if snapshot is None:
-                err_console.print(
-                    f"{BAD} no universe snapshot. Run `tb universe build` first, or pass "
-                    "--symbols.",
-                    soft_wrap=True,
+            if symbols:
+                tickers = [t.strip() for t in symbols.split(",") if t.strip()]
+            else:
+                snapshot = UniverseStore(ledger).latest()
+                if snapshot is None:
+                    err_console.print(
+                        f"{BAD} no universe snapshot. Run `tb universe build` first, or pass "
+                        "--symbols (Trading 212 tickers) or --data-symbols (provider symbols, "
+                        "research only).",
+                        soft_wrap=True,
+                    )
+                    raise typer.Exit(2)
+                tickers = list(snapshot.tickers)
+            for ticker in tickers:
+                mapping = symbol_map.get(ticker)
+                if mapping is None or not mapping.data_symbol:
+                    problems.append(f"{ticker}: no data symbol mapped")
+                    continue
+                instrument = instruments.get(ticker)
+                targets.append(
+                    (
+                        ticker,
+                        mapping.data_symbol,
+                        make_instrument_uid(
+                            isin=None if instrument is None else instrument.isin,
+                            t212_ticker=ticker,
+                        ),
+                    )
                 )
-                raise typer.Exit(2)
-            tickers = list(snapshot.tickers)
 
         span = (
             timedelta(days=365 * (years or pinned.limits.data.backfill_years_daily))
@@ -331,26 +393,17 @@ def data_backfill(
 
         feed = _provider(provider)
         console.print(
-            f"fetching {res.value} bars for {len(tickers)} symbol(s) from "
+            f"fetching {res.value} bars for {len(targets)} symbol(s) from "
             f"[bold]{provider}[/bold], {start.date()} to {end.date()}"
         )
 
         total = 0
         revisions = 0
-        problems: list[str] = []
         try:
-            for ticker in tickers:
-                mapping = symbol_map.get(ticker)
-                if mapping is None or not mapping.data_symbol:
-                    problems.append(f"{ticker}: no data symbol mapped")
-                    continue
-                instrument = instruments.get(ticker)
-                uid = make_instrument_uid(
-                    isin=None if instrument is None else instrument.isin, t212_ticker=ticker
-                )
+            for label, data_symbol, uid in targets:
                 try:
                     batch = feed.fetch_bars(
-                        mapping.data_symbol,
+                        data_symbol,
                         instrument_uid=uid,
                         resolution=res,
                         start=start,
@@ -358,13 +411,13 @@ def data_backfill(
                         provenance=Provenance.BACKFILL,
                     )
                 except TbError as exc:
-                    problems.append(f"{ticker}: {exc}")
+                    problems.append(f"{label}: {exc}")
                     continue
 
                 result = store.ingest(batch)
                 total += result.rows_written
                 revisions += len(result.revisions)
-                problems.extend(f"{ticker}: {w}" for w in batch.warnings)
+                problems.extend(f"{label}: {w}" for w in batch.warnings)
 
             if fx:
                 total += _backfill_fx(ledger, feed, pinned, start=start, end=end, problems=problems)

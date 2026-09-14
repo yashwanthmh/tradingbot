@@ -451,6 +451,120 @@ def test_actions_without_a_universe_names_the_remedy(env: dict[str, Any]) -> Non
     assert "tb universe build" in _out(result)
 
 
+def test_backfill_refuses_both_symbol_flags_at_once(env: dict[str, Any]) -> None:
+    """They key bars under different identities, so mixing them splits a series."""
+    _init(env)
+    result = _run(
+        [
+            "data",
+            "backfill",
+            "--symbols",
+            "AAPL_US_EQ",
+            "--data-symbols",
+            "AAPL",
+            *env["args"],
+        ]
+    )
+    assert result.exit_code == 2
+    assert "not both" in _out(result)
+
+
+def test_backfill_by_data_symbol_needs_no_universe_or_symbol_map(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bake-off measures data providers, so it must not need the broker.
+
+    Requiring a T212-derived symbol map to fetch a bar made the measurement
+    impossible anywhere without broker credentials — including CI, which is the
+    only environment here with egress to either feed.
+    """
+    import tb.cli_data as cli_data
+    from tb.data.providers import CsvFixtureProvider
+
+    _init(env)
+    days = [s.day for s in CAL.sessions_between(date(2026, 3, 2), date(2026, 3, 6))]
+    bars = [
+        Bar(
+            instrument_uid="sym:AAPL",
+            resolution=Resolution.DAILY,
+            bar_open_utc=datetime(day.year, day.month, day.day, tzinfo=UTC),
+            available_at_utc=datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(days=1),
+            ingested_at_utc=datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(days=1),
+            provider="yahoo",
+            provenance=Provenance.BACKFILL,
+            session=Session.REGULAR,
+            open=Decimal("100.00") + Decimal(index),
+            high=Decimal("101.00") + Decimal(index),
+            low=Decimal("99.00") + Decimal(index),
+            close=Decimal("100.50") + Decimal(index),
+            volume=1_000_000,
+        )
+        for index, day in enumerate(days)
+    ]
+    monkeypatch.setattr(
+        cli_data, "_provider", lambda _name: CsvFixtureProvider(bars=bars, provider_name="yahoo")
+    )
+
+    result = _run(
+        ["data", "backfill", "--provider", "yahoo", "--data-symbols", "aapl", *env["args"]]
+    )
+    assert result.exit_code == 0, _out(result)
+    output = _out(result)
+    assert "research mode" in output
+    # Lower-cased on the way in, keyed upper-case: a uid that varied by how the
+    # flag was typed would split one instrument's history across two series.
+    assert "1 symbol(s)" in output
+
+    with Ledger(env["db"]) as ledger:
+        store = BarStore(ledger, root=env["bars"])
+        assert "sym:AAPL" in set(store.instruments())
+
+
+def test_audit_reports_research_keyed_instruments_without_blocking(
+    env: dict[str, Any],
+) -> None:
+    """INFO, not BLOCKING: the bars are real, they just are not ISIN-keyed.
+
+    Worth a line because a sealed vintage includes them, so a backtest could
+    cite one without noticing part of its universe was research fixtures.
+    """
+    _init(env)
+    day = CAL.sessions_between(date(2026, 3, 2), date(2026, 3, 3))[0].day
+    opened = datetime(day.year, day.month, day.day, tzinfo=UTC)
+    with Ledger(env["db"]) as ledger:
+        store = BarStore(ledger, root=env["bars"])
+        store.ingest(
+            BarBatch(
+                bars=(
+                    Bar(
+                        instrument_uid="sym:AAPL",
+                        resolution=Resolution.DAILY,
+                        bar_open_utc=opened,
+                        available_at_utc=opened + timedelta(days=1),
+                        ingested_at_utc=opened + timedelta(days=1),
+                        provider="yahoo",
+                        provenance=Provenance.BACKFILL,
+                        session=Session.REGULAR,
+                        open=Decimal("100"),
+                        high=Decimal("100"),
+                        low=Decimal("100"),
+                        close=Decimal("100"),
+                        volume=1_000_000,
+                    ),
+                ),
+                provider="yahoo",
+                symbol="AAPL",
+                resolution=Resolution.DAILY,
+                requested_start=opened,
+                requested_end=opened,
+            )
+        )
+
+    result = _run(["data", "audit", *env["args"]])
+    assert result.exit_code == 0, _out(result)
+    assert "keyed by ticker rather than ISIN" in _out(result)
+
+
 def test_no_command_prints_a_credential(
     env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:

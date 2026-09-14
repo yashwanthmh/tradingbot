@@ -86,6 +86,24 @@ ignore_missing_imports = true
 module = ["pyarrow.*", "duckdb.*", "pandas_market_calendars.*"]
 ignore_missing_imports = true
 
+# Nothing here imports numpy or pandas directly — they arrive under
+# `pandas_market_calendars`, and pandas ships `py.typed`, so mypy follows the
+# chain into numpy's own stubs and type-checks them at *our* `python_version`.
+# That is how CI failed on every commit from M0 to M2: the resolved numpy is
+# 2.4.6 below Python 3.12 and 2.5.3 at or above it, and 2.5.3's stubs use PEP
+# 695 `type` statements, which are a syntax error under `python_version =
+# "3.11"`. `.python-version` pins the interpreter so that cannot drift again;
+# this skips the stubs so the pin is not the only thing standing between a
+# routine version bump and a red build in a file nobody here wrote.
+[[tool.mypy.overrides]]
+module = ["numpy.*", "pandas.*"]
+follow_imports = "skip"
+# Required for the line above to have any effect here: `follow_imports` is
+# ignored for `.pyi` files unless this is set, and the offending file is
+# `numpy/__init__.pyi`. Verified by reproducing the failure on a 3.12 venv.
+follow_imports_for_stubs = true
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

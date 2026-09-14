@@ -23,9 +23,27 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          # Pinned, and `.python-version` pins it for local work too. Without
+          # this, `requires-python = ">=3.11"` let CI resolve a newer
+          # interpreter than developers run: mypy is configured for 3.11, so it
+          # parsed the newer venv's numpy stubs — which use PEP 695 `type`
+          # statements — under 3.11 rules and failed on a syntax error in a
+          # file nobody here wrote. Every step after Type-check was skipped.
+          python-version: "3.11"
 
       - name: Sync dependencies
         run: uv sync --all-extras
+
+      - name: The interpreter is the one this project targets
+        run: |
+          # Asserted rather than assumed. A silent interpreter bump is what
+          # made CI fail on every commit from M0 onwards while every local
+          # run was clean.
+          uv run python -c "
+          import sys
+          assert sys.version_info[:2] == (3, 11), f'expected 3.11, got {sys.version.split()[0]}'
+          print(f'python {sys.version.split()[0]}')
+          "
 
       - name: Lint
         run: uv run ruff check .
@@ -145,7 +163,8 @@ jobs:
           fi
           echo "vintage correctly refused altered files"
 
-      - name: Probe refuses to characterise a real-money account        env:
+      - name: Probe refuses to characterise a real-money account
+        env:
           TB_VAR_DIR: var
           T212_LIVE_API_KEY: ci-placeholder-live-key
         run: |
