@@ -102,6 +102,79 @@ jobs:
           fi
           echo "seal correctly refused an empty store"
 
+      - name: The backtester cannot manufacture an edge
+        env:
+          # Its own store. The vintage-tamper drill below destroys `var/bars`
+          # on purpose, and a gate that shares a directory with a destructive
+          # test is a gate that fails for reasons unrelated to what it checks.
+          TB_VAR_DIR: var-calibration
+        run: |
+          # A release gate, not a diagnostic. Strategies with no edge by
+          # construction, run over a random walk: if any of them earns one, the
+          # engine is handing out information and every result it has ever
+          # produced is suspect. `tb backtest calibrate` exits non-zero on
+          # failure, so this step is the gate.
+          uv run tb backtest costs
+          uv run tb init
+          python - <<'PY'
+          import random
+          from datetime import UTC, datetime, timedelta
+          from decimal import Decimal
+          from pathlib import Path
+
+          from tb.data.barstore import BarStore
+          from tb.data.provider import Bar, BarBatch, Provenance, Resolution, Session
+          from tb.ledger.store import Ledger
+
+          BASE = datetime(2024, 1, 2, tzinfo=UTC)
+          # One US and one UK issuer, so the run exercises both the FX path and
+          # the stamp-duty path rather than only the cheaper of the two.
+          UIDS = ["isin:US0378331005", "isin:GB00B03MLX29"]
+
+          with Ledger(Path("var-calibration/ledger.db")) as ledger:
+              store = BarStore(ledger, root=Path("var-calibration/bars"))
+              for index, uid in enumerate(UIDS):
+                  walk = random.Random(500 + index)
+                  price = Decimal("100.00")
+                  bars = []
+                  for day in range(400):
+                      opened = BASE + timedelta(days=day)
+                      price = max(
+                          price + Decimal(str(round(walk.gauss(0, 1.1), 4))), Decimal("1.00")
+                      )
+                      close = max(
+                          price + Decimal(str(round(walk.gauss(0, 0.7), 4))), Decimal("1.00")
+                      )
+                      bars.append(Bar(
+                          instrument_uid=uid, resolution=Resolution.DAILY,
+                          bar_open_utc=opened,
+                          available_at_utc=opened + timedelta(days=1),
+                          ingested_at_utc=opened + timedelta(days=1),
+                          provider="fixture", provenance=Provenance.BACKFILL,
+                          session=Session.REGULAR, open=price,
+                          high=max(price, close) + Decimal("0.5"),
+                          low=min(price, close) - Decimal("0.5"),
+                          close=close, volume=1_000_000,
+                      ))
+                  store.ingest(BarBatch(
+                      bars=tuple(bars), provider="fixture", symbol=uid,
+                      resolution=Resolution.DAILY,
+                      requested_start=bars[0].bar_open_utc,
+                      requested_end=bars[-1].bar_open_utc,
+                  ))
+              print(f"seeded {len(UIDS)} instruments over 400 sessions")
+          PY
+          uv run tb backtest calibrate
+          uv run tb backtest calibrations
+          # The verdict has to be in the chain, or M5's gate cannot cite it.
+          uv run tb ledger verify
+
+      # DESTRUCTIVE — keep this step last among those that touch `var/bars`.
+      # It overwrites every Parquet file with garbage on purpose, so any step
+      # added after it inherits an unreadable store. That is exactly what
+      # happened when the calibration gate was first added below it: the run
+      # failed with a pyarrow traceback about missing magic bytes, which looked
+      # like a backtester bug and was a step-ordering one.
       - name: A sealed vintage refuses to load once its files change
         env:
           TB_VAR_DIR: var
@@ -162,69 +235,6 @@ jobs:
             exit 1
           fi
           echo "vintage correctly refused altered files"
-
-      - name: The backtester cannot manufacture an edge
-        env:
-          TB_VAR_DIR: var
-        run: |
-          # A release gate, not a diagnostic. Strategies with no edge by
-          # construction, run over a random walk: if any of them earns one, the
-          # engine is handing out information and every result it has ever
-          # produced is suspect. `tb backtest calibrate` exits non-zero on
-          # failure, so this step is the gate.
-          uv run tb backtest costs
-          python - <<'PY'
-          import random
-          from datetime import UTC, datetime, timedelta
-          from decimal import Decimal
-          from pathlib import Path
-
-          from tb.data.barstore import BarStore
-          from tb.data.provider import Bar, BarBatch, Provenance, Resolution, Session
-          from tb.ledger.store import Ledger
-
-          BASE = datetime(2024, 1, 2, tzinfo=UTC)
-          # One US and one UK issuer, so the run exercises both the FX path and
-          # the stamp-duty path rather than only the cheaper of the two.
-          UIDS = ["isin:US0378331005", "isin:GB00B03MLX29"]
-
-          with Ledger(Path("var/ledger.db")) as ledger:
-              store = BarStore(ledger, root=Path("var/bars"))
-              for index, uid in enumerate(UIDS):
-                  walk = random.Random(500 + index)
-                  price = Decimal("100.00")
-                  bars = []
-                  for day in range(400):
-                      opened = BASE + timedelta(days=day)
-                      price = max(
-                          price + Decimal(str(round(walk.gauss(0, 1.1), 4))), Decimal("1.00")
-                      )
-                      close = max(
-                          price + Decimal(str(round(walk.gauss(0, 0.7), 4))), Decimal("1.00")
-                      )
-                      bars.append(Bar(
-                          instrument_uid=uid, resolution=Resolution.DAILY,
-                          bar_open_utc=opened,
-                          available_at_utc=opened + timedelta(days=1),
-                          ingested_at_utc=opened + timedelta(days=1),
-                          provider="fixture", provenance=Provenance.BACKFILL,
-                          session=Session.REGULAR, open=price,
-                          high=max(price, close) + Decimal("0.5"),
-                          low=min(price, close) - Decimal("0.5"),
-                          close=close, volume=1_000_000,
-                      ))
-                  store.ingest(BarBatch(
-                      bars=tuple(bars), provider="fixture", symbol=uid,
-                      resolution=Resolution.DAILY,
-                      requested_start=bars[0].bar_open_utc,
-                      requested_end=bars[-1].bar_open_utc,
-                  ))
-              print(f"seeded {len(UIDS)} instruments over 400 sessions")
-          PY
-          uv run tb backtest calibrate
-          uv run tb backtest calibrations
-          # The verdict has to be in the chain, or M5's gate cannot cite it.
-          uv run tb ledger verify
 
       - name: Probe refuses to characterise a real-money account
         env:

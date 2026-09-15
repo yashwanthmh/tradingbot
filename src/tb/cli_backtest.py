@@ -18,6 +18,7 @@ whether the engine was calibrated is not a gate.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -304,7 +305,35 @@ def _load_source(
         uids = tuple(sorted({bar.instrument_uid for bar in source.bars}))
         return source, uids, vintage
 
-    everything = [bar for uid in store.instruments() for bar in store.bars_for(uid, res)]
+    # A damaged store must be *diagnosed*, not raised through as a pyarrow
+    # traceback about missing magic bytes. That error names a file and a
+    # library, neither of which tells an operator that the store is corrupt or
+    # what to do — and it reads like a backtester bug. `verify_partitions`
+    # already answers this question, so the failure points at the store.
+    try:
+        everything = [bar for uid in store.instruments() for bar in store.bars_for(uid, res)]
+    except Exception as exc:
+        findings: list[str] = []
+        # Suppressed deliberately: the store is already known unreadable, and
+        # the point of this branch is to report the *first* failure usefully.
+        # A second exception from the diagnostic would replace a good message
+        # with a worse one.
+        with contextlib.suppress(Exception):  # pragma: no branch
+            findings = list(store.verify_partitions())
+        err_console.print(
+            f"{BAD} the bar store could not be read: {escape(str(exc))}",
+            soft_wrap=True,
+        )
+        for finding in findings[:5]:
+            err_console.print(f"  {WARN} {escape(finding)}", soft_wrap=True)
+        err_console.print(
+            "Run [bold]tb data audit[/bold] to see what the catalog and the files "
+            "disagree about. A calibration over an unreadable store is not a "
+            "statement about the engine.",
+            soft_wrap=True,
+        )
+        raise typer.Exit(2) from exc
+
     source = InMemoryBarSource(bars=everything)
     return source, tuple(sorted({bar.instrument_uid for bar in everything})), None
 
