@@ -713,3 +713,183 @@ def _print_reconcile(report: Any) -> None:
             f"\n{WARN} M1 is read-only, so nothing was repaired. The suggested actions "
             "become available in M4, behind the risk engine."
         )
+
+
+@symbols_app.command("verify")
+def symbols_verify(
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+    bars: Annotated[
+        Path | None,
+        typer.Option("--bars", help="Directory holding the Parquet bar store.", show_default=False),
+    ] = None,
+    primary: Annotated[
+        str, typer.Option("--primary", help="Provider whose symbol map is being verified.")
+    ] = "alpaca",
+    secondary: Annotated[
+        str, typer.Option("--secondary", help="Independent feed to corroborate against.")
+    ] = "yahoo",
+    resolution: Annotated[str, typer.Option("--resolution", help="daily, hourly or minute.")] = (
+        "daily"
+    ),
+) -> None:
+    """Cross-verify mapped symbols against a second feed, offline.
+
+    This is the command that makes a first position possible. `CROSS_VERIFIED`
+    is reachable only through `SymbolVerifier`, and until this existed nothing
+    called it — so the tier was structurally unreachable, `may_enter` was False
+    for every symbol, and `tb symbols audit` reported "0 cross-verified" while
+    telling you an entry was possible. The deadlock the two-tier gate was built
+    to fix was fixed in the type system and still present in the pipeline.
+
+    Reads bars already in the store rather than fetching: the evidence is two
+    *independent* feeds agreeing on the same bar period in the regular session,
+    and that pairing is exactly what `tb data backfill --provider ...` for both
+    feeds produces. No network, so it is safe to run repeatedly.
+
+    Reference data is built from what the store actually holds — the bar's own
+    currency against the broker's instrument record. Name and ISIN stay absent,
+    which the verifier treats as *no evidence* rather than as disagreement;
+    that asymmetry is what stops one thin feed re-creating the deadlock.
+    """
+    from tb.data.barstore import BarStore
+    from tb.data.provider import Resolution, make_instrument_uid
+    from tb.data.verification import ProviderReference, SymbolVerifier, Tier
+
+    pinned = _load(limits)
+    try:
+        res = Resolution(resolution.lower())
+    except ValueError as exc:
+        err_console.print(f"{BAD} unknown resolution {resolution!r}: daily, hourly or minute.")
+        raise typer.Exit(2) from exc
+    if primary == secondary:
+        err_console.print(
+            f"{BAD} --primary and --secondary are both {primary!r}. A feed agreeing with "
+            "itself would verify every symbol in the universe.",
+            soft_wrap=True,
+        )
+        raise typer.Exit(2)
+
+    with _ledger(db, pinned) as ledger:
+        store = BarStore(
+            ledger,
+            root=bars or (Path(ledger.path).parent / "bars"),
+            scale=pinned.limits.data.price_scale,
+        )
+        symbol_map = SymbolMap(ledger, provider=primary)
+        mappings = [m for m in symbol_map.all() if m.data_symbol]
+        if not mappings:
+            err_console.print(
+                f"{BAD} no symbols are mapped for {primary}. Run "
+                "`tb symbols audit --refresh` first.",
+                soft_wrap=True,
+            )
+            raise typer.Exit(2)
+
+        instruments = {i.ticker: i for i in cached_instruments(ledger)}
+        verifier = SymbolVerifier(
+            symbol_map,
+            account_currency=pinned.limits.currency,
+        )
+        limit_bps = pinned.limits.execution.max_cross_venue_disagreement_bps
+
+        verified = 0
+        no_pair = 0
+        refused: list[str] = []
+
+        for mapping in mappings:
+            instrument = instruments.get(mapping.t212_ticker)
+            if instrument is None:
+                refused.append(f"{mapping.t212_ticker}: no cached instrument record")
+                continue
+
+            uid = make_instrument_uid(isin=instrument.isin, t212_ticker=mapping.t212_ticker)
+            pair = _same_period_pair(store, uid, res, primary, secondary)
+            if pair is None:
+                no_pair += 1
+                continue
+            primary_bar, secondary_bar = pair
+
+            result = verifier.verify_by_cross_provider(
+                mapping.t212_ticker,
+                instrument=instrument,
+                reference=ProviderReference(
+                    symbol=mapping.data_symbol,
+                    provider=secondary,
+                    currency=secondary_bar.currency,
+                ),
+                primary_bar=primary_bar,
+                secondary_bar=secondary_bar,
+                limit_bps=limit_bps,
+            )
+            if result.tier is Tier.CROSS_PROVIDER:
+                verified += 1
+            else:
+                refused.append(f"{mapping.t212_ticker}: {result.detail}")
+
+        summary = verifier.tier_summary()
+        table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+        table.add_row("symbols mapped", str(len(mappings)))
+        table.add_row("newly cross-verified", f"[green]{verified}[/green]" if verified else "0")
+        table.add_row(
+            "no comparable bar pair",
+            f"[yellow]{no_pair}[/yellow]" if no_pair else "0",
+        )
+        table.add_row("refused", f"[yellow]{len(refused)}[/yellow]" if refused else "0")
+        for tier, count in sorted(summary.items()):
+            table.add_row(f"  now {tier}", str(count))
+        console.print(table)
+
+        for note in refused[:10]:
+            console.print(f"  {WARN} {escape(note)}", soft_wrap=True)
+        if len(refused) > 10:
+            console.print(f"  [dim]… and {len(refused) - 10} more[/dim]")
+
+        if no_pair and not verified:
+            console.print(
+                f"\n{WARN} no symbol had a same-period regular-session bar from both "
+                f"{primary} and {secondary}. Cross-verification needs two independent "
+                "feeds over the same window: run [bold]tb data backfill[/bold] for each "
+                "provider before this.",
+                soft_wrap=True,
+            )
+        elif verified:
+            console.print(
+                f"\n{OK} {verified} symbol(s) reached cross_verified, so a "
+                "floor-notional entry is now possible. Full size still needs the "
+                "broker's own quote, which arrives once a position is held.",
+                soft_wrap=True,
+            )
+        console.print("\nNext: [bold]tb symbols audit[/bold] to see the gate's own view.")
+
+
+def _same_period_pair(
+    store: Any,
+    instrument_uid: str,
+    resolution: Any,
+    primary: str,
+    secondary: str,
+) -> tuple[Any, Any] | None:
+    """The newest bar period both feeds covered in the regular session.
+
+    Newest rather than any: a mapping verified against a year-old bar says the
+    ticker meant this company then, and tickers get reassigned. All three of
+    the verifier's preconditions are established here so it never has to refuse
+    for a reason the caller could have avoided — different providers, identical
+    bar period, regular session on both sides.
+    """
+    from tb.data.provider import Session
+
+    by_period: dict[Any, dict[str, Any]] = {}
+    for bar in store.bars_for(instrument_uid, resolution):
+        if bar.session is not Session.REGULAR:
+            continue
+        if bar.provider not in (primary, secondary):
+            continue
+        by_period.setdefault(bar.bar_open_utc, {})[bar.provider] = bar
+
+    for period in sorted(by_period, reverse=True):
+        found = by_period[period]
+        if primary in found and secondary in found:
+            return found[primary], found[secondary]
+    return None

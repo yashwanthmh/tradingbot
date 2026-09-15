@@ -507,29 +507,57 @@ class SymbolMap:
         return True, "exits are never gated on mapping confidence"
 
     def block(self, comparison: PriceComparison, *, limit_bps: float | None = None) -> None:
-        """Stop a symbol accepting new entries, and record why."""
+        """Stop a symbol accepting new entries after a cross-venue disagreement."""
+        self.block_for(
+            comparison.t212_ticker,
+            reason=f"{comparison.kind.value}: {comparison.detail}",
+            data_symbol=comparison.data_symbol,
+            disagreement_bps=comparison.disagreement_bps,
+            limit_bps=limit_bps,
+            broker_price=comparison.broker_price,
+            data_price=comparison.data_price,
+        )
+
+    def block_for(
+        self,
+        t212_ticker: str,
+        *,
+        reason: str,
+        data_symbol: str | None = None,
+        disagreement_bps: float | None = None,
+        limit_bps: float | None = None,
+        broker_price: Decimal | None = None,
+        data_price: Decimal | None = None,
+    ) -> None:
+        """Stop a symbol accepting new entries, for any reason.
+
+        Generalised from the cross-venue case because that is not the only
+        thing that should stop an entry. An unexplained split is the other one:
+        a price jump that fits a small-integer ratio with no action row behind
+        it means the vendor restated history without reporting why, and sizing
+        a position against that series is sizing against a guess.
+
+        Blocking is deliberately asymmetric and `may_exit` is unaffected —
+        refusing to *sell* over a data problem would convert it into an
+        unhedged position, which is worse than the problem.
+        """
         self._ledger.conn.execute(
             "UPDATE symbol_map SET blocked = 1, blocked_reason = ?, "
             "last_disagreement_bps = ?, last_checked_at = ? WHERE t212_ticker = ?",
-            (
-                f"{comparison.kind.value}: {comparison.detail}",
-                comparison.disagreement_bps,
-                now_iso(),
-                comparison.t212_ticker,
-            ),
+            (reason, disagreement_bps, now_iso(), t212_ticker),
         )
         self._ledger.conn.commit()
         self._ledger.append(
             EventType.SYMBOL_BLOCKED,
-            comparison.t212_ticker,
+            t212_ticker,
             SymbolBlockedPayload(
-                t212_ticker=comparison.t212_ticker,
-                data_symbol=comparison.data_symbol,
-                reason=f"{comparison.kind.value}: {comparison.detail}",
-                disagreement_bps=comparison.disagreement_bps,
+                t212_ticker=t212_ticker,
+                data_symbol=data_symbol or "",
+                reason=reason,
+                disagreement_bps=disagreement_bps,
                 limit_bps=limit_bps,
-                broker_price=comparison.broker_price,
-                data_price=comparison.data_price,
+                broker_price=broker_price,
+                data_price=data_price,
             ),
             actor=Actor.SYSTEM,
         )

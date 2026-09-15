@@ -52,6 +52,14 @@ from tb.data.provider import DataError
 # elsewhere would otherwise change prices here.
 _WORKING_PRECISION = 60
 
+# The `source_provider` the residual detector stamps on a split it *inferred*
+# from a price jump nobody announced. It is the stored discriminator for
+# `inferred_from_price_jump`, which has no column of its own, so it is a
+# constant rather than a literal repeated at the write and read sites: a rename
+# on one side alone would silently turn the flag False, and a False flag is how
+# a guessed ratio gets to adjust a real price.
+RESIDUAL_DETECTOR = "residual_detector"
+
 
 class FactorError(DataError):
     """A factor could not be computed from the actions given."""
@@ -195,6 +203,25 @@ def effective_in(
     return tuple(action for action in actions if after < action.effective_date <= through)
 
 
+def confirmed_only(
+    actions: Iterable[CorporateAction],
+) -> tuple[CorporateAction, ...]:
+    """Drop actions the residual detector merely *inferred* from a price jump.
+
+    A third filter, named like the other two because it answers a third
+    question: not "did we know" or "does it apply", but "is it a fact".
+
+    The residual detector records a suspected split so the audit and the symbol
+    gate can see it. Its ratio is a guess — the nearest small integer to an
+    unexplained overnight gap — and a guess must never reach a factor. Adjusting
+    a real price by an inferred 4-for-1 that turns out to have been a 90% loss
+    would quadruple every feature computed from it and size a position off the
+    error. The safe direction is to leave the price unadjusted and say so, which
+    is what the callers do via `Factor.complete`.
+    """
+    return tuple(action for action in actions if not action.inferred_from_price_jump)
+
+
 def latest_vintages(
     actions: Iterable[CorporateAction], as_of: datetime
 ) -> tuple[CorporateAction, ...]:
@@ -278,16 +305,30 @@ def price_factor(actions: Iterable[CorporateAction], *, at: date, as_of: datetim
     Only splits count, and only those effective after `at` and known by
     `as_of`. A 4-for-1 after the bar divides the price by four, so the factor
     contributes `ratio_den / ratio_num`.
+
+    An **inferred** split — one the residual detector guessed from an
+    unexplained price jump — is excluded and named in `missing` with
+    `complete=False`. The exclusion leaves a real discontinuity in the series,
+    which is why it is reported rather than logged: a feature computed across a
+    suspected split has a step in it, and the caller needs to be able to tell
+    that apart from a clean window. Entering that symbol is already blocked by
+    the symbol gate; the factor's job is not to paper over the gap with a
+    guess.
     """
-    relevant = [
-        action
-        for action in effective_after(latest_vintages(actions, as_of), at)
-        if action.action_type is ActionType.SPLIT
-    ]
+    live = effective_after(latest_vintages(actions, as_of), at)
+    splits = [action for action in live if action.action_type is ActionType.SPLIT]
+    relevant = confirmed_only(splits)
+    inferred = tuple(action.action_id for action in splits if action.inferred_from_price_jump)
     value = Fraction(1)
     for action in relevant:
         value /= action.split_ratio
-    return Factor(value=value, series=Series.SPLIT_ADJUSTED, n_actions=len(relevant))
+    return Factor(
+        value=value,
+        series=Series.SPLIT_ADJUSTED,
+        n_actions=len(relevant),
+        complete=not inferred,
+        missing=inferred,
+    )
 
 
 def volume_factor(actions: Iterable[CorporateAction], *, at: date, as_of: datetime) -> Factor:
@@ -334,10 +375,14 @@ def total_return_factor(
     live = latest_vintages(actions, as_of)
     splits = price_factor(live, at=at, as_of=as_of)
     value = splits.value
-    missing: list[str] = []
+    # Starts from the splits' own exclusions rather than empty: an inferred
+    # split dropped by `price_factor` is missing from this factor too, and
+    # `complete=not missing` below would otherwise report the total-return
+    # series as whole while carrying the same unadjusted discontinuity.
+    missing: list[str] = list(splits.missing)
     counted = splits.n_actions
 
-    for action in effective_after(live, at):
+    for action in confirmed_only(effective_after(live, at)):
         if action.action_type is not ActionType.CASH_DIVIDEND:
             continue
         close = reference_close.get(action.action_id)

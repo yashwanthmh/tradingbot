@@ -371,6 +371,33 @@ class ExchangeResponse(T212Model):
     )
 
 
+class DividendResponse(T212Model):
+    """One entry from `GET /equity/history/dividends`.
+
+    The cash the broker *actually* paid, which is what makes dividend
+    reconciliation the highest-value identity check in the data layer: a
+    provider dividend with no matching credit on a position held through the
+    ex-date means either the action data is wrong or the symbol map points at a
+    different company than the one in the account. The second is the failure
+    the symbol map exists to prevent, and this is the only evidence that
+    surfaces it.
+
+    Every field optional, per the drift policy: an unknown extra field is
+    ignored, but a *consumed* field going missing halts rather than coercing to
+    zero. A dividend amount silently read as 0 would reconcile as "paid
+    nothing" and mask exactly the mismatch being looked for.
+    """
+
+    ticker: str | None = None
+    reference: str | None = None
+    amount: OptMoney = None
+    amount_in_euro: OptMoney = Field(default=None, alias="amountInEuro")
+    gross_amount_per_share: OptMoney = Field(default=None, alias="grossAmountPerShare")
+    paid_on: str | None = Field(default=None, alias="paidOn")
+    quantity: OptMoney = None
+    dividend_type: str | None = Field(default=None, alias="type")
+
+
 class HistoricalOrderResponse(T212Model):
     """One entry from `GET /equity/history/orders`.
 

@@ -93,6 +93,19 @@ class FeatureSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class _Close:
+    """An adjusted close that knows whether its scale is trustworthy.
+
+    Carried alongside the number rather than tracked as a parallel index set,
+    because the two are sliced together by every lookback and a slice applied to
+    one but not the other is a silent misalignment.
+    """
+
+    value: Decimal
+    unadjustable: bool
+
+
+@dataclass(frozen=True, slots=True)
 class FeatureSnapshot:
     """The feature vector at one decision time, and its hash.
 
@@ -108,6 +121,14 @@ class FeatureSnapshot:
     snapshot_hash: str
     n_bars_seen: int
     series: Series = Series.SPLIT_ADJUSTED
+    # Action ids whose factor could not be applied over this window — in
+    # practice splits the residual detector only *inferred*, which are recorded
+    # but never used as factors. Diagnostic, and so not hashed, for the same
+    # reason `n_bars_seen` is not: the consequence is already in `values`, where
+    # every feature whose lookback crosses the discontinuity is `UNKNOWN`. It is
+    # here so that "why is everything unknown" has an answer at the call site
+    # rather than in a log.
+    unadjustable_actions: tuple[str, ...] = ()
 
     def get(self, name: str) -> FeatureValue:
         try:
@@ -311,7 +332,7 @@ class FeaturePipeline:
         at all, so the module that owns the distinction keeps it.
         """
         bars = window.bars(instrument_uid)
-        closes = self._adjusted_closes(bars, actions=actions, as_of=window.as_of)
+        closes, unadjustable = self._adjusted_closes(bars, actions=actions, as_of=window.as_of)
 
         values: dict[str, FeatureValue] = {}
         for spec in self.specs:
@@ -321,7 +342,17 @@ class FeaturePipeline:
                 # same name.
                 values[spec.name] = UNKNOWN
                 continue
-            values[spec.name] = self._round(spec.compute(closes[-spec.lookback :]))
+            window_closes = closes[-spec.lookback :]
+            if any(close.unadjustable for close in window_closes):
+                # This spec's own slice crosses a discontinuity we were not able
+                # to adjust away, so the oldest closes in it are on a different
+                # scale from the newest. A 4-for-1 left unadjusted reads as a
+                # 300% return, and refusing is the only answer that does not
+                # invent one. Per-spec rather than per-window: a lookback
+                # entirely on the far side of the split is untouched by it.
+                values[spec.name] = UNKNOWN
+                continue
+            values[spec.name] = self._round(spec.compute([close.value for close in window_closes]))
 
         return FeatureSnapshot(
             as_of=window.as_of,
@@ -330,6 +361,7 @@ class FeaturePipeline:
             snapshot_hash=self._hash(window.as_of, instrument_uid, values),
             n_bars_seen=len(bars),
             series=self.series,
+            unadjustable_actions=unadjustable,
         )
 
     def compute_all(
@@ -349,27 +381,41 @@ class FeaturePipeline:
         *,
         actions: Sequence[CorporateAction],
         as_of: datetime,
-    ) -> tuple[Decimal, ...]:
-        """Closes in this pipeline's series, oldest first.
+    ) -> tuple[tuple[_Close, ...], tuple[str, ...]]:
+        """Closes in this pipeline's series, oldest first, each knowing its scale.
 
         `RAW` is passed straight through — it is what the cross-venue price
         check, stop placement and tick rounding need. Anything else is scaled
         by the exact `Fraction` factor for that bar's own session date, so a
         split part-way through the window does not appear as a return.
+
+        A close is `unadjustable` when its factor was incomplete: some action
+        effective after that bar could not be applied, so this close is on a
+        different scale from the newest one and the two cannot be compared. In
+        practice that means an inferred split — `price_factor` excludes those
+        deliberately, because a guessed ratio must not scale a real price. The
+        returned action ids are those excluded anywhere in the window.
         """
         if self.series is Series.RAW or not actions:
-            return tuple(bar.close for bar in bars)
+            return tuple(_Close(bar.close, False) for bar in bars), ()
 
-        adjusted: list[Decimal] = []
+        adjusted: list[_Close] = []
+        unadjustable: list[str] = []
         for bar in bars:
-            factor = price_factor(actions, at=bar.session_date, as_of=as_of).value
+            factor = price_factor(actions, at=bar.session_date, as_of=as_of)
+            for action_id in factor.missing:
+                if action_id not in unadjustable:
+                    unadjustable.append(action_id)
             with localcontext() as ctx:
                 ctx.prec = _WORKING_PRECISION
                 # Through the exact Fraction rather than float(factor): a
                 # 1-for-3 reverse split is 1/3, and the drift from a float
                 # round trip would be hashed faithfully into every snapshot.
-                adjusted.append(bar.close * Decimal(factor.numerator) / Decimal(factor.denominator))
-        return tuple(adjusted)
+                value = (
+                    bar.close * Decimal(factor.value.numerator) / Decimal(factor.value.denominator)
+                )
+            adjusted.append(_Close(value, not factor.complete))
+        return tuple(adjusted), tuple(unadjustable)
 
     @staticmethod
     def _round(value: FeatureValue) -> FeatureValue:

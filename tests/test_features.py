@@ -16,7 +16,7 @@ from fractions import Fraction
 
 import pytest
 
-from tb.data.adjustments import ActionType, CorporateAction, Series
+from tb.data.adjustments import RESIDUAL_DETECTOR, ActionType, CorporateAction, Series
 from tb.data.asof import UNKNOWN, BarWindow, UnknownValueError
 from tb.data.provider import Bar, DataError, Provenance, Resolution, Session
 from tb.features.pipeline import (
@@ -280,6 +280,108 @@ def test_a_reverse_split_uses_an_exact_fraction() -> None:
     pipeline = FeaturePipeline(specs=(make_spec("return_pct", 4),))
     value = pipeline.compute(window(*bars), UID, actions=[action]).get("return_pct_4")
     assert value == Decimal("0")
+
+
+# --------------------------------------------------------------------------
+# Inferred splits: recorded, never applied, and never silently ignored
+# --------------------------------------------------------------------------
+
+
+def inferred_split(effective: date, *, known: datetime, ratio: Fraction) -> CorporateAction:
+    """What the residual detector records for an unexplained overnight jump.
+
+    `source_provider` is the stored discriminator — `inferred_from_price_jump`
+    has no column — so the constant is used here rather than a literal, which
+    keeps this test honest about what production actually reads.
+    """
+    return CorporateAction(
+        action_id=f"act_inferred_{effective}",
+        instrument_uid=UID,
+        action_type=ActionType.SPLIT,
+        effective_date=effective,
+        known_at_utc=known,
+        ratio_num=ratio.numerator,
+        ratio_den=ratio.denominator,
+        source_provider=RESIDUAL_DETECTOR,
+        inferred_from_price_jump=True,
+    )
+
+
+def test_a_guessed_ratio_never_adjusts_a_price() -> None:
+    """A feature is UNKNOWN across a suspected split, not a number.
+
+    The residual detector guesses a ratio from an unexplained gap. Applying it
+    would turn a real 75% loss into a flat series if the guess is wrong; *not*
+    applying it and returning a number anyway reports a -75% return as genuine
+    price action. Both are answers the strategy would act on, so the only
+    honest one is to refuse — which is what `UNKNOWN` is for, and it raises on
+    arithmetic rather than reading as zero.
+    """
+    bars = (bar(0, "200"), bar(1, "200"), bar(2, "50"), bar(3, "50"))
+    action = inferred_split(
+        date(2026, 3, 4), known=datetime(2026, 3, 1, tzinfo=UTC), ratio=Fraction(4, 1)
+    )
+    pipeline = FeaturePipeline(specs=(make_spec("return_pct", 4),))
+    snapshot = pipeline.compute(window(*bars), UID, actions=[action])
+
+    assert snapshot.get("return_pct_4") is UNKNOWN
+    assert not snapshot.complete
+    # And the reason is on the snapshot, so "why is this unknown" does not
+    # require re-deriving the factor at the call site.
+    assert snapshot.unadjustable_actions == (action.action_id,)
+
+
+def test_a_confirmed_split_still_adjusts_normally() -> None:
+    """The vacuity check: the refusal is about the inference, not about splits.
+
+    Without this, a bug that refused *every* split would pass the test above
+    while making the whole adjusted series unusable.
+    """
+    bars = (bar(0, "200"), bar(1, "200"), bar(2, "50"), bar(3, "50"))
+    action = split(date(2026, 3, 4), known=datetime(2026, 3, 1, tzinfo=UTC), ratio=Fraction(4, 1))
+    pipeline = FeaturePipeline(specs=(make_spec("return_pct", 4),))
+    snapshot = pipeline.compute(window(*bars), UID, actions=[action])
+
+    assert snapshot.get("return_pct_4") == Decimal("0")
+    assert snapshot.complete
+    assert snapshot.unadjustable_actions == ()
+
+
+def test_only_the_lookbacks_that_cross_the_jump_are_refused() -> None:
+    """Per-spec, not per-window. A short lookback after it is unaffected.
+
+    Refusing the whole snapshot would blind the strategy to a symbol for as
+    long as the suspicion stands — including for the exit decision, where
+    having no features is worse than the data problem itself.
+    """
+    bars = (bar(0, "200"), bar(1, "200"), bar(2, "50"), bar(3, "50"))
+    action = inferred_split(
+        date(2026, 3, 4), known=datetime(2026, 3, 1, tzinfo=UTC), ratio=Fraction(4, 1)
+    )
+    pipeline = FeaturePipeline(
+        specs=(make_spec("return_pct", 4), make_spec("return_pct", 2, name="recent"))
+    )
+    snapshot = pipeline.compute(window(*bars), UID, actions=[action])
+
+    assert snapshot.get("return_pct_4") is UNKNOWN, "the span across the jump is not comparable"
+    assert snapshot.get("recent") == Decimal("0"), "both bars post-jump: nothing to adjust"
+
+
+def test_the_raw_series_is_untouched_by_an_inferred_split() -> None:
+    """`RAW` is what the broker and the stop see, and it is already right.
+
+    It is the quoted price, adjusted by nothing by definition, so an inferred
+    action cannot make it less trustworthy — and refusing it would remove the
+    one series execution is allowed to use.
+    """
+    bars = (bar(0, "200"), bar(1, "200"), bar(2, "50"), bar(3, "50"))
+    action = inferred_split(
+        date(2026, 3, 4), known=datetime(2026, 3, 1, tzinfo=UTC), ratio=Fraction(4, 1)
+    )
+    pipeline = FeaturePipeline(specs=(make_spec("last", 1),), series=Series.RAW)
+    snapshot = pipeline.compute(window(*bars), UID, actions=[action])
+    assert snapshot.get("last_1") == Decimal("50")
+    assert snapshot.complete
 
 
 # --------------------------------------------------------------------------

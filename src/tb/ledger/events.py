@@ -105,6 +105,7 @@ class EventType(StrEnum):
     # deliberately re-read, which is what says whether "we found nothing"
     # means anything at all.
     DATA_REVISION_CANARY_COMPLETED = "data.revision_canary_completed"
+    DATA_REGIME_READ = "data.regime_read"
 
     # --- strategy specs and backtests (M3) ---
     STRATEGY_SPEC_REGISTERED = "strategy.spec_registered"
@@ -581,6 +582,29 @@ class RevisionCanaryPayload(EventPayload):
     problems: list[str] = Field(default_factory=list)
 
 
+class RegimeReadPayload(EventPayload):
+    """One reading of the regime gate, and why it said what it said.
+
+    `state` is carried separately from `exposure_factor` because the two
+    failure states produce the *same* reduced factor as a genuine `RISK_OFF`.
+    Reading the factor alone months later could not tell "the index was below
+    its average" from "we could not see the index", and those call for opposite
+    responses: one is the gate working, the other is the feed broken.
+    """
+
+    state: str
+    exposure_factor: Decimal
+    reference_symbol: str
+    instrument_uid: str
+    ma_days: int
+    n_sessions_seen: int
+    is_measured: bool
+    as_of: str
+    last_close: Decimal | None = None
+    moving_average: Decimal | None = None
+    detail: str = ""
+
+
 class StrategySpecPayload(EventPayload):
     """A strategy specification entering the registry.
 
@@ -699,6 +723,7 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.DATA_UNIVERSE_SNAPSHOT_TAKEN: UniverseSnapshotPayload,
     EventType.DATA_BAKEOFF_COMPLETED: BakeoffPayload,
     EventType.DATA_REVISION_CANARY_COMPLETED: RevisionCanaryPayload,
+    EventType.DATA_REGIME_READ: RegimeReadPayload,
     EventType.STRATEGY_SPEC_REGISTERED: StrategySpecPayload,
     EventType.BACKTEST_COMPLETED: BacktestPayload,
     EventType.BACKTEST_CALIBRATED: CalibrationPayload,
@@ -738,6 +763,7 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     EventType.DATA_UNIVERSE_SNAPSHOT_TAKEN: AggregateType.DATA,
     EventType.DATA_BAKEOFF_COMPLETED: AggregateType.DATA,
     EventType.DATA_REVISION_CANARY_COMPLETED: AggregateType.DATA,
+    EventType.DATA_REGIME_READ: AggregateType.DATA,
     EventType.STRATEGY_SPEC_REGISTERED: AggregateType.STRATEGY,
     EventType.BACKTEST_COMPLETED: AggregateType.STRATEGY,
     # Filed under RUN, not STRATEGY: a calibration is a statement about this

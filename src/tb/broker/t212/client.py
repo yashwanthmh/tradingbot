@@ -43,6 +43,7 @@ from tb.broker.t212.errors import (
 from tb.broker.t212.models import (
     AccountInfoResponse,
     CashResponse,
+    DividendResponse,
     ExchangeResponse,
     HistoricalOrderResponse,
     InstrumentResponse,
@@ -479,6 +480,26 @@ class T212Client:
         # The endpoint is paginated: `{items: [...], nextPagePath: ...}`.
         items = body.get("items", []) if isinstance(body, dict) else body
         return self._parse_many(HistoricalOrderResponse, items, Endpoint.HISTORY_ORDERS, msg_id)
+
+    def get_dividends(
+        self, *, limit: int = 50, cursor: int | None = None
+    ) -> list[DividendResponse]:
+        """Cash dividends the broker actually credited.
+
+        The evidence behind the data layer's highest-value identity check. A
+        provider dividend with no matching credit, on a position held through
+        the ex-date, means the action data is wrong *or* the symbol map points
+        at a different company than the one in the account — and only the
+        broker's own payment record can tell us which.
+
+        Six calls a minute, same bucket class as order history.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        body, msg_id = self._request(Endpoint.HISTORY_DIVIDENDS, params=params)
+        items = body.get("items", []) if isinstance(body, dict) else body
+        return self._parse_many(DividendResponse, items, Endpoint.HISTORY_DIVIDENDS, msg_id)
 
     # -- composite ---------------------------------------------------------
 

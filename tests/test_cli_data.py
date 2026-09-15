@@ -137,7 +137,26 @@ def seed(
 
 def test_the_data_and_universe_commands_are_registered() -> None:
     for group, expected in (
-        ("data", ("backfill", "audit", "bakeoff", "seal", "verify", "vintages")),
+        (
+            "data",
+            # Every command, not a sample. Two M2 modules shipped with passing
+            # tests and no production caller at all, and the thing that would
+            # have caught both is an assertion that the CLI actually reaches
+            # them — `regime` and `canary` are here for that reason.
+            (
+                "backfill",
+                "audit",
+                "bakeoff",
+                "seal",
+                "verify",
+                "vintages",
+                "coverage",
+                "actions",
+                "canary",
+                "regime",
+                "reconcile-actions",
+            ),
+        ),
         ("universe", ("build",)),
     ):
         out = _out(_run([group, "--help"]))
@@ -594,3 +613,428 @@ def test_no_command_prints_a_credential(
         out = _out(_run([*command, *env["args"]]))
         assert "SECRET-KEY-ID" not in out
         assert "SECRET-SECRET" not in out
+
+
+# --------------------------------------------------------------------------
+# Unexplained splits: the audit acts rather than advises
+# --------------------------------------------------------------------------
+
+
+def _mapped_instrument(env: dict[str, Any], *, confidence: Any = None) -> None:
+    """One instrument, tradable, mapped for alpaca."""
+    from tb.core.clock import now_iso
+    from tb.data.symbols import Confidence, SymbolMap, SymbolMapping
+
+    pinned = load_hard_limits(env["limits"])
+    with Ledger(env["db"], config_hash=pinned.config_hash) as ledger:
+        ledger.conn.execute(
+            "INSERT INTO instruments (ticker, instrument_type, isin, currency_code,"
+            " short_name, full_name, exchange_id, working_schedule_id,"
+            " min_trade_quantity, max_open_quantity, added_on, fetched_at, raw_json)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "AAPL_US_EQ",
+                "STOCK",
+                "US0378331005",
+                "USD",
+                "Apple",
+                "Apple Inc.",
+                1,
+                1,
+                "0.1",
+                "1000",
+                None,
+                now_iso(),
+                "{}",
+            ),
+        )
+        ledger.conn.commit()
+        SymbolMap(ledger, provider="alpaca").upsert(
+            SymbolMapping(
+                t212_ticker="AAPL_US_EQ",
+                data_symbol="AAPL",
+                provider="alpaca",
+                confidence=confidence or Confidence.CROSS_VERIFIED,
+                derivation="suffix_strip",
+                currency_code="USD",
+            )
+        )
+
+
+def _seed_split(env: dict[str, Any]) -> None:
+    """A clean 4-for-1 jump that no action row explains."""
+    pinned = load_hard_limits(env["limits"])
+    days = [s.day for s in CAL.sessions_between(date(2026, 3, 2), date(2026, 3, 31))]
+    with Ledger(env["db"], config_hash=pinned.config_hash) as ledger:
+        store = BarStore(ledger, root=env["bars"], scale=pinned.limits.data.price_scale)
+        bars = [
+            daily(day, close="400.00" if index < len(days) // 2 else "100.00")
+            for index, day in enumerate(days)
+        ]
+        store.ingest(
+            BarBatch(
+                bars=tuple(bars),
+                provider="alpaca",
+                symbol="AAPL",
+                resolution=Resolution.DAILY,
+                requested_start=bars[0].bar_open_utc,
+                requested_end=bars[-1].bar_open_utc,
+            )
+        )
+
+
+def _mapping(env: dict[str, Any]) -> Any:
+    from tb.data.symbols import SymbolMap
+
+    pinned = load_hard_limits(env["limits"])
+    with Ledger(env["db"], config_hash=pinned.config_hash) as ledger:
+        return SymbolMap(ledger, provider="alpaca").get("AAPL_US_EQ")
+
+
+def test_an_unexplained_split_actually_blocks_the_symbol(env: dict[str, Any]) -> None:
+    """Acted on, not advised about.
+
+    The audit used to print "entries in those symbols should be blocked",
+    which is not a control: the next turn of the loop would enter before
+    anyone read it. Yahoo back-adjusting its cache without reporting an action
+    is its documented behaviour, so this path is the one that fires in
+    practice.
+    """
+    _init(env)
+    _mapped_instrument(env)
+    before = _mapping(env)
+    assert before is not None
+    assert before.may_enter, "the fixture should start tradable"
+
+    _seed_split(env)
+    result = _run(["data", "audit", *env["args"]])
+    assert "unexplained split" in _out(result)
+    assert "blocked from new entries" in _out(result)
+
+    after = _mapping(env)
+    assert after is not None
+    assert after.blocked
+    assert not after.may_enter, "the symbol is still enterable after an unexplained split"
+    assert "split" in (after.blocked_reason or "")
+    # The reason names the ratio and the date, so an operator does not have to
+    # decode it — a reason nobody can read is a reason they override.
+    assert "for-" in (after.blocked_reason or "")
+
+
+def test_the_inferred_split_is_recorded_as_a_flagged_action(env: dict[str, Any]) -> None:
+    """Recorded, and read back flagged — asserted through the real read path.
+
+    `inferred_from_price_jump` has no column: `corporate_actions` predates the
+    flag and `apply_schema` cannot add columns, so `source_provider` is the
+    stored discriminator and `from_row` derives the flag from it. Asserting the
+    derivation rather than a column is what pins that coupling — the failure to
+    catch would be a rename on one side turning the flag silently False.
+    """
+    _init(env)
+    _mapped_instrument(env)
+    _seed_split(env)
+    _run(["data", "audit", *env["args"]])
+
+    from tb.data.actions import ActionStore
+    from tb.data.adjustments import RESIDUAL_DETECTOR, ActionType
+
+    pinned = load_hard_limits(env["limits"])
+    with Ledger(env["db"], config_hash=pinned.config_hash) as ledger:
+        stored = ActionStore(ledger).actions_for(UID)
+        assert stored, "the suspicion was not recorded"
+        assert all(a.action_type is ActionType.SPLIT for a in stored)
+        assert all(a.inferred_from_price_jump for a in stored)
+        assert all(a.source_provider == RESIDUAL_DETECTOR for a in stored)
+
+
+def test_an_inferred_split_never_adjusts_a_price(env: dict[str, Any]) -> None:
+    """The consequence of the flag, which is the only reason to store it.
+
+    A guessed ratio reaching the factor algebra would quadruple every feature
+    computed across the jump and size a position off the inference. Excluded —
+    but `complete=False`, because the discontinuity is still in the series and
+    silently returning the identity factor would claim a clean window.
+    """
+    _init(env)
+    _mapped_instrument(env)
+    _seed_split(env)
+    _run(["data", "audit", *env["args"]])
+
+    from tb.data.actions import ActionStore
+    from tb.data.adjustments import price_factor, volume_factor
+
+    pinned = load_hard_limits(env["limits"])
+    with Ledger(env["db"], config_hash=pinned.config_hash) as ledger:
+        stored = ActionStore(ledger).actions_for(UID)
+
+    before = min(a.effective_date for a in stored) - timedelta(days=1)
+    as_of = datetime.now(UTC) + timedelta(days=1)
+    factor = price_factor(stored, at=before, as_of=as_of)
+    assert factor.is_identity, "an inferred ratio adjusted a real price"
+    assert not factor.complete, "the excluded split was not reported"
+    assert factor.missing == tuple(a.action_id for a in stored)
+    # The inverse of the identity is the identity, so the volume factor must
+    # not pick up a 4x liquidity error from the same guess.
+    assert volume_factor(stored, at=before, as_of=as_of).is_identity
+
+
+def test_an_unmapped_instrument_is_reported_rather_than_silently_skipped(
+    env: dict[str, Any],
+) -> None:
+    """It is unreachable by the trading path — but say so.
+
+    "0 blocked" against "1 detected" would otherwise read as a control that
+    ran and found nothing to do.
+    """
+    _init(env)
+    _seed_split(env)  # bars, but no instrument and no mapping
+    result = _run(["data", "audit", *env["args"]])
+    out = _out(result)
+    assert "unexplained split" in out
+    assert "could not be blocked" in out
+
+
+def test_blocking_never_prevents_an_exit(env: dict[str, Any]) -> None:
+    """The asymmetry. Refusing to sell over a data problem is worse than it."""
+    _init(env)
+    _mapped_instrument(env)
+    _seed_split(env)
+    _run(["data", "audit", *env["args"]])
+
+    from tb.data.symbols import SymbolMap
+
+    pinned = load_hard_limits(env["limits"])
+    with Ledger(env["db"], config_hash=pinned.config_hash) as ledger:
+        allowed, reason = SymbolMap(ledger, provider="alpaca").may_exit("AAPL_US_EQ")
+        assert allowed, f"a blocked symbol refused an exit: {reason}"
+
+
+# --------------------------------------------------------------------------
+# tb data reconcile-actions
+# --------------------------------------------------------------------------
+
+
+def test_reconcile_actions_needs_stored_actions(env: dict[str, Any]) -> None:
+    _init(env)
+    result = _run(
+        ["data", "reconcile-actions", "--limits", str(env["limits"]), "--db", str(env["db"])]
+    )
+    assert result.exit_code == 0
+    assert "tb data actions" in _out(result)
+
+
+def test_reconcile_actions_is_inconclusive_without_position_history(
+    env: dict[str, Any],
+) -> None:
+    """Exit 1, not 0. "No credit" and "no credit expected" look identical.
+
+    Reporting that as clean would be the wrong answer in the permissive
+    direction — it would clear a symbol the check never actually examined.
+    """
+    _init(env)
+    pinned = load_hard_limits(env["limits"])
+    with Ledger(env["db"], config_hash=pinned.config_hash) as ledger:
+        from tb.data.actions import ActionStore
+        from tb.data.adjustments import ActionType, CorporateAction
+
+        ActionStore(ledger).record(
+            [
+                CorporateAction(
+                    action_id="act_div_1",
+                    instrument_uid=UID,
+                    action_type=ActionType.CASH_DIVIDEND,
+                    effective_date=date(2026, 3, 10),
+                    known_at_utc=datetime(2026, 3, 1, tzinfo=UTC),
+                    source_provider="fixture",
+                    gross_amount=Decimal("0.24"),
+                    currency="USD",
+                )
+            ]
+        )
+
+    result = _run(
+        ["data", "reconcile-actions", "--limits", str(env["limits"]), "--db", str(env["db"])]
+    )
+    assert result.exit_code == 1
+    out = _out(result)
+    assert "inconclusive rather than clean" in out
+    assert "tb reconcile" in out
+
+
+# --------------------------------------------------------------------------
+# tb data regime
+# --------------------------------------------------------------------------
+#
+# The gate had no production caller at all: `tb.data.regime` was imported only
+# by its own test, so the exposure factor existed, was correct, and was applied
+# to nothing. These tests are about the command being the caller — and about the
+# cold start, which is the expensive half: "no signal" must mean reduced
+# exposure, never full.
+
+
+def seed_reference(env: dict[str, Any], *, sessions: int, rising: bool = True) -> None:
+    """Bars for the reference series under its own `sym:` uid.
+
+    `sym:SPY`, not an ISIN: the reference series is not traded, so there is no
+    broker instrument record to take an ISIN from, and it is deliberately
+    outside the symbol map's tradability gate.
+    """
+    pinned = load_hard_limits(env["limits"])
+    days = [s.day for s in CAL.sessions_between(date(2024, 1, 2), date(2026, 3, 31))][-sessions:]
+    with Ledger(env["db"], config_hash=pinned.config_hash) as ledger:
+        store = BarStore(ledger, root=env["bars"], scale=pinned.limits.data.price_scale)
+        bars = [
+            daily(
+                day,
+                # Rising ends above its own trailing average; falling ends below.
+                close=f"{100 + (i if rising else sessions - i) / 10:.2f}",
+                provider="alpaca",
+                uid="sym:SPY",
+            )
+            for i, day in enumerate(days)
+        ]
+        store.ingest(
+            BarBatch(
+                bars=tuple(bars),
+                provider="alpaca",
+                symbol="SPY",
+                resolution=Resolution.DAILY,
+                requested_start=bars[0].bar_open_utc,
+                requested_end=bars[-1].bar_open_utc,
+            )
+        )
+
+
+def _regime(env: dict[str, Any], *extra: str) -> Any:
+    return _run(["data", "regime", *env["args"], *extra])
+
+
+def test_an_empty_store_reduces_exposure_rather_than_permitting_it(env: dict[str, Any]) -> None:
+    """The most expensive default in the system, asserted.
+
+    On a fresh install there are no reference bars. "No signal, so full
+    exposure" would apply on day one, to the whole portfolio, at exactly the
+    moment a new deployment is least likely to be right about anything.
+    """
+    _init(env)
+    result = _regime(env)
+    assert result.exit_code == 1, "an unmeasured gate must not report success"
+    out = _out(result)
+    assert "unavailable" in out
+    assert "x0.5" in out
+    assert "not a market signal" in out
+    # And it says how to fix it, naming the reference series.
+    assert "tb data backfill --data-symbols SPY" in out
+
+
+def test_too_little_history_is_not_the_same_fact_as_risk_off(env: dict[str, Any]) -> None:
+    """Four states, not two. An operator must be able to tell them apart.
+
+    Both reduce exposure, but one means the index is down and the other means
+    we cannot see it — and only the second is fixed by backfilling.
+    """
+    _init(env)
+    seed_reference(env, sessions=30)
+    result = _regime(env, "--as-of", "2026-04-01T00:00:00Z")
+    assert result.exit_code == 1
+    out = _out(result)
+    assert "insufficient_history" in out
+    assert "30 sessions" in out
+    assert "x0.5" in out
+
+
+def test_enough_rising_history_permits_full_exposure(env: dict[str, Any]) -> None:
+    """The vacuity check, and the only test here that reaches x1.
+
+    Without it every assertion above would still pass against a gate that
+    always answered "unavailable" — proving the fail-closed half while leaving
+    the gate useless. Exit 0, because a measured reading is the gate working
+    whichever way it points.
+    """
+    _init(env)
+    seed_reference(env, sessions=300, rising=True)
+    result = _regime(env, "--as-of", "2026-04-01T00:00:00Z")
+    assert result.exit_code == 0, _out(result)
+    out = _out(result)
+    assert "risk_on" in out
+    assert "x1 (full)" in out
+    assert "measuring the market" in out
+
+
+def test_enough_falling_history_reduces_exposure_and_still_exits_zero(
+    env: dict[str, Any],
+) -> None:
+    """`risk_off` is the gate working, not a fault.
+
+    Exiting non-zero here would make a deployment check fail for the whole of
+    a bear market — which is when the check matters most and when an operator
+    is most likely to start ignoring it.
+    """
+    _init(env)
+    seed_reference(env, sessions=300, rising=False)
+    result = _regime(env, "--as-of", "2026-04-01T00:00:00Z")
+    assert result.exit_code == 0, _out(result)
+    out = _out(result)
+    assert "risk_off" in out
+    assert "x0.5" in out
+
+
+def test_a_reading_is_recorded_in_the_ledger_on_every_read(env: dict[str, Any]) -> None:
+    """Every read, not only transitions.
+
+    The factor in force at a decision time has to be recoverable from the
+    ledger alone. A reading written only on a change cannot answer that for the
+    instants in between, which is most of them.
+    """
+    _init(env)
+    seed_reference(env, sessions=30)
+    _regime(env, "--as-of", "2026-04-01T00:00:00Z")
+
+    pinned = load_hard_limits(env["limits"])
+    with Ledger(env["db"], config_hash=pinned.config_hash) as ledger:
+        rows = ledger.conn.execute(
+            "SELECT payload_json FROM event_log WHERE event_type = 'data.regime_read'"
+        ).fetchall()
+        assert len(rows) == 1
+        payload = rows[0]["payload_json"]
+        # The state is stored alongside the factor: reading x0.5 back on its own
+        # could not tell a genuine risk_off from a broken feed.
+        assert "insufficient_history" in payload
+        assert "sym:SPY" in payload
+        assert '"is_measured":false' in payload.replace(" ", "")
+
+
+def test_the_reading_is_point_in_time(env: dict[str, Any]) -> None:
+    """An as-of instant before any bar was knowable sees nothing.
+
+    Same visibility rule as every other read. Without it, a regime reading in a
+    backtest would be the one computed from today's data rather than the one
+    available then — which is the whole lookahead channel this layer exists to
+    close.
+    """
+    _init(env)
+    seed_reference(env, sessions=30)
+    result = _regime(env, "--as-of", "2020-01-01T00:00:00Z")
+    assert result.exit_code == 1
+    assert "no SPY bars knowable" in _out(result)
+
+
+def test_a_naive_as_of_is_refused(env: dict[str, Any]) -> None:
+    """It would be read as UTC while the operator meant local time."""
+    _init(env)
+    result = _regime(env, "--as-of", "2026-04-01T00:00:00")
+    assert result.exit_code == 2
+    assert "no timezone" in _out(result)
+
+
+def test_an_unparseable_as_of_is_refused(env: dict[str, Any]) -> None:
+    _init(env)
+    result = _regime(env, "--as-of", "last tuesday")
+    assert result.exit_code == 2
+    assert "not an ISO instant" in _out(result)
+
+
+def test_regime_needs_a_ledger(env: dict[str, Any]) -> None:
+    result = _regime(env)
+    assert result.exit_code == 2
+    assert "tb init" in _out(result)

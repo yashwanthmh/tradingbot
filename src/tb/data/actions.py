@@ -43,6 +43,7 @@ from decimal import Decimal
 from tb.core.canonical import hash_payload
 from tb.core.clock import from_iso, now_utc, to_iso
 from tb.data.adjustments import (
+    RESIDUAL_DETECTOR,
     ActionType,
     CorporateAction,
     SplitSuspicion,
@@ -499,7 +500,7 @@ class ActionStore:
                     action_type=ActionType.SPLIT,
                     effective_date=suspicion.effective_date,
                     known_at_utc=now_utc(),
-                    source_provider="residual_detector",
+                    source_provider=RESIDUAL_DETECTOR,
                     ratio_num=suspicion.implied_ratio.numerator,
                     ratio_den=suspicion.implied_ratio.denominator,
                     inferred_from_price_jump=True,
@@ -609,5 +610,9 @@ def _from_row(row: sqlite3.Row) -> CorporateAction:
         new_symbol=None if get("new_symbol") is None else str(get("new_symbol")),
         declared_date=None if declared is None else _as_date(str(declared)),
         superseded_by=(None if get("superseded_by") is None else str(get("superseded_by"))),
-        inferred_from_price_jump=str(get("source_provider")) == "residual_detector",
+        # No column of its own: `corporate_actions` predates the flag and
+        # `apply_schema` is CREATE-IF-NOT-EXISTS, so the source provider is the
+        # stored discriminator. `RESIDUAL_DETECTOR` is shared with the write
+        # site above so the two cannot drift apart.
+        inferred_from_price_jump=str(get("source_provider")) == RESIDUAL_DETECTOR,
     )

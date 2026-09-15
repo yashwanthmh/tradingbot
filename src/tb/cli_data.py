@@ -4,22 +4,28 @@ Read-and-write, but only into the data layer: nothing here can place an order.
 The commands correspond one-to-one with the M2 verification steps, in the order
 you would actually run them:
 
-    tb universe build     pick the symbols, record a dated snapshot
-    tb data backfill      fetch history for them
-    tb data audit         classify what is wrong with it
-    tb data bakeoff       measure whether the feed is good enough to trade
-    tb data seal          freeze a vintage M3 can cite
-    tb data verify        re-hash a sealed vintage
+    tb universe build          pick the symbols, record a dated snapshot
+    tb data backfill           fetch history for them
+    tb data audit              classify what is wrong with it
+    tb data actions            fetch splits and dividends
+    tb data reconcile-actions  check dividends against cash the broker paid
+    tb data canary             re-read old history and record restatements
+    tb data regime             the exposure factor, and whether it is measured
+    tb data bakeoff            measure whether the feed is good enough to trade
+    tb data seal               freeze a vintage M3 can cite
+    tb data verify             re-hash a sealed vintage
 
-`backfill` and `bakeoff` are the only two that touch a network, and both name
-which provider they are calling before they call it.
+`backfill`, `bakeoff`, `actions`, `canary` and `reconcile-actions` are the ones
+that touch a network, and each names which provider it is calling before it
+calls it. Everything else reads the local store.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from datetime import UTC, datetime, timedelta
+from collections.abc import Sequence
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
@@ -30,12 +36,14 @@ from rich.markup import escape
 from rich.table import Table
 
 from tb.broker.reconcile import Severity
+from tb.broker.t212.client import T212Client
 from tb.broker.t212.probe import cached_instruments
 from tb.broker.t212.raw_archive import RawArchive
 from tb.config.loader import PinnedLimits, load_hard_limits
 from tb.core.errors import TbError
 from tb.core.ids import new_run_id
 from tb.data.actions import ActionStore
+from tb.data.adjustments import SplitSuspicion
 from tb.data.audit import DataAuditor, summarise_gaps
 from tb.data.bakeoff import Bakeoff, Verdict, may_widen_live_resolutions
 from tb.data.barstore import BarStore
@@ -52,6 +60,7 @@ from tb.data.provider import (
 from tb.data.providers import AlpacaProvider, YahooProvider
 from tb.data.providers.alpaca import KEY_ID_VAR as ALPACA_KEY_ID_VAR
 from tb.data.providers.alpaca import SECRET_VAR as ALPACA_SECRET_VAR
+from tb.data.regime import RegimeGate, RegimeState
 from tb.data.snapshot import SnapshotStore
 from tb.data.symbols import SymbolMap
 from tb.data.universe import (
@@ -60,6 +69,7 @@ from tb.data.universe import (
     dollar_volume_from_bars,
     select,
 )
+from tb.ledger.events import Actor, EventType, RegimeReadPayload
 from tb.ledger.store import Ledger, default_ledger_path
 
 data_app = typer.Typer(help="Fetch, audit, compare and seal market data.", no_args_is_help=True)
@@ -150,6 +160,23 @@ def _provider(name: str, *, archive: RawArchive | None = None) -> MarketDataProv
     except DataError as exc:
         err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
         raise typer.Exit(2) from exc
+
+
+def _broker_client(ledger: Ledger, run_id: str) -> T212Client:
+    """A read-only broker client, or a refusal naming the missing key.
+
+    Imported inside the function so every offline `tb data` command stays
+    importable without broker credentials — the data layer must not require a
+    broker key to audit a store.
+    """
+    from tb.broker.t212.client import T212Client
+    from tb.broker.t212.ratelimit import RateGovernor
+
+    return T212Client.from_env(
+        governor=RateGovernor(state_path=Path(ledger.path).parent / "run" / "ratelimit.json"),
+        ledger=ledger,
+        run_id=run_id,
+    )
 
 
 def _archive(ledger: Ledger, provider: str, run_id: str | None = None) -> RawArchive:
@@ -593,11 +620,29 @@ def data_audit(
                 break
 
         if report.suspicions:
+            # Recorded and *acted on*, not advised about. The plan's rule is
+            # "halt entries on that symbol", and a report telling an operator
+            # to block something by hand is not a control — the next run of the
+            # loop would enter before anyone read it.
+            recorded, blocked = _act_on_suspicions(ledger, report.suspicions)
             console.print(
-                f"\n{BAD} {len(report.suspicions)} unexplained split(s) detected. Entries in "
-                "those symbols should be blocked until a provider confirms the action — "
-                "the inferred ratio is evidence, not something to adjust prices by."
+                f"\n{BAD} {len(report.suspicions)} unexplained split(s) detected: "
+                f"{recorded} recorded as inferred actions, {blocked} symbol(s) blocked "
+                "from new entries until a provider confirms the action.",
+                soft_wrap=True,
             )
+            console.print(
+                "  The inferred ratio is evidence, never something to adjust prices by: "
+                "sizing a position off a guessed ratio is worse than not trading it.",
+                soft_wrap=True,
+            )
+            if blocked < len(report.suspicions):
+                console.print(
+                    f"  {WARN} {len(report.suspicions) - blocked} could not be blocked — no "
+                    "mapped Trading 212 ticker for that instrument. It is unreachable by "
+                    "the trading path anyway, but nothing will stop it if that changes.",
+                    soft_wrap=True,
+                )
 
         if not report.clean:
             raise typer.Exit(1)
@@ -1118,3 +1163,336 @@ def _canary_report(canary: RevisionCanary, res: Resolution) -> None:
         )
     console.print(table)
     console.print(f"\n[dim]last canary run: {canary.last_run_at() or 'never'}[/dim]")
+
+
+# --------------------------------------------------------------------------
+# tb data regime
+# --------------------------------------------------------------------------
+
+
+@data_app.command("regime")
+def data_regime(
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+    bars: RootOpt = None,
+    as_of: Annotated[
+        str | None,
+        typer.Option("--as-of", help="ISO instant to read as of. Default: now."),
+    ] = None,
+) -> None:
+    """The one factor that scales every strategy's exposure at once.
+
+    Long-only and unlevered means every live strategy is a long-equity beta
+    expression, so in a drawdown their correlation goes to one and per-strategy
+    caps stop helping exactly when they are needed. This gate sits above the
+    allocator: below the reference index's long moving average, all gross
+    exposure is scaled by `regime.exposure_factor_below_ma`.
+
+    Run it before arming anything. The states that matter are the two that are
+    *not* a market signal — `insufficient_history` and `unavailable` — because
+    both mean the gate cannot see the index, and both still reduce exposure. A
+    fresh install is in one of them for roughly ten months, and this command
+    exists so that is a number an operator has read rather than a surprise.
+
+    Exit 1 when the reading is unmeasured, so a deployment check can gate on
+    it. `risk_off` exits 0: the index being below its average is the gate
+    working, not a fault.
+    """
+    pinned = _load(limits)
+    moment = _instant(as_of)
+
+    with _ledger(db, pinned) as ledger:
+        store = _store(ledger, pinned, bars)
+        gate = RegimeGate(limits=pinned.limits)
+        reading = gate.read(store, as_of=moment)
+
+        # Recorded on every read, not only on a change. The factor that was in
+        # force at a decision time has to be recoverable from the ledger
+        # alone, and a reading only written on transitions cannot answer that
+        # for the instants in between.
+        with ledger.transaction() as tx:
+            tx.append(
+                EventType.DATA_REGIME_READ,
+                reading.instrument_uid,
+                RegimeReadPayload(
+                    state=reading.state.value,
+                    exposure_factor=reading.exposure_factor,
+                    reference_symbol=reading.reference_symbol,
+                    instrument_uid=reading.instrument_uid,
+                    ma_days=reading.ma_days,
+                    n_sessions_seen=reading.n_sessions_seen,
+                    is_measured=reading.state.is_measured,
+                    as_of=reading.as_of.isoformat(),
+                    last_close=reading.last_close,
+                    moving_average=reading.moving_average,
+                    detail=reading.detail,
+                ),
+                actor=Actor.SYSTEM,
+                run_id=new_run_id(),
+            )
+
+        table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+        table.add_row("reference", f"{reading.reference_symbol} ({reading.instrument_uid})")
+        table.add_row("as of", reading.as_of.isoformat())
+        colour = "green" if reading.state is RegimeState.RISK_ON else "yellow"
+        table.add_row("state", f"[{colour}]{reading.state.value}[/{colour}]")
+        table.add_row(
+            "exposure factor",
+            f"x{reading.exposure_factor}" if reading.reduced else "x1 (full)",
+        )
+        table.add_row("sessions seen", f"{reading.n_sessions_seen} (needs {gate.min_sessions})")
+        if reading.last_close is not None:
+            table.add_row("last close", str(reading.last_close))
+        if reading.moving_average is not None:
+            table.add_row(f"{reading.ma_days}-day average", str(reading.moving_average))
+        console.print(table)
+        console.print(f"\n{escape(reading.detail)}", soft_wrap=True)
+
+        if reading.state.is_measured:
+            console.print(f"\n{OK} the gate is measuring the market.")
+            return
+
+        # The actionable half. An unmeasured gate is not an error to be cleared
+        # by ignoring it — it is the reason exposure is reduced, and the only
+        # fix is more history for the reference series.
+        console.print(
+            f"\n{WARN} this reading is not a market signal. Exposure stays at "
+            f"x{reading.exposure_factor} until the gate can see "
+            f"{gate.min_sessions} sessions of {reading.reference_symbol}.",
+            soft_wrap=True,
+        )
+        console.print(
+            f"  backfill the reference series with: [bold]tb data backfill "
+            f"--data-symbols {reading.reference_symbol} --resolution daily "
+            f"--years 2[/bold]",
+            soft_wrap=True,
+        )
+        raise typer.Exit(1)
+
+
+def _instant(text: str | None) -> datetime:
+    """Parse an as-of instant, refusing a naive one.
+
+    A naive datetime here would be interpreted as UTC by arithmetic further
+    down while the operator meant local time, which silently shifts the
+    visibility boundary by up to a day.
+    """
+    if text is None:
+        return datetime.now(UTC)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise typer.BadParameter(
+            f"{text!r} is not an ISO instant. Try 2026-03-02T00:00:00Z."
+        ) from exc
+    if parsed.tzinfo is None:
+        raise typer.BadParameter(
+            f"{text!r} has no timezone. An as-of instant without one would be read "
+            "as UTC while you meant local time, moving the visibility boundary by "
+            "up to a day. Append Z or an offset."
+        )
+    return parsed
+
+
+# --------------------------------------------------------------------------
+# tb data reconcile-actions
+# --------------------------------------------------------------------------
+
+
+@data_app.command("reconcile-actions")
+def data_reconcile_actions(
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+    limit: Annotated[int, typer.Option("--limit", help="Broker dividend records to read.")] = 50,
+) -> None:
+    """Check provider dividends against cash Trading 212 actually paid.
+
+    The highest-value identity check in the data layer, and the only one that
+    can catch the failure the symbol map exists to prevent. If a provider
+    reports a dividend and the broker credited no cash for a position held
+    through the ex-date, either the action data is wrong *or the symbol map
+    points at a different company than the one in the account*. Every other
+    check in this layer compares our data against our data; this one compares
+    it against money that moved.
+
+    Needs the broker, so it needs a key. Position spans come from
+    `positions_snapshot` — the reconciler's own output — because a dividend on
+    a stock we never held is not expected and counting those as mismatches
+    would bury the one case that matters under the whole universe.
+
+    With no position history at all the result is **inconclusive, not clean**:
+    without knowing what was held, "no credit" and "no credit expected" are
+    indistinguishable, and reporting that as a pass would be the wrong answer
+    in the permissive direction.
+    """
+    pinned = _load(limits)
+    with _ledger(db, pinned) as ledger:
+        instruments = {i.ticker: i for i in cached_instruments(ledger)}
+        actions = ActionStore(ledger, run_id=new_run_id())
+        with_actions = set(actions.instruments_with_actions())
+        if not with_actions:
+            console.print(
+                f"{WARN} no corporate actions stored, so there is nothing to reconcile. "
+                "Run [bold]tb data actions[/bold] first.",
+                soft_wrap=True,
+            )
+            return
+
+        spans = _held_spans(ledger)
+        if not spans:
+            console.print(
+                f"{WARN} no position history in `positions_snapshot`, so this check is "
+                "[bold]inconclusive rather than clean[/bold]: without knowing what was "
+                "held, a missing credit and a credit that was never due look identical. "
+                "Run [bold]tb reconcile[/bold] while holding a position first.",
+                soft_wrap=True,
+            )
+            raise typer.Exit(1)
+
+        try:
+            client = _broker_client(ledger, new_run_id())
+        except TbError as exc:
+            err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+            raise typer.Exit(2) from exc
+
+        try:
+            credits = client.get_dividends(limit=limit)
+        except TbError as exc:
+            err_console.print(
+                f"{BAD} could not read broker dividends: {escape(str(exc))}", soft_wrap=True
+            )
+            raise typer.Exit(2) from exc
+        finally:
+            client.close()
+
+        by_ticker: dict[str, list[tuple[date, Decimal]]] = {}
+        undated = 0
+        for record in credits:
+            if not record.ticker or record.amount is None or not record.paid_on:
+                # Never coerce a missing amount to zero: it would reconcile as
+                # "paid nothing" and mask the exact mismatch being looked for.
+                undated += 1
+                continue
+            try:
+                paid = datetime.fromisoformat(record.paid_on.replace("Z", "+00:00")).date()
+            except ValueError:
+                undated += 1
+                continue
+            by_ticker.setdefault(record.ticker, []).append((paid, record.amount))
+
+        matched = 0
+        unexplained: list[str] = []
+        skipped = 0
+        for ticker, instrument in sorted(instruments.items()):
+            uid = make_instrument_uid(isin=instrument.isin, t212_ticker=ticker)
+            if uid not in with_actions:
+                continue
+            results = actions.reconcile_dividends(
+                uid,
+                broker_credits=by_ticker.get(ticker, []),
+                held_through=spans.get(ticker, ()),
+            )
+            for outcome in results:
+                if not outcome.matched:
+                    unexplained.append(f"{ticker} {outcome.effective_date}: {outcome.detail}")
+                elif "no position held" in outcome.detail:
+                    skipped += 1
+                else:
+                    matched += 1
+
+        table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+        table.add_row("broker credits read", str(len(credits)))
+        table.add_row("unusable credit records", f"[yellow]{undated}[/yellow]" if undated else "0")
+        table.add_row("dividends matched", f"[green]{matched}[/green]" if matched else "0")
+        table.add_row("not expected (never held)", str(skipped))
+        table.add_row("UNEXPLAINED", f"[red]{len(unexplained)}[/red]" if unexplained else "0")
+        console.print(table)
+
+        for note in unexplained[:10]:
+            console.print(f"  {BAD} {escape(note)}", soft_wrap=True)
+
+        if unexplained:
+            err_console.print(
+                f"\n{BAD} {len(unexplained)} dividend(s) had no matching broker credit on a "
+                "position that was held through the ex-date. Either the action data is "
+                "wrong or the symbol map points at a different company — check "
+                "[bold]tb symbols show[/bold] for the affected tickers before trading them.",
+                soft_wrap=True,
+            )
+            raise typer.Exit(1)
+        console.print(f"\n{OK} every expected dividend matches a broker credit.")
+
+
+def _held_spans(ledger: Ledger) -> dict[str, tuple[tuple[date, date], ...]]:
+    """When each ticker was actually held, from the reconciler's snapshots.
+
+    `(initial_fill_date, snapshot_ts)` per row with a positive quantity. Coarse
+    on purpose: it is evidence that the position existed across that span, not
+    a claim that it existed at no other time. Under-claiming is the safe
+    direction — a dividend wrongly treated as "not expected" is skipped rather
+    than flagged, and an over-claimed span would manufacture mismatches for
+    stock that was never owned.
+    """
+    rows = ledger.conn.execute(
+        "SELECT ticker, quantity, initial_fill_date, ts FROM positions_snapshot "
+        "WHERE initial_fill_date IS NOT NULL"
+    ).fetchall()
+    found: dict[str, list[tuple[date, date]]] = {}
+    for row in rows:
+        try:
+            if Decimal(str(row["quantity"])) <= 0:
+                continue
+            start = datetime.fromisoformat(
+                str(row["initial_fill_date"]).replace("Z", "+00:00")
+            ).date()
+            end = datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00")).date()
+        except (ValueError, ArithmeticError):
+            continue
+        if end >= start:
+            found.setdefault(str(row["ticker"]), []).append((start, end))
+    return {ticker: tuple(spans) for ticker, spans in found.items()}
+
+
+def _act_on_suspicions(ledger: Ledger, suspicions: Sequence[SplitSuspicion]) -> tuple[int, int]:
+    """Record each inferred split and block the symbol it belongs to.
+
+    Two separate consequences, both required by the plan's rule. Recording
+    makes the inference a durable fact the factor algebra can be asked to
+    exclude; blocking is what actually stops an entry. Doing only the first
+    would leave the loop free to trade a series the audit just called into
+    question.
+
+    The uid-to-ticker direction needs the instruments cache, because an
+    `isin:` uid carries no ticker — which is why this lives in the CLI rather
+    than in `DataAuditor`. The data audit must stay runnable without a broker.
+    """
+    actions = ActionStore(ledger, run_id=new_run_id())
+    by_uid: dict[str, str] = {}
+    for instrument in cached_instruments(ledger):
+        by_uid[make_instrument_uid(isin=instrument.isin, t212_ticker=instrument.ticker)] = (
+            instrument.ticker
+        )
+
+    recorded = 0
+    blocked = 0
+    for suspicion in suspicions:
+        result = actions.record_suspicion(suspicion)
+        if result.recorded:
+            recorded += 1
+        ticker = by_uid.get(suspicion.instrument_uid)
+        if ticker is None:
+            continue
+        for provider in KNOWN_PROVIDERS:
+            symbol_map = SymbolMap(ledger, provider=provider)
+            if symbol_map.get(ticker) is None:
+                continue
+            symbol_map.block_for(
+                ticker,
+                # `description` rather than a second format string: it already
+                # reads as "N-for-M split within X%", and a reason an operator
+                # has to decode is a reason they will override.
+                reason=f"unexplained split — {suspicion.description}",
+            )
+            blocked += 1
+            break
+    return recorded, blocked
