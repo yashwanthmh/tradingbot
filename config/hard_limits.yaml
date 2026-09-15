@@ -17,7 +17,7 @@
 #  Changing a value takes effect on the next process start, not mid-run.
 # ============================================================================
 
-schema_version: 2
+schema_version: 3
 
 # Currency of every *_ccy figure below. Asserted against the base currency the
 # broker reports for the account at startup; a mismatch is fatal, because a
@@ -89,6 +89,32 @@ execution:
   # No entries in the opening or closing auction chaos.
   no_entry_first_minutes: 15
   no_entry_last_minutes: 20
+
+costs:
+  # NOT the venue's published fees. The 0.15% FX conversion and the 0.5% UK
+  # stamp duty are facts about the world; they live in code beside the
+  # arithmetic that charges them, so changing one is a reviewed commit rather
+  # than a config edit. What lives here is the judgement call nobody publishes.
+
+  # Half the quoted spread, paid on entry and again on exit. 2bps is realistic
+  # for a US megacap in regular hours and optimistic for anything thinner.
+  assumed_half_spread_bps: 2.0
+  # What a market order pays beyond the spread. Separate from the spread
+  # because they scale differently with size and with volatility.
+  assumed_slippage_bps: 3.0
+
+  # Backstop against our own arithmetic. If the cost model ever computes a
+  # round trip cheaper than this, this is used instead: a cost bug makes
+  # trading look free, and that is the expensive direction to be wrong in.
+  min_round_trip_cost_bps: 30.0
+
+  # Bounds on what a strategy may CLAIM its edge is. The upper bound is not
+  # tuning — it closes a hole. The cost gate divides cost by the strategy's own
+  # declared edge, so a spec claiming 10,000bps would pass trivially and the
+  # one control keeping the search loop out of the fee trap would be
+  # defeatable by the search loop. An edge above this is a malformed spec.
+  min_expected_edge_bps: 5.0
+  max_expected_edge_bps: 500.0
 
 anomaly:
   # Halt if today's activity exceeds the trailing 95th percentile by this

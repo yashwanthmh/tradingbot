@@ -141,6 +141,47 @@ class ExecutionLimits(_Section):
         return self
 
 
+class CostLimits(_Section):
+    """What a round trip is assumed to cost, and what edge may be claimed.
+
+    Deliberately *not* the venue's published fees. Trading 212's 0.15% FX
+    conversion and the UK's 0.5% stamp duty are facts about the world, they
+    live in code beside the arithmetic that charges them, and changing one
+    should be a reviewed commit rather than a config edit. What lives here is
+    the part that is a judgement call nobody publishes: the spread and
+    slippage a market order actually pays.
+
+    `max_expected_edge_bps` closes a hole in the cost gate rather than tuning
+    it. The gate is `expected_cost_bps / expected_edge_bps <=
+    max_cost_to_edge_ratio`, and `expected_edge_bps` is declared by the
+    strategy — so a spec claiming a 10,000bps edge passes the gate trivially.
+    Without a ceiling, the one control that keeps the search loop out of the
+    fee trap is defeatable by the search loop. An edge above this is not
+    optimism, it is a malformed spec.
+    """
+
+    assumed_half_spread_bps: float = Field(ge=0.0)
+    assumed_slippage_bps: float = Field(ge=0.0)
+
+    # A computed round trip below this is treated as this instead. A cost model
+    # bug makes trading look free, which is the expensive direction to be wrong
+    # in, so the floor is a backstop against our own arithmetic.
+    min_round_trip_cost_bps: float = Field(gt=0.0)
+
+    min_expected_edge_bps: float = Field(gt=0.0)
+    max_expected_edge_bps: float = Field(gt=0.0)
+
+    @model_validator(mode="after")
+    def _check_ordering(self) -> CostLimits:
+        if self.min_expected_edge_bps >= self.max_expected_edge_bps:
+            raise ValueError(
+                f"min_expected_edge_bps ({self.min_expected_edge_bps}) is not below "
+                f"max_expected_edge_bps ({self.max_expected_edge_bps}): no declared "
+                "edge would be admissible, so nothing could ever trade"
+            )
+        return self
+
+
 class AnomalyLimits(_Section):
     """Runaway-loop containment.
 
@@ -251,6 +292,7 @@ class HardLimits(_Section):
     capital: CapitalLimits
     loss: LossLimits
     execution: ExecutionLimits
+    costs: CostLimits
     anomaly: AnomalyLimits
     regime: RegimeLimits
     promotion: PromotionLimits
@@ -279,6 +321,36 @@ class HardLimits(_Section):
     def worst_case_unprotected_loss_pct(self) -> float:
         """Equity lost if one position gaps through its unprotected window."""
         return self.capital.per_position_pct * self.execution.unprotected_gap_pct_assumption / 100.0
+
+    @property
+    def implied_min_edge_bps(self) -> float:
+        """The smallest edge that could clear the cost gate at the cost floor.
+
+        `min_round_trip_cost_bps / max_cost_to_edge_ratio`. This is the number
+        the whole venue analysis comes down to: at a 30bps floor and a 0.33
+        ratio it is 90bps, against 5-20bps of gross minute-bar edge in liquid
+        names. Exposing it as a property keeps that arithmetic in front of
+        whoever edits either input, instead of it emerging as an empty
+        promotion pipeline three milestones later.
+        """
+        return self.costs.min_round_trip_cost_bps / self.execution.max_cost_to_edge_ratio
+
+    @model_validator(mode="after")
+    def _check_cost_coherence(self) -> HardLimits:
+        # A declared-edge ceiling below what the cost gate demands means every
+        # admissible spec is rejected by the gate: the pipeline would run,
+        # reject everything, and report nothing wrong.
+        if self.costs.max_expected_edge_bps < self.implied_min_edge_bps:
+            raise ValueError(
+                f"costs.max_expected_edge_bps ({self.costs.max_expected_edge_bps}bps) is "
+                f"below the edge the cost gate requires at the cost floor "
+                f"({self.implied_min_edge_bps:.1f}bps = min_round_trip_cost_bps "
+                f"{self.costs.min_round_trip_cost_bps} / max_cost_to_edge_ratio "
+                f"{self.execution.max_cost_to_edge_ratio}). Every spec permitted to "
+                "declare an edge would then be refused for having too small a one, so "
+                "nothing could ever be promoted and no gate would report why."
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_data_coherence(self) -> HardLimits:

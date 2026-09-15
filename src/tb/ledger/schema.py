@@ -27,7 +27,7 @@ from pathlib import Path
 
 from tb.core.canonical import GENESIS_HASH
 
-LEDGER_SCHEMA_VERSION = 3
+LEDGER_SCHEMA_VERSION = 4
 
 # --------------------------------------------------------------------------
 # Tables
@@ -445,6 +445,111 @@ _TABLES: tuple[str, ...] = (
         PRIMARY KEY (provider, resolution, observed_at)
     )
     """,
+    # ---- strategy specs and backtests (M3) -------------------------------
+    # The spec is stored as submitted, with a content hash over its canonical
+    # form. `UNIQUE(strategy_id, version)` is load-bearing beyond tidiness:
+    # M5's sealed holdout may be evaluated exactly once per version, and a
+    # uniqueness constraint is what makes a second evaluation impossible
+    # rather than merely discouraged.
+    """
+    CREATE TABLE IF NOT EXISTS strategy_specs (
+        strategy_id        TEXT    NOT NULL,
+        version            INTEGER NOT NULL,
+        lineage_id         TEXT    NOT NULL,
+        parent_strategy_id TEXT,
+        spec_json          TEXT    NOT NULL,
+        spec_hash          TEXT    NOT NULL,
+        author_kind        TEXT    NOT NULL,
+        expected_edge_bps  REAL,
+        registered_at      TEXT    NOT NULL,
+        registering_event_seq INTEGER NOT NULL,
+        PRIMARY KEY (strategy_id, version)
+    )
+    """,
+    # Every backtest, including the ones that failed their gates. M5 computes
+    # deflated Sharpe from the trial count in a lineage, and a table holding
+    # only the successes would understate that count — which inflates every
+    # deflated metric computed from it, in the permissive direction.
+    """
+    CREATE TABLE IF NOT EXISTS backtests (
+        backtest_id        TEXT    PRIMARY KEY,
+        strategy_id        TEXT    NOT NULL,
+        strategy_version   INTEGER NOT NULL,
+        spec_hash          TEXT    NOT NULL,
+        vintage_id         TEXT    NOT NULL,
+        resolution         TEXT    NOT NULL,
+        window_start       TEXT,
+        window_end         TEXT,
+        rng_seed           INTEGER NOT NULL,
+        code_git_sha       TEXT,
+        config_hash        TEXT,
+        n_decisions        INTEGER NOT NULL,
+        n_trades           INTEGER NOT NULL,
+        n_rejected_by_cost_gate INTEGER NOT NULL DEFAULT 0,
+        gross_return_pct   REAL,
+        net_return_pct     REAL,
+        gross_sharpe       REAL,
+        net_sharpe         REAL,
+        max_drawdown_pct   REAL,
+        cost_drag_bps      REAL,
+        turnover           REAL,
+        admissible         INTEGER NOT NULL DEFAULT 0,
+        caveats_json       TEXT,
+        ran_at             TEXT    NOT NULL,
+        completing_event_seq INTEGER NOT NULL
+    )
+    """,
+    # Per-trade detail, so a backtest result can be interrogated rather than
+    # only believed. Costs are broken out by component because "it lost money
+    # after costs" and "it lost money to stamp duty specifically" lead to
+    # different decisions.
+    """
+    CREATE TABLE IF NOT EXISTS backtest_trades (
+        backtest_id       TEXT    NOT NULL,
+        trade_seq         INTEGER NOT NULL,
+        instrument_uid    TEXT    NOT NULL,
+        entry_at          TEXT    NOT NULL,
+        exit_at           TEXT,
+        entry_price       TEXT    NOT NULL,
+        exit_price        TEXT,
+        quantity          TEXT    NOT NULL,
+        gross_pnl_ccy     TEXT,
+        net_pnl_ccy       TEXT,
+        cost_total_ccy    TEXT,
+        cost_fx_ccy       TEXT,
+        cost_stamp_ccy    TEXT,
+        cost_spread_ccy   TEXT,
+        cost_slippage_ccy TEXT,
+        expected_edge_bps REAL,
+        expected_cost_bps REAL,
+        holding_minutes   INTEGER,
+        exit_reason       TEXT,
+        PRIMARY KEY (backtest_id, trade_seq)
+    )
+    """,
+    # Calibration runs: whether the engine itself can be trusted. Kept as its
+    # own table rather than a flag on `backtests` because the subject is the
+    # engine, and M5 needs to find the most recent run for this code version.
+    """
+    CREATE TABLE IF NOT EXISTS backtest_calibrations (
+        calibration_id    TEXT    PRIMARY KEY,
+        vintage_id        TEXT    NOT NULL,
+        resolution        TEXT    NOT NULL,
+        code_git_sha      TEXT,
+        n_strategies      INTEGER NOT NULL,
+        n_runs            INTEGER NOT NULL,
+        rng_seed          INTEGER NOT NULL,
+        worst_net_sharpe  REAL,
+        best_net_sharpe   REAL,
+        mean_net_sharpe   REAL,
+        mean_cost_drag_bps REAL,
+        tolerance         REAL    NOT NULL,
+        passed            INTEGER NOT NULL,
+        failures_json     TEXT,
+        ran_at            TEXT    NOT NULL,
+        completing_event_seq INTEGER NOT NULL
+    )
+    """,
 )
 
 # --------------------------------------------------------------------------
@@ -518,6 +623,16 @@ _INDEXES: tuple[str, ...] = (
     "ON bar_revisions (instrument_uid, resolution, bar_open_utc)",
     "CREATE INDEX IF NOT EXISTS ix_universe_snapshots_taken ON universe_snapshots (taken_at)",
     "CREATE INDEX IF NOT EXISTS ix_fx_lookup ON fx_rates (pair, as_of_date)",
+    # v4 (M3)
+    "CREATE INDEX IF NOT EXISTS ix_strategy_specs_lineage ON strategy_specs (lineage_id)",
+    "CREATE INDEX IF NOT EXISTS ix_strategy_specs_hash ON strategy_specs (spec_hash)",
+    # The lineage trial count M5's deflated Sharpe divides by. Indexed because
+    # it is read on every promotion evaluation, over every trial ever run.
+    "CREATE INDEX IF NOT EXISTS ix_backtests_strategy ON backtests (strategy_id, strategy_version)",
+    "CREATE INDEX IF NOT EXISTS ix_backtests_vintage ON backtests (vintage_id)",
+    "CREATE INDEX IF NOT EXISTS ix_backtest_trades_instrument "
+    "ON backtest_trades (backtest_id, instrument_uid)",
+    "CREATE INDEX IF NOT EXISTS ix_calibrations_ran ON backtest_calibrations (ran_at)",
 )
 
 

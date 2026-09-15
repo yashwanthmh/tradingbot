@@ -282,3 +282,83 @@ def test_hard_limits_model_rejects_out_of_range_percentages() -> None:
     payload["capital"]["per_position_pct"] = 0.0
     with pytest.raises(Exception, match="greater than 0"):
         HardLimits.model_validate(payload)
+
+
+# --------------------------------------------------------------------------
+# The cost section (M3)
+# --------------------------------------------------------------------------
+
+
+def test_the_costs_section_holds_only_judgement_calls(limits_file: Path) -> None:
+    """The venue's published fees are deliberately NOT here.
+
+    0.15% FX and 0.5% stamp duty are facts about the world, they live beside
+    the arithmetic that charges them, and changing one should be a reviewed
+    commit rather than a config edit.
+    """
+    costs = load_hard_limits(limits_file).limits.costs
+    assert costs.assumed_half_spread_bps > 0
+    assert costs.assumed_slippage_bps > 0
+    assert costs.min_round_trip_cost_bps > 0
+    fields = set(type(costs).model_fields)
+    assert not {f for f in fields if "stamp" in f or "fx" in f}, (
+        "a published venue fee has been moved into the operator-tunable file"
+    )
+
+
+def test_implied_min_edge_is_the_whole_venue_analysis(limits_file: Path) -> None:
+    """One number: what a strategy must earn gross to survive the cost gate.
+
+    At a 30bps floor and a 0.33 ratio this is ~91bps, against 5-20bps of gross
+    minute-bar edge in liquid names. That gap is the project's central
+    constraint, so it is computed rather than asserted in prose.
+    """
+    limits = load_hard_limits(limits_file).limits
+    expected = limits.costs.min_round_trip_cost_bps / limits.execution.max_cost_to_edge_ratio
+    assert limits.implied_min_edge_bps == pytest.approx(expected)
+    assert limits.implied_min_edge_bps > 20.0, (
+        "if this ever drops below gross minute-bar edge, re-read the cost model before believing it"
+    )
+
+
+def test_a_declared_edge_ceiling_below_the_gate_is_refused() -> None:
+    """Otherwise the pipeline rejects everything and reports nothing wrong.
+
+    Every spec permitted to declare an edge would be refused by the cost gate
+    for declaring too small a one, so promotion would be silently impossible.
+    """
+    payload = yaml.safe_load(REFERENCE_LIMITS.read_text(encoding="utf-8"))
+    payload["costs"]["max_expected_edge_bps"] = 10.0
+    payload["costs"]["min_expected_edge_bps"] = 1.0
+    with pytest.raises(Exception, match="below the edge the cost gate requires"):
+        HardLimits.model_validate(payload)
+
+
+def test_an_inverted_declared_edge_band_is_refused() -> None:
+    payload = yaml.safe_load(REFERENCE_LIMITS.read_text(encoding="utf-8"))
+    payload["costs"]["min_expected_edge_bps"] = 600.0
+    with pytest.raises(Exception, match="not below"):
+        HardLimits.model_validate(payload)
+
+
+def test_a_missing_costs_section_is_fatal() -> None:
+    """Fail-closed on our own config.
+
+    A limits file with no cost assumptions would otherwise mean the cost gate
+    runs on defaults nobody reviewed — and the permissive direction of that
+    mistake is "trading looks free".
+    """
+    payload = yaml.safe_load(REFERENCE_LIMITS.read_text(encoding="utf-8"))
+    del payload["costs"]
+    with pytest.raises(Exception, match="costs"):
+        HardLimits.model_validate(payload)
+
+
+def test_a_v2_limits_file_is_refused_rather_than_partly_understood(tmp_path: Path) -> None:
+    """v2 predates the costs section, so claiming support would be a lie."""
+    payload = yaml.safe_load(REFERENCE_LIMITS.read_text(encoding="utf-8"))
+    payload["schema_version"] = 2
+    target = tmp_path / "v2.yaml"
+    target.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    with pytest.raises(Exception, match="schema_version=2"):
+        load_hard_limits(target)

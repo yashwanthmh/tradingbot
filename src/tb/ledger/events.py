@@ -101,6 +101,14 @@ class EventType(StrEnum):
     DATA_UNIVERSE_SNAPSHOT_TAKEN = "data.universe_snapshot_taken"
     DATA_BAKEOFF_COMPLETED = "data.bakeoff_completed"
 
+    # --- strategy specs and backtests (M3) ---
+    STRATEGY_SPEC_REGISTERED = "strategy.spec_registered"
+    BACKTEST_COMPLETED = "backtest.completed"
+    # The null-strategy calibration. Its own event type rather than a flag on
+    # a backtest, because it is evidence about the *engine* rather than about a
+    # strategy, and M5's promotion gate needs to find the most recent one.
+    BACKTEST_CALIBRATED = "backtest.calibrated"
+
 
 class EventPayload(BaseModel):
     """Base for every payload.
@@ -548,6 +556,88 @@ class BakeoffPayload(EventPayload):
     rationale: str
 
 
+class StrategySpecPayload(EventPayload):
+    """A strategy specification entering the registry.
+
+    `author_kind` distinguishes a hand-written spec from a searcher's and from
+    an LLM's. It matters for M5's multiplicity accounting: a deterministic
+    searcher generates orders of magnitude more candidates than a person does,
+    so the deflated-Sharpe trial count is dominated by whichever produced the
+    lineage.
+    """
+
+    strategy_id: str
+    lineage_id: str
+    version: int
+    spec_hash: str
+    author_kind: str
+    parent_strategy_id: str | None = None
+    expected_edge_bps: float | None = None
+    n_operators: int | None = None
+
+
+class BacktestPayload(EventPayload):
+    """One backtest, and the evidence needed to judge whether it means anything.
+
+    `vintage_id` is not decoration. A backtest that does not name a sealed
+    vintage ran against a store whose contents have since been free to change,
+    so its numbers cannot be reproduced and cannot support a decision to put
+    money behind them. `rng_seed` and `code_git_sha` complete the triple that
+    makes a re-run comparable.
+    """
+
+    backtest_id: str
+    strategy_id: str
+    strategy_version: int
+    spec_hash: str
+    vintage_id: str
+    resolution: str
+    window_start: str
+    window_end: str
+    rng_seed: int
+
+    n_decisions: int
+    n_trades: int
+    n_rejected_by_cost_gate: int = 0
+
+    gross_return_pct: float | None = None
+    net_return_pct: float | None = None
+    # Both, always. A gross Sharpe on this venue is a number about a strategy
+    # that does not exist, since the fee schedule is the binding constraint.
+    gross_sharpe: float | None = None
+    net_sharpe: float | None = None
+    max_drawdown_pct: float | None = None
+    cost_drag_bps: float | None = None
+    turnover: float | None = None
+    admissible: bool = False
+    caveats: list[str] = Field(default_factory=list)
+
+
+class CalibrationPayload(EventPayload):
+    """Whether the backtester itself can be trusted.
+
+    Evidence about the engine, not about a strategy. Null strategies — random
+    entries, always-long, coin-flip — must show a post-cost Sharpe that is
+    approximately the cost drag and no better. A coin-flip strategy showing
+    positive net Sharpe is not a discovery, it is a lookahead bug, a fill
+    price taken from the wrong bar, or a cost model charging too little.
+    """
+
+    calibration_id: str
+    vintage_id: str
+    resolution: str
+    n_strategies: int
+    n_runs: int
+    rng_seed: int
+    worst_net_sharpe: float | None = None
+    best_net_sharpe: float | None = None
+    mean_net_sharpe: float | None = None
+    mean_cost_drag_bps: float | None = None
+    tolerance: float
+    passed: bool
+    failures: list[str] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------
@@ -583,6 +673,9 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.DATA_ACTION_RECONCILED: ActionReconciledPayload,
     EventType.DATA_UNIVERSE_SNAPSHOT_TAKEN: UniverseSnapshotPayload,
     EventType.DATA_BAKEOFF_COMPLETED: BakeoffPayload,
+    EventType.STRATEGY_SPEC_REGISTERED: StrategySpecPayload,
+    EventType.BACKTEST_COMPLETED: BacktestPayload,
+    EventType.BACKTEST_CALIBRATED: CalibrationPayload,
 }
 
 # The default aggregate each event type is filed under, so callers do not have
@@ -618,6 +711,12 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     EventType.DATA_ACTION_RECONCILED: AggregateType.DATA,
     EventType.DATA_UNIVERSE_SNAPSHOT_TAKEN: AggregateType.DATA,
     EventType.DATA_BAKEOFF_COMPLETED: AggregateType.DATA,
+    EventType.STRATEGY_SPEC_REGISTERED: AggregateType.STRATEGY,
+    EventType.BACKTEST_COMPLETED: AggregateType.STRATEGY,
+    # Filed under RUN, not STRATEGY: a calibration is a statement about this
+    # build of the engine, and filing it under a strategy would imply it says
+    # something about one.
+    EventType.BACKTEST_CALIBRATED: AggregateType.RUN,
 }
 
 
