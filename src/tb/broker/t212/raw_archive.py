@@ -64,6 +64,29 @@ class RawArchive:
         # The API key, so it can be scrubbed if it ever appears in a body.
         self._redact = tuple(v for v in redact_values if v)
 
+    @classmethod
+    def for_provider(
+        cls,
+        ledger: Ledger | None,
+        *,
+        provider: str,
+        run_id: str | None = None,
+        redact_values: tuple[str, ...] = (),
+    ) -> RawArchive:
+        """An archive for a market-data provider rather than for the broker.
+
+        The `environment` column is really a *source* field — it was named for
+        the broker case, where the only sources are demo and live. Nothing
+        about `record()` is broker-specific, so a provider reuses the same
+        table, the same scrubber and the same replay path rather than growing a
+        parallel archive that would need its own drift tooling.
+
+        Worth having for Yahoo above all: its failure mode is *silently
+        different data* rather than an error, so the archived body is the only
+        way to tell a shape change from a guess about one.
+        """
+        return cls(ledger, environment=provider, run_id=run_id, redact_values=redact_values)
+
     def _scrub(self, text: str | None) -> str | None:
         if text is None:
             return None

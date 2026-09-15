@@ -31,6 +31,7 @@ from rich.table import Table
 
 from tb.broker.reconcile import Severity
 from tb.broker.t212.probe import cached_instruments
+from tb.broker.t212.raw_archive import RawArchive
 from tb.config.loader import PinnedLimits, load_hard_limits
 from tb.core.errors import TbError
 from tb.core.ids import new_run_id
@@ -49,6 +50,8 @@ from tb.data.provider import (
     make_instrument_uid,
 )
 from tb.data.providers import AlpacaProvider, YahooProvider
+from tb.data.providers.alpaca import KEY_ID_VAR as ALPACA_KEY_ID_VAR
+from tb.data.providers.alpaca import SECRET_VAR as ALPACA_SECRET_VAR
 from tb.data.snapshot import SnapshotStore
 from tb.data.symbols import SymbolMap
 from tb.data.universe import (
@@ -130,16 +133,42 @@ def _check_provider(name: str) -> str:
     return name
 
 
-def _provider(name: str) -> MarketDataProvider:
-    """Build a validated provider, resolving credentials where it needs them."""
+def _provider(name: str, *, archive: RawArchive | None = None) -> MarketDataProvider:
+    """Build a validated provider, resolving credentials where it needs them.
+
+    `archive` is threaded through rather than constructed here because it needs
+    a ledger, and the provider factory is deliberately usable without one (for
+    `tb data bakeoff --help`, for instance). Passing it is what makes the
+    payloads replayable; before this was wired, `tb data backfill` archived
+    nothing at all and a Yahoo shape change left no forensic record.
+    """
     _check_provider(name)
     if name == "yahoo":
-        return YahooProvider()
+        return YahooProvider(archive=archive)
     try:
-        return AlpacaProvider.from_env()
+        return AlpacaProvider.from_env(archive=archive)
     except DataError as exc:
         err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
         raise typer.Exit(2) from exc
+
+
+def _archive(ledger: Ledger, provider: str, run_id: str | None = None) -> RawArchive:
+    """A provider archive with the credential scrubbed.
+
+    Alpaca sends its key in headers, which never reach `record()`, so this is
+    defence in depth rather than the primary control: a 401 body that echoed
+    the key back would otherwise be archived verbatim. Yahoo needs it more
+    directly, since its query parameters can carry tokens.
+    """
+    secrets = tuple(
+        value
+        for value in (
+            os.environ.get(ALPACA_KEY_ID_VAR),
+            os.environ.get(ALPACA_SECRET_VAR),
+        )
+        if value
+    )
+    return RawArchive.for_provider(ledger, provider=provider, run_id=run_id, redact_values=secrets)
 
 
 def _resolution(text: str) -> Resolution:
@@ -392,7 +421,8 @@ def data_backfill(
         end = datetime.now(UTC)
         start = end - span
 
-        feed = _provider(provider)
+        run_id = new_run_id()
+        feed = _provider(provider, archive=_archive(ledger, provider, run_id))
         console.print(
             f"fetching {res.value} bars for {len(targets)} symbol(s) from "
             f"[bold]{provider}[/bold], {start.date()} to {end.date()}"
@@ -908,7 +938,8 @@ def data_actions(
     with _ledger(db, pinned) as ledger:
         symbol_map = SymbolMap(ledger, provider=provider)
         instruments = {i.ticker: i for i in cached_instruments(ledger)}
-        actions = ActionStore(ledger, run_id=new_run_id())
+        actions_run_id = new_run_id()
+        actions = ActionStore(ledger, run_id=actions_run_id)
 
         if symbols:
             tickers = [t.strip() for t in symbols.split(",") if t.strip()]
@@ -924,7 +955,8 @@ def data_actions(
 
         end = datetime.now(UTC)
         start = end - timedelta(days=365 * years)
-        feed = _provider(provider)
+        run_id = new_run_id()
+        feed = _provider(provider, archive=_archive(ledger, provider, run_id))
         recorded = 0
         superseded = 0
         problems: list[str] = []
@@ -997,11 +1029,12 @@ def data_canary(
 
     with _ledger(db, pinned) as ledger:
         store = _store(ledger, pinned, bars)
+        canary_run_id = new_run_id()
         canary = RevisionCanary(
             ledger,
             store,
             sample_pct=pinned.limits.data.revision_canary_sample_pct,
-            run_id=new_run_id(),
+            run_id=canary_run_id,
         )
 
         if report:
@@ -1022,7 +1055,7 @@ def data_canary(
             f"{res.value} window(s) via [bold]{provider}[/bold], "
             "least-recently-checked first"
         )
-        feed = _provider(provider)
+        feed = _provider(provider, archive=_archive(ledger, provider, canary_run_id))
         try:
             result = canary.run(feed, resolution=res)
         finally:

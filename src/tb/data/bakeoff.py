@@ -378,9 +378,29 @@ class Bakeoff:
             worst=tuple(sorted(pairs, key=lambda p: -p.disagreement_bps)[:5]),
         )
 
+        # Persist the delay measurement, not just report it. Until this was
+        # wired the p95 went into the event payload and nowhere else, so the
+        # conservative declared constant stayed authoritative forever and
+        # `live_capable`'s preference for an observed delay was unreachable.
+        # `measure` refuses backfilled bars, so a history-only run records
+        # nothing rather than laundering the declared guess into the table
+        # meant to replace it.
+        self._record_observations(
+            {primary: primary_bars, secondary: secondary_bars}, resolution=resolution
+        )
+
         if emit_event:
             self._emit(result)
         return result
+
+    def _record_observations(
+        self, by_provider: dict[str, Sequence[Bar]], *, resolution: Resolution
+    ) -> None:
+        from tb.data.observations import ProviderObservationStore
+
+        store = ProviderObservationStore(self._ledger)
+        for provider, bars in by_provider.items():
+            store.measure_and_record(bars, provider=provider, resolution=resolution)
 
     def _staleness_coverage(self, bars: Sequence[Bar]) -> float | None:
         """What fraction of live bars arrived inside the staleness bound.

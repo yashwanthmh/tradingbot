@@ -502,7 +502,12 @@ def test_backfill_by_data_symbol_needs_no_universe_or_symbol_map(
         for index, day in enumerate(days)
     ]
     monkeypatch.setattr(
-        cli_data, "_provider", lambda _name: CsvFixtureProvider(bars=bars, provider_name="yahoo")
+        cli_data,
+        "_provider",
+        # Accepts `archive=` because the real factory threads one through:
+        # `tb data backfill` archives provider payloads so a Yahoo shape
+        # change has a forensic record. The fixture ignores it.
+        lambda _name, archive=None: CsvFixtureProvider(bars=bars, provider_name="yahoo"),
     )
 
     result = _run(
