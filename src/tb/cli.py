@@ -60,6 +60,11 @@ from tb.cli_data import data_app, universe_app  # noqa: E402
 app.add_typer(data_app, name="data")
 app.add_typer(universe_app, name="universe")
 
+# M3: the cost model and the non-cheating backtester.
+from tb.cli_backtest import backtest_app  # noqa: E402
+
+app.add_typer(backtest_app, name="backtest")
+
 
 @app.command("reconcile")
 def reconcile(

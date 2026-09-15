@@ -125,7 +125,7 @@ data*, then *can I reconcile broker state*, then *is there any edge after costs*
 | M0 | Ledger, hard limits, kill switch, run state | **done** |
 | M1 | Broker adapter (read-only), rate governor, reconciler, symbol map | **done** |
 | M2 | Point-in-time data layer, provider bake-off | **done** |
-| M3 | Cost model, non-cheating backtester, strategy DSL | |
+| M3 | Cost model, non-cheating backtester, strategy DSL | **done** |
 | M4 | Risk engine, live loop, crash drills | |
 | M5 | Registry, promotion gate, capital allocator | |
 | M6 | Self-strategising search (LLM optional) | |
@@ -248,6 +248,71 @@ are read from deliberately different variables — `T212_DEMO_API_KEY` and
 `T212_LIVE_API_KEY` — and the base URL is derived from which one is present. There is no
 mode flag, because a single key plus a flag is one typo away from real money. Research and
 backtest processes are asserted to run *without* the live key in their environment at all.
+
+Then check that the backtester can be trusted, before trusting anything it
+says:
+
+```bash
+tb backtest costs             # the venue arithmetic, per jurisdiction
+tb backtest calibrate         # exits 1 if a null strategy earned an edge
+tb backtest calibrations      # what the engine has been judged on
+```
+
+`tb backtest costs` prints the number the whole project turns on. From a GBP
+account, per 1,000 of notional:
+
+| instrument | round trip | gross edge needed |
+|---|---|---|
+| US large-cap | 40bps | **121bps** |
+| UK share | 60bps | **182bps** |
+| Irish share | 140bps | **424bps** |
+
+against 5-20bps of gross edge on minute-bar signals in liquid names. Minute-by-
+minute trading needs six to twenty times more edge than exists, which is why
+the design target is minute-resolution *features* with hour-to-day position
+changes — and why the cost gate is a pre-trade rejection rather than a report.
+Irish-incorporated names are not tradable by anything in this system's class.
+
+`tb backtest calibrate` is a release gate rather than a diagnostic. It runs
+strategies with no edge by construction — always-flat, always-long,
+alternating, and eight seeded coin flips — over the store and fails if any of
+them earned one. A coin flip with a positive net Sharpe is a fill-timing error,
+a mark taken from a bar the position could not see, or a cost charged on one
+leg. It is never a discovery.
+
+The assertion is two-sided, and the second half is the part usually left out:
+the population's cost drag must also be materially non-zero, because a run
+where nothing was charged passes the Sharpe test trivially while proving
+nothing. That check earned its place immediately — it caught a real bug in the
+first version of the engine, which compared bar time instead of knowledge time
+when picking a fill bar and therefore filled nothing at all.
+
+Three things about the backtester that are load-bearing:
+
+**A fill never uses a price the decision could see.** An order decided on bar
+`t` fills at the open of bar `t+1`, and the engine obtains that price by
+advancing the reader — so it is structurally unavailable to the decision that
+caused it. Filling at the decision bar's close is the most common way a
+backtest manufactures returns, worth roughly the entire gross edge at minute
+resolution. A decision on the last bar has no next bar, so it is dropped and
+counted rather than filled at a price it saw.
+
+**There is exactly one feature pipeline.** The same object, taking the same
+`BarWindow` type, in backtest, paper and live. A test asserts both call paths
+produce identical snapshot hashes, because two implementations that agree today
+drift — and the drift surfaces as live underperforming its backtest months
+after it was introduced.
+
+**A strategy that will not declare its expected edge cannot trade.** The cost
+gate divides by that declared number, so `costs.max_expected_edge_bps` bounds
+it: without a ceiling, a spec claiming 10,000bps would pass the gate trivially
+and the one control keeping the search loop out of the fee trap would be
+defeatable by the search loop.
+
+Strategy specs are validated data, never code. A test walks the AST of
+`src/tb/strategy/` asserting no `eval`, `exec`, `compile` or dangerous import
+exists anywhere in the interpretation path — features are selected from a fixed
+library table by name, which is what makes interpreting generated specs safe.
 
 ## Risk and honest limitations
 
