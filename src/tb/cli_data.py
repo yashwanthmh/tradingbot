@@ -39,6 +39,7 @@ from tb.data.audit import DataAuditor, summarise_gaps
 from tb.data.bakeoff import Bakeoff, Verdict, may_widen_live_resolutions
 from tb.data.barstore import BarStore
 from tb.data.calendar import TradingCalendar
+from tb.data.canary import RevisionCanary
 from tb.data.fx import FxStore, rates_from_bars
 from tb.data.provider import (
     DataError,
@@ -957,3 +958,130 @@ def data_actions(
         console.print(table)
         for problem in problems[:10]:
             console.print(f"  {WARN} {escape(problem)}")
+
+
+# --------------------------------------------------------------------------
+# tb data canary
+# --------------------------------------------------------------------------
+
+
+@data_app.command("canary")
+def data_canary(
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+    bars: RootOpt = None,
+    provider: Annotated[str, typer.Option("--provider", help="alpaca or yahoo.")] = "yahoo",
+    resolution: Annotated[str, typer.Option("--resolution", help="daily, hourly or minute.")] = (
+        "daily"
+    ),
+    report: Annotated[
+        bool, typer.Option("--report", help="Show coverage history without fetching.")
+    ] = False,
+) -> None:
+    """Re-read a slice of stored history and record what the vendor now says.
+
+    Revision detection only fires on bars that get refetched, and the
+    incremental poll only refetches the last few sessions. A restatement
+    twenty days back is therefore *invisible* — nothing in the system would
+    ever look there — and Yahoo back-adjusts historical OHLC as a matter of
+    course, including for actions it never reports.
+
+    Windows are selected least-recently-verified first rather than at random,
+    so coverage accumulates instead of re-rolling the same dice, and the oldest
+    unverified history is reached first. `data.revision_canary_sample_pct` is
+    the per-run budget.
+    """
+    pinned = _load(limits)
+    res = _resolution(resolution)
+    _check_provider(provider)
+
+    with _ledger(db, pinned) as ledger:
+        store = _store(ledger, pinned, bars)
+        canary = RevisionCanary(
+            ledger,
+            store,
+            sample_pct=pinned.limits.data.revision_canary_sample_pct,
+            run_id=new_run_id(),
+        )
+
+        if report:
+            _canary_report(canary, res)
+            return
+
+        available = canary.windows(resolution=res)
+        if not available:
+            console.print(
+                f"{WARN} nothing stored at {res.value} resolution, so there is no "
+                "history to re-verify. Run `tb data backfill` first.",
+                soft_wrap=True,
+            )
+            return
+
+        console.print(
+            f"re-verifying {canary.budget(len(available))} of {len(available)} "
+            f"{res.value} window(s) via [bold]{provider}[/bold], "
+            "least-recently-checked first"
+        )
+        feed = _provider(provider)
+        try:
+            result = canary.run(feed, resolution=res)
+        finally:
+            feed.close()
+
+        table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+        table.add_row("windows checked", f"{result.n_windows_checked}/{result.n_windows_available}")
+        table.add_row("coverage this run", f"{result.coverage_pct:.1f}%")
+        table.add_row("bars compared", str(result.n_bars_compared))
+        table.add_row(
+            "restatements found",
+            f"[yellow]{result.n_revisions_found}[/yellow]" if result.n_revisions_found else "0",
+        )
+        if result.oldest_checked_age_days is not None:
+            table.add_row("oldest checked", f"{result.oldest_checked_age_days:.0f} days unverified")
+        console.print(table)
+
+        for uid in result.instruments_restated():
+            console.print(
+                f"  {WARN} {escape(uid)} was restated. Any backtest citing the live "
+                "store over that window is no longer reproducible; a sealed vintage "
+                "is unaffected, which is what vintages are for.",
+                soft_wrap=True,
+            )
+        for problem in result.problems[:10]:
+            console.print(f"  {WARN} {escape(problem)}", soft_wrap=True)
+
+        if result.clean:
+            console.print(
+                f"\n{OK} no restatements in the windows checked. That is a statement "
+                f"about {result.coverage_pct:.0f}% of stored history, not all of it.",
+                soft_wrap=True,
+            )
+
+
+def _canary_report(canary: RevisionCanary, res: Resolution) -> None:
+    """Coverage history: which windows have been verified, and how often."""
+    rows = canary.coverage(resolution=res)
+    if not rows:
+        console.print(
+            f"{WARN} the canary has never run at {res.value} resolution. Every stored "
+            "bar older than the incremental poll's reach is unverified.",
+            soft_wrap=True,
+        )
+        return
+    table = Table(show_header=True)
+    table.add_column("instrument")
+    table.add_column("window from")
+    table.add_column("checks", justify="right")
+    table.add_column("last checked")
+    table.add_column("restatements", justify="right")
+    for row in rows[:25]:
+        found = int(row["total_revisions"] or 0)
+        table.add_row(
+            str(row["instrument_uid"]),
+            str(row["window_start"])[:10],
+            str(row["n_checks"]),
+            str(row["last_checked_at"])[:19],
+            f"[yellow]{found}[/yellow]" if found else "0",
+        )
+    console.print(table)
+    console.print(f"\n[dim]last canary run: {canary.last_run_at() or 'never'}[/dim]")

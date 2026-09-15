@@ -234,6 +234,13 @@ class BarStore:
                 continue
             to_write.append(bar)
 
+        # Recorded even when nothing is written, because the symbol mapping is
+        # a fact about the fetch rather than about the rows. A batch that turned
+        # out to be entirely unchanged still establishes which symbol this uid
+        # answers to, and without it an ISIN-keyed instrument cannot be
+        # refetched later — see `instrument_symbols` in the schema.
+        self._record_symbol(batch)
+
         if not to_write and not result.revisions:
             return result
 
@@ -599,6 +606,46 @@ class BarStore:
         return sorted(str(row["instrument_uid"]) for row in rows)
 
     # -- the catalog, for sealing a vintage --------------------------------
+
+    def _record_symbol(self, batch: BarBatch) -> None:
+        """Remember which provider symbol this instrument answers to.
+
+        Upsert on `(instrument_uid, provider)`, keeping `first_seen_at`. A
+        changed symbol for the same uid is legitimate — a company renames its
+        ticker and the ISIN does not move, which is exactly why bars are keyed
+        on the ISIN — so the newest symbol wins and the original sighting is
+        preserved.
+        """
+        if not batch.symbol or not batch.bars:
+            return
+        uid = batch.bars[0].instrument_uid
+        moment = now_iso()
+        self._ledger.conn.execute(
+            """
+            INSERT INTO instrument_symbols (
+                instrument_uid, provider, symbol, first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(instrument_uid, provider) DO UPDATE SET
+                symbol = excluded.symbol,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (uid, batch.provider, batch.symbol, moment, moment),
+        )
+        self._ledger.conn.commit()
+
+    def symbol_for(self, instrument_uid: str, provider: str) -> str | None:
+        """The provider symbol this instrument was last fetched under.
+
+        `None` rather than a guess. Deriving a ticker from an ISIN is the
+        mismapping the symbol map exists to prevent, and a caller that needs
+        to refetch should report that it cannot rather than fetch the wrong
+        company's prices.
+        """
+        row = self._ledger.conn.execute(
+            "SELECT symbol FROM instrument_symbols WHERE instrument_uid = ? AND provider = ?",
+            (instrument_uid, provider),
+        ).fetchone()
+        return None if row is None else str(row["symbol"])
 
     def live_partitions(
         self,

@@ -100,6 +100,11 @@ class EventType(StrEnum):
     DATA_ACTION_RECONCILED = "data.action_reconciled"
     DATA_UNIVERSE_SNAPSHOT_TAKEN = "data.universe_snapshot_taken"
     DATA_BAKEOFF_COMPLETED = "data.bakeoff_completed"
+    # Distinct from `data.bar_revision_detected`, which fires per restated
+    # bar: this is the *coverage* statement — how much of stored history was
+    # deliberately re-read, which is what says whether "we found nothing"
+    # means anything at all.
+    DATA_REVISION_CANARY_COMPLETED = "data.revision_canary_completed"
 
     # --- strategy specs and backtests (M3) ---
     STRATEGY_SPEC_REGISTERED = "strategy.spec_registered"
@@ -556,6 +561,26 @@ class BakeoffPayload(EventPayload):
     rationale: str
 
 
+class RevisionCanaryPayload(EventPayload):
+    """One deliberate re-read of stored history.
+
+    `n_windows_checked` against `n_windows_available` is the point. A run that
+    checked 2 of 400 windows and found nothing has established almost nothing,
+    and a payload carrying only the finding count would read as reassurance.
+    """
+
+    canary_id: str
+    resolution: str
+    n_windows_available: int
+    n_windows_checked: int
+    n_bars_compared: int
+    n_revisions_found: int
+    coverage_pct: float
+    oldest_checked_age_days: float | None = None
+    instruments_restated: list[str] = Field(default_factory=list)
+    problems: list[str] = Field(default_factory=list)
+
+
 class StrategySpecPayload(EventPayload):
     """A strategy specification entering the registry.
 
@@ -673,6 +698,7 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.DATA_ACTION_RECONCILED: ActionReconciledPayload,
     EventType.DATA_UNIVERSE_SNAPSHOT_TAKEN: UniverseSnapshotPayload,
     EventType.DATA_BAKEOFF_COMPLETED: BakeoffPayload,
+    EventType.DATA_REVISION_CANARY_COMPLETED: RevisionCanaryPayload,
     EventType.STRATEGY_SPEC_REGISTERED: StrategySpecPayload,
     EventType.BACKTEST_COMPLETED: BacktestPayload,
     EventType.BACKTEST_CALIBRATED: CalibrationPayload,
@@ -711,6 +737,7 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     EventType.DATA_ACTION_RECONCILED: AggregateType.DATA,
     EventType.DATA_UNIVERSE_SNAPSHOT_TAKEN: AggregateType.DATA,
     EventType.DATA_BAKEOFF_COMPLETED: AggregateType.DATA,
+    EventType.DATA_REVISION_CANARY_COMPLETED: AggregateType.DATA,
     EventType.STRATEGY_SPEC_REGISTERED: AggregateType.STRATEGY,
     EventType.BACKTEST_COMPLETED: AggregateType.STRATEGY,
     # Filed under RUN, not STRATEGY: a calibration is a statement about this

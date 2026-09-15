@@ -27,7 +27,7 @@ from pathlib import Path
 
 from tb.core.canonical import GENESIS_HASH
 
-LEDGER_SCHEMA_VERSION = 4
+LEDGER_SCHEMA_VERSION = 5
 
 # --------------------------------------------------------------------------
 # Tables
@@ -445,6 +445,46 @@ _TABLES: tuple[str, ...] = (
         PRIMARY KEY (provider, resolution, observed_at)
     )
     """,
+    # Which provider symbol each instrument was fetched under. NOT `symbol_map`,
+    # which maps a Trading 212 ticker to a data symbol and is a risk control
+    # with confidence tiers — this is a plain provenance fact: "we fetched uid X
+    # from provider P under symbol S".
+    #
+    # Nothing recorded it before, and the consequence was concrete: an
+    # ISIN-keyed partition could not be refetched, because an ISIN does not
+    # tell you the ticker and guessing one is the mismapping `symbol_map`
+    # exists to prevent. The revision canary needs exactly this, and so will
+    # any later "re-read this instrument" path.
+    """
+    CREATE TABLE IF NOT EXISTS instrument_symbols (
+        instrument_uid  TEXT    NOT NULL,
+        provider        TEXT    NOT NULL,
+        symbol          TEXT    NOT NULL,
+        first_seen_at   TEXT    NOT NULL,
+        last_seen_at    TEXT    NOT NULL,
+        PRIMARY KEY (instrument_uid, provider)
+    )
+    """,
+    # Coverage history for the revision canary. Append-only rather than an
+    # upsert: "checked four times, never restated" is a different and more
+    # useful fact than "last checked on Tuesday", and an upsert throws the
+    # first away. This table is also what makes the selection deterministic —
+    # least-recently-verified ordering needs a record of what was verified.
+    """
+    CREATE TABLE IF NOT EXISTS canary_checks (
+        check_id           TEXT    PRIMARY KEY,
+        instrument_uid     TEXT    NOT NULL,
+        resolution         TEXT    NOT NULL,
+        provider           TEXT    NOT NULL,
+        window_start       TEXT    NOT NULL,
+        window_end         TEXT    NOT NULL,
+        checked_at         TEXT    NOT NULL,
+        outcome            TEXT    NOT NULL,
+        n_bars_compared    INTEGER NOT NULL DEFAULT 0,
+        n_revisions_found  INTEGER NOT NULL DEFAULT 0,
+        run_id             TEXT
+    )
+    """,
     # ---- strategy specs and backtests (M3) -------------------------------
     # The spec is stored as submitted, with a content hash over its canonical
     # form. `UNIQUE(strategy_id, version)` is load-bearing beyond tidiness:
@@ -623,6 +663,9 @@ _INDEXES: tuple[str, ...] = (
     "ON bar_revisions (instrument_uid, resolution, bar_open_utc)",
     "CREATE INDEX IF NOT EXISTS ix_universe_snapshots_taken ON universe_snapshots (taken_at)",
     "CREATE INDEX IF NOT EXISTS ix_fx_lookup ON fx_rates (pair, as_of_date)",
+    "CREATE INDEX IF NOT EXISTS ix_canary_checks_window "
+    "ON canary_checks (resolution, instrument_uid, window_start)",
+    "CREATE INDEX IF NOT EXISTS ix_canary_checks_when ON canary_checks (checked_at)",
     # v4 (M3)
     "CREATE INDEX IF NOT EXISTS ix_strategy_specs_lineage ON strategy_specs (lineage_id)",
     "CREATE INDEX IF NOT EXISTS ix_strategy_specs_hash ON strategy_specs (spec_hash)",
