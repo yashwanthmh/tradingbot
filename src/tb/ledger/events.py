@@ -115,6 +115,50 @@ class EventType(StrEnum):
     # strategy, and M5's promotion gate needs to find the most recent one.
     BACKTEST_CALIBRATED = "backtest.calibrated"
 
+    # --- the live path (M4) ---
+    #
+    # The decision lineage, in the order it happens. Every member exists
+    # because something reads it back: the reconciler, the recovery pass, or
+    # M8's replay.
+    DECISION_MADE = "decision.made"
+    # Emitted for a refusal too, with every rule's verdict attached. A ledger
+    # that recorded only the orders it placed could not answer "why did it
+    # stop trading", which is the more common question.
+    RISK_EVALUATED = "risk.evaluated"
+    # S105 reads `..._TOKEN_... = "str"` as a hardcoded credential. A
+    # `RiskToken` is an in-process authorisation object that never leaves this
+    # machine and is never a secret. Suppressed on the line rather than
+    # disabled in config: S105 catching a real key in a literal is worth far
+    # more than the noise it makes here.
+    RISK_TOKEN_ISSUED = "risk.token_issued"  # noqa: S105
+    # The write-ahead commit, appended *before* the socket write. This event
+    # existing with no `order.submitted` after it is the UNKNOWN state the
+    # recovery pass exists to resolve.
+    INTENT_COMMITTED = "intent.committed"
+    ORDER_SUBMITTED = "order.submitted"
+    ORDER_ACKNOWLEDGED = "order.acknowledged"
+    ORDER_REJECTED = "order.rejected"
+    ORDER_CANCELLED = "order.cancelled"
+    # Distinct from `order.acknowledged`: an intent can be resolved by
+    # *discovery* during recovery rather than by a response we received, and
+    # conflating the two would lose the fact that we never saw the ack.
+    INTENT_RESOLVED = "intent.resolved"
+    FILL_RECORDED = "fill.recorded"
+    # The protective stop landing behind an entry closes the unprotected
+    # window. Its own event because the window's duration is a number worth
+    # being able to query, not just a state worth checking.
+    POSITION_PROTECTED = "position.protected"
+    POSITION_UNPROTECTED = "position.unprotected"
+    # The bidirectional dead-man switch, both directions. Separate types
+    # because "the watchdog halted the trader" and "the trader could not reach
+    # the watchdog" are different faults with different fixes.
+    WATCHDOG_TRIPPED = "watchdog.tripped"
+    WATCHDOG_UNREACHABLE = "watchdog.unreachable"
+    INSTANCE_LOCK_ACQUIRED = "instance.lock_acquired"
+    INSTANCE_LOCK_REFUSED = "instance.lock_refused"
+    INSTANCE_LOCK_RELEASED = "instance.lock_released"
+    LOOP_CYCLE_COMPLETED = "loop.cycle_completed"
+
 
 class EventPayload(BaseModel):
     """Base for every payload.
@@ -605,6 +649,274 @@ class RegimeReadPayload(EventPayload):
     detail: str = ""
 
 
+# --------------------------------------------------------------------------
+# The live path (M4)
+# --------------------------------------------------------------------------
+
+
+class DecisionPayload(EventPayload):
+    """What the strategy saw and what it concluded.
+
+    The feature vector is carried in full alongside its hash. The hash makes
+    "the strategy saw exactly these inputs" checkable; the vector makes it
+    *readable* months later without re-running the pipeline against a store
+    that may have been revised since — which for a revised store would produce
+    different numbers and no way to tell which set was the real one.
+    """
+
+    decision_id: str
+    run_id: str
+    strategy_id: str
+    strategy_version: int
+    instrument_uid: str
+    as_of_utc: str
+    resolution: str
+    action: str
+    feature_snapshot_hash: str
+    feature_vector: dict[str, Any] = Field(default_factory=dict)
+    spec_hash: str | None = None
+    model_version: str | None = None
+    t212_ticker: str | None = None
+    bar_open_utc: str | None = None
+    data_snapshot_id: str | None = None
+    expected_edge_bps: float | None = None
+    expected_cost_bps: float | None = None
+    rationale: str = ""
+    rng_seed: int | None = None
+    regime_state: str | None = None
+    regime_exposure_factor: Decimal | None = None
+
+
+class RiskVerdictRow(BaseModel):
+    """One rule's opinion. Not an `EventPayload` — it nests inside one."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rule_name: str
+    verdict: str
+    limit_value: Decimal | float | str | None = None
+    observed_value: Decimal | float | str | None = None
+    detail: str = ""
+    is_blocking: bool = True
+
+
+class RiskEvaluationPayload(EventPayload):
+    """Every rule's verdict for one decision, pass or fail.
+
+    `verdicts` carries all of them rather than only the failures. A refusal
+    recorded as "blocked by the daily loss breaker" cannot be told apart later
+    from one blocked by that breaker *and* three other rules, and the two lead
+    to different investigations. Recording the passes also makes the margins
+    queryable: a rule that passed at 99% of its limit is a warning that a rule
+    passing at 10% is not.
+    """
+
+    decision_id: str
+    run_id: str
+    approved: bool
+    n_rules_evaluated: int
+    n_blocking_failures: int
+    verdicts: list[RiskVerdictRow] = Field(default_factory=list)
+    # Present only on approval. The size the engine actually authorised, which
+    # may be well below what the strategy asked for.
+    approved_quantity: Decimal | None = None
+    approved_notional_ccy: Decimal | None = None
+    token_id: str | None = None
+    refusal_summary: str = ""
+
+
+class RiskTokenPayload(EventPayload):
+    """A token was issued, and for exactly what.
+
+    The bound order parameters are recorded so a token cannot later be claimed
+    to have authorised something else: the ledger says the engine approved a
+    BUY of this quantity of this ticker, and `place_order` refuses a token
+    whose parameters do not match the order in hand.
+    """
+
+    token_id: str
+    decision_id: str | None = None
+    run_id: str
+    t212_ticker: str
+    side: str
+    purpose: str
+    quantity: Decimal
+    max_notional_ccy: Decimal | None = None
+    issued_at: str
+    expires_at: str
+
+
+class IntentCommittedPayload(EventPayload):
+    """The write-ahead commit, appended before the socket write.
+
+    This event with no `order.submitted` behind it *is* the UNKNOWN state. It
+    is deliberately recorded before anything is sent, because the alternative
+    ordering — send, then record — loses the intent entirely on a crash
+    mid-flight and leaves an order at the broker that nothing in this system
+    knows about.
+    """
+
+    intent_id: str
+    run_id: str
+    decision_id: str | None = None
+    parent_intent_id: str | None = None
+    t212_ticker: str
+    side: str
+    order_type: str
+    purpose: str
+    priority_class: str
+    quantity: Decimal
+    risk_token_id: str
+    limit_price: Decimal | None = None
+    stop_price: Decimal | None = None
+    time_validity: str | None = None
+    expected_cost_bps: float | None = None
+
+
+class OrderSubmittedPayload(EventPayload):
+    """A POST left the process.
+
+    `attempt` is recorded because "exactly one POST per intent_id" is the
+    property the crash drills assert, and asserting it needs the count to be
+    visible rather than inferred from the absence of duplicates.
+    """
+
+    intent_id: str
+    run_id: str
+    t212_ticker: str
+    attempt: int
+    sent_at: str
+
+
+class OrderOutcomePayload(EventPayload):
+    """An acknowledgement, rejection or cancellation from the broker."""
+
+    intent_id: str | None = None
+    run_id: str
+    t212_ticker: str
+    broker_order_id: str | None = None
+    status: str
+    detail: str = ""
+    # The broker's own words, kept because a rejection reason is the only
+    # evidence of a venue rule we did not know about.
+    broker_message: str | None = None
+
+
+class IntentResolvedPayload(EventPayload):
+    """How an unresolved intent was settled.
+
+    `resolved_by` distinguishes a response we received from a state we
+    *discovered* during recovery. Losing that distinction would make an
+    unacknowledged order that turned out to have filled look like a normal
+    acknowledged one, and the unprotected window it implies would go
+    unmeasured.
+    """
+
+    intent_id: str
+    run_id: str
+    final_state: str
+    resolved_by: str
+    broker_order_id: str | None = None
+    detail: str = ""
+
+
+class FillPayload(EventPayload):
+    """A fill, with the honesty of its price attached.
+
+    `source` is `api_history` or `inferred_from_position_delta`, and
+    `admissible_for_pnl` follows from it. An inferred price is a guess derived
+    from a position change; letting one into the realised series would teach
+    the allocator an edge that was never earned.
+    """
+
+    fill_id: str
+    run_id: str
+    t212_ticker: str
+    side: str
+    quantity: Decimal
+    source: str
+    confidence: str
+    admissible_for_pnl: bool
+    intent_id: str | None = None
+    broker_order_id: str | None = None
+    instrument_uid: str | None = None
+    price: Decimal | None = None
+    filled_at: str | None = None
+    fees: dict[str, Any] = Field(default_factory=dict)
+    fx_rate: Decimal | None = None
+
+
+class ProtectionPayload(EventPayload):
+    """A position gained or lost its protective stop.
+
+    `unprotected_seconds` is the number this event exists for. The window
+    between an entry fill and its stop is unavoidable on a venue with no
+    bracket orders, and sizing assumes a bound on it — so the actual duration
+    has to be measurable rather than assumed.
+    """
+
+    t212_ticker: str
+    run_id: str
+    quantity: Decimal
+    protected: bool
+    stop_intent_id: str | None = None
+    stop_price: Decimal | None = None
+    entry_fill_id: str | None = None
+    unprotected_seconds: float | None = None
+    detail: str = ""
+
+
+class WatchdogPayload(EventPayload):
+    """One direction of the dead-man switch firing."""
+
+    direction: str
+    run_id: str | None = None
+    observed_age_seconds: float | None = None
+    limit_seconds: float | None = None
+    action_taken: str = ""
+    detail: str = ""
+
+
+class InstanceLockPayload(EventPayload):
+    """An attempt to become the single trading instance.
+
+    A refusal is recorded as loudly as an acquisition: two loops against one
+    account is a silent fault — both processes look healthy while every
+    position is doubled — so the second one's refusal is the only trace that
+    it was ever started.
+    """
+
+    lock_name: str
+    run_id: str
+    host: str
+    pid: int
+    acquired: bool
+    expires_at: str | None = None
+    held_by_run_id: str | None = None
+    held_by_pid: int | None = None
+    detail: str = ""
+
+
+class LoopCyclePayload(EventPayload):
+    """One pass of the tick loop.
+
+    Cheap to append and worth appending: a loop that is running but deciding
+    nothing looks identical to a stopped loop unless each cycle says so, and
+    "it was up all day" is a claim the ledger should be able to settle.
+    """
+
+    run_id: str
+    cycle: int
+    as_of_utc: str
+    n_instruments_considered: int
+    n_decisions: int
+    n_orders_submitted: int
+    n_risk_refusals: int
+    duration_ms: float
+    halted: bool = False
+    detail: str = ""
+
+
 class StrategySpecPayload(EventPayload):
     """A strategy specification entering the registry.
 
@@ -727,6 +1039,25 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.STRATEGY_SPEC_REGISTERED: StrategySpecPayload,
     EventType.BACKTEST_COMPLETED: BacktestPayload,
     EventType.BACKTEST_CALIBRATED: CalibrationPayload,
+    # M4
+    EventType.DECISION_MADE: DecisionPayload,
+    EventType.RISK_EVALUATED: RiskEvaluationPayload,
+    EventType.RISK_TOKEN_ISSUED: RiskTokenPayload,
+    EventType.INTENT_COMMITTED: IntentCommittedPayload,
+    EventType.ORDER_SUBMITTED: OrderSubmittedPayload,
+    EventType.ORDER_ACKNOWLEDGED: OrderOutcomePayload,
+    EventType.ORDER_REJECTED: OrderOutcomePayload,
+    EventType.ORDER_CANCELLED: OrderOutcomePayload,
+    EventType.INTENT_RESOLVED: IntentResolvedPayload,
+    EventType.FILL_RECORDED: FillPayload,
+    EventType.POSITION_PROTECTED: ProtectionPayload,
+    EventType.POSITION_UNPROTECTED: ProtectionPayload,
+    EventType.WATCHDOG_TRIPPED: WatchdogPayload,
+    EventType.WATCHDOG_UNREACHABLE: WatchdogPayload,
+    EventType.INSTANCE_LOCK_ACQUIRED: InstanceLockPayload,
+    EventType.INSTANCE_LOCK_REFUSED: InstanceLockPayload,
+    EventType.INSTANCE_LOCK_RELEASED: InstanceLockPayload,
+    EventType.LOOP_CYCLE_COMPLETED: LoopCyclePayload,
 }
 
 # The default aggregate each event type is filed under, so callers do not have
@@ -770,6 +1101,27 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     # build of the engine, and filing it under a strategy would imply it says
     # something about one.
     EventType.BACKTEST_CALIBRATED: AggregateType.RUN,
+    # M4. The aggregate is what an event is *about*, which is why a fill is
+    # filed under POSITION rather than ORDER: the order is how it happened,
+    # the position is the thing that changed.
+    EventType.DECISION_MADE: AggregateType.DECISION,
+    EventType.RISK_EVALUATED: AggregateType.DECISION,
+    EventType.RISK_TOKEN_ISSUED: AggregateType.DECISION,
+    EventType.INTENT_COMMITTED: AggregateType.ORDER,
+    EventType.ORDER_SUBMITTED: AggregateType.ORDER,
+    EventType.ORDER_ACKNOWLEDGED: AggregateType.ORDER,
+    EventType.ORDER_REJECTED: AggregateType.ORDER,
+    EventType.ORDER_CANCELLED: AggregateType.ORDER,
+    EventType.INTENT_RESOLVED: AggregateType.ORDER,
+    EventType.FILL_RECORDED: AggregateType.POSITION,
+    EventType.POSITION_PROTECTED: AggregateType.POSITION,
+    EventType.POSITION_UNPROTECTED: AggregateType.POSITION,
+    EventType.WATCHDOG_TRIPPED: AggregateType.SAFETY,
+    EventType.WATCHDOG_UNREACHABLE: AggregateType.SAFETY,
+    EventType.INSTANCE_LOCK_ACQUIRED: AggregateType.SAFETY,
+    EventType.INSTANCE_LOCK_REFUSED: AggregateType.SAFETY,
+    EventType.INSTANCE_LOCK_RELEASED: AggregateType.SAFETY,
+    EventType.LOOP_CYCLE_COMPLETED: AggregateType.RUN,
 }
 
 

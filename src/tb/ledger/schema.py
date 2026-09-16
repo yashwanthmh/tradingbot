@@ -27,7 +27,7 @@ from pathlib import Path
 
 from tb.core.canonical import GENESIS_HASH
 
-LEDGER_SCHEMA_VERSION = 5
+LEDGER_SCHEMA_VERSION = 6
 
 # --------------------------------------------------------------------------
 # Tables
@@ -590,6 +590,153 @@ _TABLES: tuple[str, ...] = (
         completing_event_seq INTEGER NOT NULL
     )
     """,
+    # ----------------------------------------------------------------------
+    # v6 (M4) — the decision lineage. decisions -> risk_verdicts ->
+    # order_intents -> fills, each row pointing back at the one before it, so
+    # a fill months later traces to the feature vector and the spec version
+    # that produced it. This chain is the answer to "why did it buy that".
+    # ----------------------------------------------------------------------
+    #
+    # What the strategy saw and what it concluded, before any risk opinion.
+    # `feature_snapshot_hash` and `feature_vector_json` are both stored: the
+    # hash makes "the strategy saw these features" checkable, the vector makes
+    # it readable without re-running the pipeline against a store that may
+    # have been revised since.
+    """
+    CREATE TABLE IF NOT EXISTS decisions (
+        decision_id        TEXT    PRIMARY KEY,
+        run_id             TEXT    NOT NULL,
+        strategy_id        TEXT    NOT NULL,
+        strategy_version   INTEGER NOT NULL,
+        spec_hash          TEXT,
+        model_version      TEXT,
+        instrument_uid     TEXT    NOT NULL,
+        t212_ticker        TEXT,
+        as_of_utc          TEXT    NOT NULL,
+        bar_open_utc       TEXT,
+        resolution         TEXT    NOT NULL,
+        data_snapshot_id   TEXT,
+        feature_snapshot_hash TEXT NOT NULL,
+        feature_vector_json   TEXT NOT NULL,
+        action             TEXT    NOT NULL,
+        expected_edge_bps  REAL,
+        expected_cost_bps  REAL,
+        rationale          TEXT,
+        rng_seed           INTEGER,
+        regime_state       TEXT,
+        regime_exposure_factor TEXT,
+        decided_at         TEXT    NOT NULL,
+        deciding_event_seq INTEGER NOT NULL
+    )
+    """,
+    # One row per rule per decision, not one row per decision. A refused order
+    # has to record what every rule said, including the ones that passed:
+    # "blocked by the daily loss breaker" is a different investigation from
+    # "blocked by the daily loss breaker and three other things", and a table
+    # holding only the first failure cannot tell them apart. `limit_value` and
+    # `observed_value` are stored side by side so the margin is readable —
+    # a rule that passed at 99% of its limit is a different fact from one that
+    # passed at 10%, and only the pair shows it.
+    """
+    CREATE TABLE IF NOT EXISTS risk_verdicts (
+        decision_id       TEXT    NOT NULL,
+        rule_name         TEXT    NOT NULL,
+        verdict           TEXT    NOT NULL,
+        limit_value       TEXT,
+        observed_value    TEXT,
+        detail            TEXT,
+        is_blocking       INTEGER NOT NULL DEFAULT 1,
+        evaluated_at      TEXT    NOT NULL,
+        PRIMARY KEY (decision_id, rule_name)
+    )
+    """,
+    # The write-ahead log that synthesises exactly-once submission on a venue
+    # with no idempotency tokens.
+    #
+    # `wal_committed_at` is set BEFORE the socket write and is the whole point
+    # of the table: an intent present here with no `broker_order_id` after a
+    # crash is `UNKNOWN`, never `FAILED`. Treating unknown as failed and
+    # retrying is precisely how a double fill happens, so `state` has a
+    # distinct member for it and recovery must resolve it by *looking*, never
+    # by assuming.
+    #
+    # `intent_id` is deterministic over (run, decision, purpose, side,
+    # instrument, quantity) so a retry of the same logical order computes the
+    # same id and collides with the existing row instead of creating a second
+    # one.
+    """
+    CREATE TABLE IF NOT EXISTS order_intents (
+        intent_id         TEXT    PRIMARY KEY,
+        decision_id       TEXT,
+        run_id            TEXT    NOT NULL,
+        parent_intent_id  TEXT,
+        instrument_uid    TEXT,
+        t212_ticker       TEXT    NOT NULL,
+        side              TEXT    NOT NULL,
+        order_type        TEXT    NOT NULL,
+        purpose           TEXT    NOT NULL,
+        priority_class    TEXT    NOT NULL,
+        quantity          TEXT    NOT NULL,
+        limit_price       TEXT,
+        stop_price        TEXT,
+        time_validity     TEXT,
+        expected_cost_bps REAL,
+        risk_token_id     TEXT    NOT NULL,
+        state             TEXT    NOT NULL,
+        wal_committed_at  TEXT    NOT NULL,
+        submitted_at      TEXT,
+        broker_order_id   TEXT,
+        resolved_at       TEXT,
+        resolution_note   TEXT,
+        n_submit_attempts INTEGER NOT NULL DEFAULT 0,
+        committing_event_seq INTEGER NOT NULL
+    )
+    """,
+    # Fills, with an explicit honesty flag on the price.
+    #
+    # Trading 212's history endpoints are rate-limited well below the write
+    # path, so history *will* fall behind, and a fill price cannot be
+    # reconstructed from the data feed (different venue). `source`
+    # distinguishes `api_history` from `inferred_from_position_delta`, and an
+    # inferred price must never enter the realised-PnL series the allocator
+    # learns from — a made-up entry price would teach it a made-up edge.
+    """
+    CREATE TABLE IF NOT EXISTS fills (
+        fill_id           TEXT    PRIMARY KEY,
+        intent_id         TEXT,
+        broker_order_id   TEXT,
+        t212_ticker       TEXT    NOT NULL,
+        instrument_uid    TEXT,
+        side              TEXT    NOT NULL,
+        quantity          TEXT    NOT NULL,
+        price             TEXT,
+        filled_at         TEXT,
+        fees_json         TEXT,
+        fx_rate           TEXT,
+        source            TEXT    NOT NULL,
+        confidence        TEXT    NOT NULL,
+        admissible_for_pnl INTEGER NOT NULL DEFAULT 0,
+        recorded_at       TEXT    NOT NULL,
+        recording_event_seq INTEGER NOT NULL
+    )
+    """,
+    # Single-instance enforcement. Two trading loops against one account
+    # double every position and reconcile to nonsense, and the failure is
+    # silent: both processes look healthy. A row here is a lease — holder plus
+    # expiry — rather than a boolean, so a crashed instance's lock expires
+    # instead of locking the account out permanently.
+    """
+    CREATE TABLE IF NOT EXISTS instance_locks (
+        lock_name         TEXT    PRIMARY KEY,
+        run_id            TEXT    NOT NULL,
+        host              TEXT    NOT NULL,
+        pid               INTEGER NOT NULL,
+        acquired_at       TEXT    NOT NULL,
+        renewed_at        TEXT    NOT NULL,
+        expires_at        TEXT    NOT NULL,
+        released_at       TEXT
+    )
+    """,
 )
 
 # --------------------------------------------------------------------------
@@ -676,6 +823,24 @@ _INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_backtest_trades_instrument "
     "ON backtest_trades (backtest_id, instrument_uid)",
     "CREATE INDEX IF NOT EXISTS ix_calibrations_ran ON backtest_calibrations (ran_at)",
+    # v6 (M4)
+    "CREATE INDEX IF NOT EXISTS ix_decisions_run ON decisions (run_id, as_of_utc)",
+    "CREATE INDEX IF NOT EXISTS ix_decisions_instrument ON decisions (instrument_uid, as_of_utc)",
+    "CREATE INDEX IF NOT EXISTS ix_decisions_strategy ON decisions (strategy_id, strategy_version)",
+    # The recovery query, and the one that must be fast: every startup and
+    # every reconcile asks "which intents are unresolved" before anything
+    # else is allowed to happen.
+    "CREATE INDEX IF NOT EXISTS ix_intents_unresolved ON order_intents (state, wal_committed_at)",
+    "CREATE INDEX IF NOT EXISTS ix_intents_run ON order_intents (run_id, wal_committed_at)",
+    "CREATE INDEX IF NOT EXISTS ix_intents_broker_order ON order_intents (broker_order_id)",
+    "CREATE INDEX IF NOT EXISTS ix_intents_ticker ON order_intents (t212_ticker, purpose)",
+    "CREATE INDEX IF NOT EXISTS ix_fills_intent ON fills (intent_id)",
+    "CREATE INDEX IF NOT EXISTS ix_fills_ticker ON fills (t212_ticker, filled_at)",
+    # The allocator reads only admissible fills. Indexed so "the realised
+    # series" never accidentally becomes "the realised series including the
+    # inferred prices" for performance reasons.
+    "CREATE INDEX IF NOT EXISTS ix_fills_admissible ON fills (admissible_for_pnl, filled_at)",
+    "CREATE INDEX IF NOT EXISTS ix_locks_live ON instance_locks (lock_name, released_at)",
 )
 
 
