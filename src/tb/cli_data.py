@@ -457,6 +457,13 @@ def data_backfill(
 
         total = 0
         revisions = 0
+        # Counted separately from `problems`, because a warning is not a
+        # failure and the two must not be added together. `n_fetched` is the
+        # number of symbols that produced a batch at all — the signal that
+        # tells "the feed is unreachable" apart from "the store was already up
+        # to date", which both write zero rows.
+        n_fetched = 0
+        first_failure = ""
         try:
             for label, data_symbol, uid in targets:
                 try:
@@ -470,8 +477,10 @@ def data_backfill(
                     )
                 except TbError as exc:
                     problems.append(f"{label}: {exc}")
+                    first_failure = first_failure or f"{label}: {exc}"
                     continue
 
+                n_fetched += 1
                 result = store.ingest(batch)
                 total += result.rows_written
                 revisions += len(result.revisions)
@@ -485,6 +494,7 @@ def data_backfill(
         sealed = store.compact() if seal else []
 
         table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+        table.add_row("symbols fetched", f"{n_fetched}/{len(targets)}")
         table.add_row("rows written", str(total))
         table.add_row("revisions detected", f"[yellow]{revisions}[/yellow]" if revisions else "0")
         table.add_row("partitions sealed", str(len(sealed)))
@@ -495,6 +505,32 @@ def data_backfill(
             console.print(f"  {WARN} {escape(problem)}")
         if len(problems) > 15:
             console.print(f"  [dim]… and {len(problems) - 15} more[/dim]")
+
+        # A backfill that fetched nothing at all is not a success, and saying
+        # so here is what keeps a pipeline honest: the first run of the
+        # bake-off workflow reported success having written zero rows, because
+        # every Yahoo request was throttled and this command still exited 0.
+        # The next step then failed for "no bars in the store", four steps
+        # away from the actual cause.
+        #
+        # Zero *rows* on its own is fine — a re-run of an up-to-date store
+        # writes none. Zero *symbols fetched* is not.
+        if targets and n_fetched == 0:
+            err_console.print(
+                f"\n{BAD} no symbol could be fetched from {provider}: "
+                f"all {len(targets)} request(s) failed. The store is unchanged.",
+                soft_wrap=True,
+            )
+            if first_failure:
+                err_console.print(f"  first failure: {escape(first_failure)}", soft_wrap=True)
+            raise typer.Exit(2)
+
+        if n_fetched < len(targets):
+            console.print(
+                f"\n{WARN} {len(targets) - n_fetched} of {len(targets)} symbol(s) returned "
+                "nothing. Anything measured over this store covers the rest only.",
+                soft_wrap=True,
+            )
 
         console.print(f"\n{OK} now run [bold]tb data audit[/bold]")
 

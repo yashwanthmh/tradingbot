@@ -1038,3 +1038,153 @@ def test_regime_needs_a_ledger(env: dict[str, Any]) -> None:
     result = _regime(env)
     assert result.exit_code == 2
     assert "tb init" in _out(result)
+
+
+# --------------------------------------------------------------------------
+# A backfill that fetched nothing is not a success
+# --------------------------------------------------------------------------
+#
+# The first real bake-off run reported success having written zero rows: Yahoo
+# throttled all ten requests, `tb data backfill` exited 0 anyway, and the
+# failure surfaced four steps later as "no bars in the store" — pointing at
+# the store rather than at the feed.
+
+
+class _RefusingProvider:
+    """A provider that fails every fetch, the way a throttled feed does."""
+
+    def __init__(self, *, message: str = "throttled the request") -> None:
+        self.message = message
+        self.calls = 0
+
+    @property
+    def name(self) -> str:
+        return "yahoo"
+
+    def fetch_bars(self, symbol: str, **_: Any) -> Any:
+        from tb.data.provider import DataError
+
+        self.calls += 1
+        raise DataError(f"transport failure on {symbol}: {self.message}")
+
+    def close(self) -> None:
+        return None
+
+
+def test_a_backfill_that_fetched_nothing_exits_non_zero(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit 2, naming the feed — not exit 0 with a warning nobody reads.
+
+    This is the honesty that keeps a pipeline diagnosable: the failure has to
+    be reported by the step that caused it, in the words of the cause.
+    """
+    import tb.cli_data as cli_data
+
+    _init(env)
+    feed = _RefusingProvider()
+    monkeypatch.setattr(cli_data, "_provider", lambda _name, archive=None: feed)
+
+    result = _run(
+        [
+            "data",
+            "backfill",
+            "--provider",
+            "yahoo",
+            "--data-symbols",
+            "aapl,msft,nvda",
+            # `--no-fx` so the call count is the symbol count: the FX leg
+            # fetches through the same provider and would add one.
+            "--no-fx",
+            *env["args"],
+        ]
+    )
+    assert result.exit_code == 2, _out(result)
+    out = _out(result)
+    assert "no symbol could be fetched from yahoo" in out
+    assert "all 3 request(s) failed" in out
+    # The cause, not just the count: a throttle and a 401 need different fixes.
+    assert "throttled" in out
+    assert feed.calls == 3, "every symbol should still have been attempted"
+
+
+def test_a_partial_backfill_says_what_it_missed(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit 0, because some data arrived — but the gap is stated.
+
+    Anything measured over this store covers the symbols that arrived, and a
+    measurement that silently ran over 1 of 3 symbols while reporting on "the
+    universe" is the quiet version of the same bug.
+    """
+    import tb.cli_data as cli_data
+    from tb.data.provider import DataError
+    from tb.data.providers import CsvFixtureProvider
+
+    _init(env)
+    days = [s.day for s in CAL.sessions_between(date(2026, 3, 2), date(2026, 3, 6))]
+    bars = [daily(day, provider="yahoo", uid="sym:AAPL") for day in days]
+
+    real = CsvFixtureProvider(bars=bars, provider_name="yahoo")
+
+    class _Flaky:
+        @property
+        def name(self) -> str:
+            return "yahoo"
+
+        def fetch_bars(self, symbol: str, **kwargs: Any) -> Any:
+            if symbol.upper() != "AAPL":
+                raise DataError(f"transport failure on {symbol}: throttled")
+            return real.fetch_bars(symbol, **kwargs)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli_data, "_provider", lambda _name, archive=None: _Flaky())
+
+    result = _run(
+        [
+            "data",
+            "backfill",
+            "--provider",
+            "yahoo",
+            "--data-symbols",
+            "aapl,msft,nvda",
+            "--no-fx",
+            *env["args"],
+        ]
+    )
+    assert result.exit_code == 0, _out(result)
+    out = _out(result)
+    assert "symbols fetched" in out
+    assert "2 of 3 symbol(s) returned nothing" in out
+
+
+def test_an_up_to_date_backfill_is_still_a_success(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Zero *rows* is fine; zero *symbols fetched* is not.
+
+    The vacuity guard on the rule above. Re-running a backfill over a store
+    that already holds every bar writes nothing, and that must stay exit 0 —
+    otherwise the refusal would fire on the most ordinary case there is.
+    """
+    import tb.cli_data as cli_data
+    from tb.data.providers import CsvFixtureProvider
+
+    _init(env)
+    days = [s.day for s in CAL.sessions_between(date(2026, 3, 2), date(2026, 3, 6))]
+    bars = [daily(day, provider="yahoo", uid="sym:AAPL") for day in days]
+    monkeypatch.setattr(
+        cli_data,
+        "_provider",
+        lambda _name, archive=None: CsvFixtureProvider(bars=bars, provider_name="yahoo"),
+    )
+    args = ["data", "backfill", "--provider", "yahoo", "--data-symbols", "aapl", *env["args"]]
+
+    assert _run(args).exit_code == 0
+    second = _run(args)
+    assert second.exit_code == 0, _out(second)
+    out = _out(second)
+    assert "symbols fetched" in out
+    assert "1/1" in out

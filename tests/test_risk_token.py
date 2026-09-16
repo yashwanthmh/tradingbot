@@ -156,7 +156,7 @@ def test_construction_from_a_test_module_is_refused() -> None:
     This is the guard that catches a bypass the AST scan cannot: a construction
     assembled at runtime, from a REPL, or from a test that imported the mint.
     """
-    with pytest.raises(RiskTokenError, match="only tb.risk.engine"):
+    with pytest.raises(RiskTokenError, match=r"only tb\.risk\.engine"):
         RiskToken(**_token_kwargs())  # type: ignore[arg-type]
 
 
@@ -189,7 +189,7 @@ def test_replace_cannot_launder_an_approval_into_a_larger_one() -> None:
 
     token = _issue_via_engine(RiskEngine())
     assert token is not None
-    with pytest.raises(RiskTokenError, match="only tb.risk.engine"):
+    with pytest.raises(RiskTokenError, match=r"only tb\.risk\.engine"):
         replace(token, quantity=Decimal("300"))
 
 

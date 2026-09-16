@@ -76,19 +76,31 @@ jobs:
           # doctor redacts every credential it prints; see ops/secrets.redact.
           uv run tb doctor
 
-      - name: Backfill the reference feed (Yahoo)
+      # Alpaca first, and it is the one that must work. The measurement is
+      # about the IEX feed; Yahoo is the reference it is compared against.
+      - name: Backfill the feed under test (Alpaca IEX)
         run: |
           uv run tb data backfill \
-            --provider yahoo \
+            --provider alpaca \
             --resolution '${{ inputs.resolution }}' \
             --days '${{ inputs.minute_days }}' \
             --data-symbols '${{ inputs.symbols }}' \
             --no-fx
 
-      - name: Backfill the feed under test (Alpaca IEX)
+      # Yahoo's chart endpoint rate-limits by IP and throttles GitHub's ranges
+      # hard: the first run of this workflow had all ten requests refused and
+      # wrote zero rows. So this step is allowed to fail without failing the
+      # job, and the measurement below adapts to whichever feeds arrived.
+      #
+      # `continue-on-error` rather than `|| true`: it records the step as
+      # failed on the run page, which `|| true` would hide, and the outcome is
+      # readable by later steps.
+      - name: Backfill the reference feed (Yahoo, best effort)
+        id: yahoo
+        continue-on-error: true
         run: |
           uv run tb data backfill \
-            --provider alpaca \
+            --provider yahoo \
             --resolution '${{ inputs.resolution }}' \
             --days '${{ inputs.minute_days }}' \
             --data-symbols '${{ inputs.symbols }}' \
@@ -105,17 +117,45 @@ jobs:
       - name: The measurement
         id: bakeoff
         run: |
+          # pipefail, or `tee` decides the exit code and a refused measurement
+          # reports success. That is exactly what happened on run 1: the
+          # bake-off printed "no minute bars from yahoo" and the job went
+          # green.
+          set -o pipefail
           uv run tb data bakeoff \
             --resolution '${{ inputs.resolution }}' \
             --primary alpaca \
             --secondary yahoo \
             | tee var/bakeoff-report.txt
 
+      # Runs even when the cross-feed comparison could not: the single-feed
+      # numbers are the ones that speak to the paid-data decision, and the
+      # no-print fraction in particular is a property of IEX alone.
+      - name: The one-feed numbers, whatever happened above
+        if: always()
+        run: |
+          set -o pipefail
+          # The audit writes `bar_coverage`, so it runs first. Its exit code
+          # is ignored for the same reason as the earlier audit step — a feed
+          # with known holes is the subject, not a failure — but `pipefail`
+          # still applies to `coverage` below, which has no such excuse.
+          uv run tb data audit --resolution '${{ inputs.resolution }}' \
+            | tee var/audit-report.txt || true
+          uv run tb data coverage | tee var/coverage-report.txt
+
       - name: Seal a vintage so the number is citable
+        if: always()
         run: |
           # A bake-off nobody can reproduce is an anecdote. The vintage hashes
           # the exact files the verdict was computed over.
-          uv run tb data seal || echo "::warning::seal refused; the store may hold no sealed partitions"
+          #
+          # `--resolution` is passed: without it `seal` uses the configured
+          # live resolutions (daily), finds no daily partitions in a
+          # minute-only store, and refuses with a message about there being
+          # nothing to seal. That is correct behaviour answering a question
+          # nobody asked.
+          uv run tb data seal --resolution '${{ inputs.resolution }}' \
+            || echo "::warning::seal refused; see its message above"
           uv run tb ledger verify
 
       - name: Summarise onto the run page
@@ -124,12 +164,34 @@ jobs:
           {
             echo '## Bake-off verdict'
             echo
+            if [ "${{ steps.yahoo.outcome }}" != "success" ]; then
+              echo '> **The cross-feed comparison did not run.** Yahoo returned nothing —'
+              echo '> its chart endpoint rate-limits by IP and throttles GitHub ranges.'
+              echo '> The single-feed numbers below still stand; the Alpaca-vs-Yahoo'
+              echo '> disagreement figure needs a run from an IP Yahoo will serve.'
+              echo
+            fi
             echo '```'
-            cat var/bakeoff-report.txt 2>/dev/null || echo "(no report produced)"
+            cat var/bakeoff-report.txt 2>/dev/null || echo "(no cross-feed report produced)"
+            echo '```'
+            echo
+            echo '### Coverage (one feed)'
+            echo '```'
+            cat var/coverage-report.txt 2>/dev/null || echo "(none)"
+            echo '```'
+            echo
+            echo '### Audit'
+            echo
+            echo 'The `thin_name_no_print` gap count against bars stored is the'
+            echo 'no-print fraction — the IEX representativeness number, and the'
+            echo 'one that speaks to the paid-data decision on its own.'
+            echo '```'
+            tail -40 var/audit-report.txt 2>/dev/null || echo "(none)"
             echo '```'
             echo
             echo "Symbols: \`${{ inputs.symbols }}\`"
             echo "Resolution: \`${{ inputs.resolution }}\` over ~${{ inputs.minute_days }} days"
+            echo "Yahoo backfill: \`${{ steps.yahoo.outcome }}\`"
             echo
             echo 'Bars here are keyed `sym:TICKER` rather than by ISIN — research'
             echo 'identities, reported by `tb data audit` and not admissible as'
