@@ -67,16 +67,33 @@ class Verdict(StrEnum):
     PAID_DATA_REQUIRED = "paid_data_required"
     # Not enough overlapping bars to say anything. Not a pass.
     INSUFFICIENT_SAMPLE = "insufficient_sample"
+    # Only one feed was available, so the cross-feed disagreement could not be
+    # computed at all. Distinct from `INSUFFICIENT_SAMPLE` because the remedy
+    # differs: that one says backfill more, this one says obtain a second
+    # feed. Conflating them would send someone to fetch more bars from the
+    # feed they already have.
+    NO_SECOND_FEED = "no_second_feed"
 
     @property
     def permits_live_resolution(self) -> bool:
         """Whether this verdict may widen `data.allowed_live_resolutions`.
 
-        `INSUFFICIENT_SAMPLE` deliberately does not. A measurement that could
-        not be taken is not a measurement that passed, and treating absence of
+        Only `FREE_DATA_SUFFICIENT` does. `INSUFFICIENT_SAMPLE` and
+        `NO_SECOND_FEED` deliberately do not: a measurement that could not be
+        taken is not a measurement that passed, and treating absence of
         evidence as a pass is how a gate becomes decoration.
         """
         return self is Verdict.FREE_DATA_SUFFICIENT
+
+    @property
+    def is_measured(self) -> bool:
+        """Whether a cross-feed comparison actually happened.
+
+        Both refusals reduce to "no number", but a caller reporting results
+        needs to distinguish "measured, and the answer is no" from "could not
+        measure" — the first settles the question and the second does not.
+        """
+        return self in (Verdict.FREE_DATA_SUFFICIENT, Verdict.PAID_DATA_REQUIRED)
 
 
 # Below this many overlapping bars the percentiles are noise. A p95 over twenty
@@ -151,6 +168,12 @@ class BakeoffResult:
 
     @property
     def verdict(self) -> Verdict:
+        # No pairs at all means the two feeds never covered the same bar
+        # period — in practice, one of them returned nothing. Reported as its
+        # own verdict so the remedy is "get a second feed" rather than
+        # "backfill more of the one you have".
+        if not self.secondary or self.n_compared_bars == 0:
+            return Verdict.NO_SECOND_FEED
         if self.n_compared_bars < MIN_COMPARABLE_BARS or self.p95_bps is None:
             return Verdict.INSUFFICIENT_SAMPLE
         # The round-trip cost on Trading 212 is 30-55bps. A required gross edge
@@ -163,6 +186,28 @@ class BakeoffResult:
 
     @property
     def rationale(self) -> str:
+        if self.verdict is Verdict.NO_SECOND_FEED:
+            # The single-feed numbers are real and are reported, because three
+            # of the bake-off's four outputs do not need a second feed: the
+            # no-print fraction, the observed delay distribution, and the
+            # share of cycles inside the staleness bound. Refusing to say
+            # anything would discard measurements that were taken.
+            missing = "; ".join(
+                f"{stat.provider}: {stat.missing_fraction:.1%} of expected bars absent"
+                + (
+                    ""
+                    if stat.observed_delay_p95_s is None
+                    else f", p95 delay {stat.observed_delay_p95_s:.0f}s"
+                )
+                for stat in self.stats
+            )
+            return (
+                f"no cross-feed comparison: only one feed had {self.resolution.value} bars, "
+                f"so the disagreement percentiles could not be computed. What one feed does "
+                f"establish is still reported — {missing or 'no per-provider stats'}. The "
+                "no-print fraction is a property of the feed alone and needs no second "
+                "opinion; the disagreement figure does, and this run has no evidence on it."
+            )
         if self.verdict is Verdict.INSUFFICIENT_SAMPLE:
             return (
                 f"only {self.n_compared_bars} comparable {self.resolution.value} bars "

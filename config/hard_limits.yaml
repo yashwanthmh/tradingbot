@@ -169,10 +169,27 @@ data:
 
   # Which resolutions the bot may trade live. Daily closes are consolidated,
   # revision-stable, and a three-minute staleness bound is irrelevant to a
-  # once-a-day decision. Minute resolution stays out until the bake-off shows
-  # the feed is representative enough — Alpaca's free tier is IEX only, a few
-  # percent of consolidated volume, and its systematic disagreement sits in the
-  # same 5-20bps band as the entire gross edge.
+  # once-a-day decision.
+  #
+  # **Minute resolution is refused on measured evidence, not on caution.** See
+  # docs/decisions/0001-minute-resolution.md for the working. In short, from a
+  # real Alpaca IEX pull of 62,549 minute bars over ten of the most liquid US
+  # names:
+  #
+  #   * 3,751 expected minutes had no IEX print at all — about 5.7%, or one
+  #     minute in eighteen, on the most liquid names there are;
+  #   * the cost gate needs 121bps of declared edge to admit even a US round
+  #     trip (40bps cost / 0.33 ratio), against 5-20bps of gross minute-bar
+  #     edge. An Irish issuer needs 424bps.
+  #
+  # Either number alone refuses minute trading. The cross-feed disagreement
+  # figure would add precision to a conclusion these two already reach, and it
+  # is not obtainable from CI — Yahoo's chart endpoint throttles cloud IPs.
+  #
+  # What would reopen it: a `free_data_sufficient` verdict from `tb data
+  # bakeoff --resolution minute` on a run with two real feeds. Nothing else.
+  # `may_widen_live_resolutions` refuses every other verdict, so this edit
+  # cannot be made by a measurement that did not happen.
   allowed_live_resolutions: [daily]
 
   # Promotion gate against feed noise: a strategy's expected edge must exceed

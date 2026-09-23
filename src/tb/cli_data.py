@@ -733,15 +733,29 @@ def data_bakeoff(
                 elif bar.provider == secondary:
                     secondary_bars.append(bar)
 
-        if not primary_bars or not secondary_bars:
-            missing = primary if not primary_bars else secondary
+        # The primary is the feed under test, so its absence is a setup
+        # problem: there is nothing to measure. A missing *secondary* is
+        # different — three of the four outputs (no-print fraction, observed
+        # delay, share of cycles inside the staleness bound) are properties of
+        # one feed and were already measured. Refusing outright used to
+        # discard them.
+        if not primary_bars:
             err_console.print(
-                f"{BAD} no {res.value} bars from {missing} in the store. A bake-off needs "
-                f"both feeds: run `tb data backfill --provider {missing} "
+                f"{BAD} no {res.value} bars from {primary} in the store, so there is "
+                f"nothing to measure. Run `tb data backfill --provider {primary} "
                 f"--resolution {res.value}`.",
                 soft_wrap=True,
             )
             raise typer.Exit(2)
+
+        single_feed = not secondary_bars
+        if single_feed:
+            console.print(
+                f"{WARN} no {res.value} bars from [bold]{secondary}[/bold]: the cross-feed "
+                "disagreement cannot be computed. Reporting what one feed establishes on "
+                "its own.",
+                soft_wrap=True,
+            )
 
         result = Bakeoff(
             ledger,
@@ -806,6 +820,16 @@ def data_bakeoff(
                     f"{pair.primary_close} vs {pair.secondary_close} "
                     f"({pair.disagreement_bps:.1f}bps)"
                 )
+
+        # Exit 1 on anything but a clean pass, so this can gate a pipeline.
+        # Previously it printed the verdict and exited 0 whatever it said,
+        # which is the same masking as a `| tee` without `pipefail`: the
+        # measurement reported a problem and the caller saw success. 1 rather
+        # than 2, because the exit-code contract here reserves 2 for a setup
+        # problem the operator must fix, and a feed that is not good enough is
+        # a finding about the data.
+        if result.verdict is not Verdict.FREE_DATA_SUFFICIENT:
+            raise typer.Exit(1)
 
 
 # --------------------------------------------------------------------------

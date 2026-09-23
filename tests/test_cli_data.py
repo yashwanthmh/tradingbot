@@ -356,23 +356,71 @@ def test_bakeoff_on_an_empty_store_names_the_remedy(env: dict[str, Any]) -> None
     assert "tb data backfill" in _out(result)
 
 
-def test_bakeoff_with_only_one_feed_names_the_missing_one(env: dict[str, Any]) -> None:
-    """A feed cannot be baked off against nothing, and the message says which."""
+def test_one_feed_still_reports_what_one_feed_establishes(env: dict[str, Any]) -> None:
+    """Exit 1 with the single-feed numbers, not exit 2 with nothing.
+
+    Three of the bake-off's four outputs — the no-print fraction, the observed
+    delay distribution, and the share of cycles inside the staleness bound —
+    are properties of one feed and need no second opinion. Refusing outright
+    discarded measurements that had already been taken, which is how the real
+    CI run ended up reporting nothing at all after Yahoo throttled it.
+
+    `no_second_feed` rather than `insufficient_sample`, because the remedy
+    differs: that one says backfill more, this one says obtain a second feed.
+    """
     _init(env)
     seed(env, providers=("alpaca",))
     result = _run(["data", "bakeoff", "--resolution", "daily", *env["args"]])
-    assert result.exit_code == 2
+    assert result.exit_code == 1, _out(result)
     out = _out(result)
     assert "no daily bars from yahoo" in out
-    assert "--provider yahoo" in out
+    assert "no_second_feed" in out
+    # The measurements that were taken are still reported.
+    assert "alpaca missing" in out
+
+
+def test_a_single_feed_verdict_cannot_widen_the_live_resolutions() -> None:
+    """**The gate that keeps minute trading out until it is measured.**
+
+    `allowed_live_resolutions` is `[daily]`, and only a `FREE_DATA_SUFFICIENT`
+    verdict may widen it. A single-feed run produces no cross-feed evidence at
+    all, so it must not license the edit — treating "could not measure" as a
+    pass is how a gate becomes decoration.
+    """
+    from tb.data.bakeoff import Verdict, may_widen_live_resolutions
+
+    assert not Verdict.NO_SECOND_FEED.permits_live_resolution
+    assert not Verdict.INSUFFICIENT_SAMPLE.permits_live_resolution
+    assert Verdict.FREE_DATA_SUFFICIENT.permits_live_resolution
+    # And it is distinguishable from a measurement that ran and said no.
+    assert not Verdict.NO_SECOND_FEED.is_measured
+    assert Verdict.PAID_DATA_REQUIRED.is_measured
+
+    class _Result:
+        resolution = Resolution.MINUTE
+        verdict = Verdict.NO_SECOND_FEED
+        rationale = "no second feed"
+
+    allowed, why = may_widen_live_resolutions(
+        _Result(),  # type: ignore[arg-type]
+        currently_allowed=["daily"],
+    )
+    assert not allowed, "a no-evidence verdict licensed widening to minute"
+    assert "no_second_feed" in why, why
 
 
 def test_bakeoff_reports_the_minimum_viable_edge(env: dict[str, Any]) -> None:
-    """The headline number, and it is honest about a short sample."""
+    """The headline number, and it is honest about a short sample.
+
+    Exit 1: an insufficient sample is not a pass. The command used to print
+    the verdict and exit 0 whatever it said, which is the same masking as a
+    `| tee` without `pipefail` — the measurement reported a problem and the
+    caller saw success.
+    """
     _init(env)
     seed(env, providers=("alpaca", "yahoo"))
     result = _run(["data", "bakeoff", "--resolution", "daily", *env["args"]])
-    assert result.exit_code == 0
+    assert result.exit_code == 1, _out(result)
     out = _out(result)
     assert "minimum viable edge" in out
     assert "worst disagreements" in out
@@ -1188,3 +1236,69 @@ def test_an_up_to_date_backfill_is_still_a_success(
     out = _out(second)
     assert "symbols fetched" in out
     assert "1/1" in out
+
+
+# --------------------------------------------------------------------------
+# The decision record stays tied to the code
+# --------------------------------------------------------------------------
+
+
+def test_the_minute_resolution_decision_matches_the_cost_model() -> None:
+    """**The record cannot rot away from the arithmetic it cites.**
+
+    `docs/decisions/0001-minute-resolution.md` refuses minute trading on two
+    numbers, one of which comes straight from the cost model. A decision
+    record quoting a figure the code no longer produces is worse than no
+    record: it is a reviewed-looking justification for something nobody
+    re-checked.
+
+    The first draft of that record said 109bps, from a cost of 36bps observed
+    at the loop's ~£150 order size. The published table says 40bps and 121bps.
+    This test is what caught the discrepancy, and is why it exists.
+    """
+    from decimal import Decimal
+    from pathlib import Path as _Path
+
+    from tb.backtest.costs import CostModel, Jurisdiction
+    from tb.config.loader import load_hard_limits
+
+    limits = load_hard_limits(None).limits
+    model = CostModel(limits=limits)
+    us = model.round_trip(
+        notional_ccy=Decimal("1000"),
+        instrument_currency="USD",
+        jurisdiction=Jurisdiction.US,
+    )
+    required = float(us.total_bps) / limits.execution.max_cost_to_edge_ratio
+
+    record = (
+        _Path(__file__).resolve().parents[1] / "docs" / "decisions" / "0001-minute-resolution.md"
+    )
+    text = record.read_text(encoding="utf-8")
+
+    assert f"{us.total_bps:.1f}bps" in text, (
+        f"the record does not cite the current US round-trip cost of {us.total_bps:.1f}bps"
+    )
+    assert f"{required:.0f}bps" in text, (
+        f"the record does not cite the current required edge of {required:.0f}bps"
+    )
+    # And the config comment beside the limit must agree with it.
+    config = (_Path(__file__).resolve().parents[1] / "config" / "hard_limits.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert f"{required:.0f}bps" in config, (
+        "hard_limits.yaml cites a required edge the cost model no longer produces"
+    )
+
+
+def test_minute_is_still_refused_by_the_shipped_config() -> None:
+    """The decision, asserted where it is enforced.
+
+    A record saying minute is refused, beside a config permitting it, would be
+    the worst of both. This is cheap and pins them together.
+    """
+    from tb.config.loader import load_hard_limits
+
+    data = load_hard_limits(None).limits.data
+    assert not data.permits_live("minute")
+    assert data.permits_live("daily")
