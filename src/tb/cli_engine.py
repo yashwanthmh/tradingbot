@@ -47,6 +47,7 @@ from tb.ops.watchdog import (
     SelfCheck,
     Watchdog,
 )
+from tb.portfolio.pnl import EquityCurve
 from tb.strategy.trivial import MovingAverageCross, specs
 
 engine_app = typer.Typer(help="Run the trading loop and its supervisor.", no_args_is_help=True)
@@ -196,6 +197,7 @@ def run(
             state=StateMachine(ledger, pinned, run_id=run_id),
             self_check=self_check,
             lock=lock,
+            equity=EquityCurve(ledger, run_id=run_id),
         )
 
         console.print(

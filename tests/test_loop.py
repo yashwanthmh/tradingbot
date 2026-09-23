@@ -37,6 +37,7 @@ from tb.ledger.verify import verify_chain
 from tb.ops.killswitch import write_heartbeat
 from tb.ops.state import RunState, StateMachine
 from tb.ops.watchdog import InstanceLock, SelfCheck
+from tb.portfolio.pnl import EquityCurve
 from tb.strategy.base import Action
 from tb.strategy.trivial import MovingAverageCross, specs
 
@@ -256,6 +257,7 @@ def _loop(
             run_id=run_id,
         ),
         lock=InstanceLock(ledger, run_id=run_id),
+        equity=EquityCurve(ledger, run_id=run_id),
         clock=lambda: at,
     )
 
@@ -726,3 +728,141 @@ def test_run_forever_stops_at_the_cycle_bound(env: dict[str, Any]) -> None:
         loop.lock.acquire(at=AS_OF)
         results = loop.run_forever(interval_seconds=0.0, max_cycles=3)
     assert [r.cycle for r in results] == [1, 2, 3]
+
+
+# --------------------------------------------------------------------------
+# The loss breakers, through the loop
+# --------------------------------------------------------------------------
+
+
+def test_the_daily_breaker_stops_the_loop_entering_after_a_loss(
+    env: dict[str, Any],
+) -> None:
+    """**The end-to-end proof that the breakers are live.**
+
+    Before the equity curve existed the loop passed `day_pnl_pct=0.0`, so
+    this path was unreachable: the account could fall any distance and the
+    rule still returned PASS. Here the broker's equity drops between cycles
+    and the loop's own verdict changes.
+
+    Two cycles, because the first is what establishes the day's opening
+    equity — which is also the ordering the loop depends on.
+    """
+    _seed(env, _rising_bars(days=140))
+
+    # The control: a healthy account enters. Run first and in its own ledger
+    # session, because once it holds a position the next cycle is an exit
+    # decision rather than an entry — and the comparison needs both cycles to
+    # be attempting the same thing.
+    with Ledger(env["db"], config_hash=env["pinned"].config_hash) as ledger:
+        healthy = _loop(env, ledger, _broker())
+        healthy.lock.acquire(at=AS_OF)
+        control = healthy.run_cycle()
+    assert control.submitted, f"the control cycle did not trade: {control.refusals}"
+
+    # Now the same decision against an account down 4%, past the 2% halt. A
+    # fresh store so the loop is again considering an *entry*.
+    env2 = dict(env)
+    env2["db"] = Path(str(env["db"]) + ".down")
+    env2["bars"] = env["bars"]
+    _seed(env2, _rising_bars(days=140))
+
+    broker = _broker()
+    with Ledger(env2["db"], config_hash=env2["pinned"].config_hash) as ledger:
+        loop = _loop(env2, ledger, broker)
+        loop.lock.acquire(at=AS_OF)
+        # The day's opening equity, as the first cycle of the session would
+        # have marked it.
+        loop.equity.mark(equity_ccy=Decimal("10000"), at=AS_OF - timedelta(minutes=5))
+        # Mutating the simulator's equity is what a bad day looks like from
+        # the loop's side: it reads `get_cash().total` like any other cycle.
+        broker.equity = Decimal("9600.00")
+        second = loop.run_cycle()
+
+    assert second.decisions[0].action is Action.ENTER, (
+        "the second cycle must be attempting an entry for the comparison to mean anything"
+    )
+    assert not second.submitted, "an entry was placed with the day down 4%"
+    assert any("daily_loss" in reason for _, reason in second.refusals), second.refusals
+    env["db"] = env2["db"]  # so the verdict query below reads this run's ledger
+
+    with Ledger(env["db"]) as check:
+        verdict = check.conn.execute(
+            "SELECT verdict, observed_value, limit_value FROM risk_verdicts"
+            " WHERE rule_name = 'daily_loss' ORDER BY evaluated_at DESC LIMIT 1"
+        ).fetchone()
+    assert verdict["verdict"] == "block"
+    assert float(verdict["observed_value"]) == pytest.approx(4.0, abs=0.01)
+    assert float(verdict["limit_value"]) == env["pinned"].limits.loss.daily_halt_pct
+
+
+def test_an_exit_still_goes_through_with_the_day_breached(env: dict[str, Any]) -> None:
+    """The asymmetry, end to end and at the worst moment.
+
+    A breaker that blocked the flattening orders it fired to place would lock
+    in the loss it existed to limit. The daily breaker is breached here and
+    the exit is submitted anyway.
+    """
+    _seed(env, _falling_bars(days=140))
+    broker = _broker()
+    broker.seed_position(
+        TICKER,
+        quantity=Decimal("1"),
+        average_price=Decimal("150.00"),
+        entered_at=AS_OF - timedelta(days=30),
+    )
+
+    with Ledger(env["db"], config_hash=env["pinned"].config_hash) as ledger:
+        loop = _loop(env, ledger, broker)
+        loop.lock.acquire(at=AS_OF)
+        # Establish the day's open, then crater it.
+        loop.equity.mark(equity_ccy=Decimal("10000"), at=AS_OF - timedelta(minutes=5))
+        broker.equity = Decimal("8000.00")  # -20%: past all three thresholds
+        result = loop.run_cycle()
+
+    assert result.decisions[0].action is Action.EXIT
+    assert result.submitted, f"the exit was blocked at -20%: {result.refusals}"
+    assert broker.get_position(TICKER) is None
+
+
+def test_an_unmeasurable_account_blocks_the_entry(env: dict[str, Any]) -> None:
+    """A broker that reports no equity must not read as a flat day.
+
+    The loop leaves the curve unmarked, so the three percentages reach the
+    rules as `None` and every one of them blocks. That is the fail-closed
+    reading, and it is the reason the loop passes `None` rather than `0.0`.
+    """
+    _seed(env, _rising_bars(days=140))
+    broker = _broker()
+
+    with Ledger(env["db"], config_hash=env["pinned"].config_hash) as ledger:
+        loop = _loop(env, ledger, broker)
+        loop.lock.acquire(at=AS_OF)
+
+        # A broker with no equity to report. `CashBalance.total` is optional
+        # precisely because the venue may not say.
+        from tb.broker.port import CashBalance
+
+        broker.get_cash = lambda: CashBalance(  # type: ignore[method-assign]
+            currency="GBP", free=None, total=None, invested=None, blocked=None
+        )
+        result = loop.run_cycle()
+
+    assert not result.submitted, "an entry was placed against an unmeasured account"
+    reasons = " ".join(reason for _, reason in result.refusals)
+    assert "daily_loss" in reasons or "unknown" in reasons, result.refusals
+
+
+def test_the_loop_records_an_equity_mark_per_cycle(env: dict[str, Any]) -> None:
+    """The curve is what the breakers read, so it has to be fed every cycle."""
+    _seed(env, _falling_bars(days=140))
+    with Ledger(env["db"], config_hash=env["pinned"].config_hash) as ledger:
+        loop = _loop(env, ledger, _broker())
+        loop.lock.acquire(at=AS_OF)
+        loop.run_cycle()
+        loop.run_cycle()
+        loop.run_cycle()
+
+    with Ledger(env["db"]) as check:
+        marks = check.conn.execute("SELECT COUNT(*) AS n FROM equity_marks").fetchone()
+    assert marks["n"] == 3

@@ -70,6 +70,7 @@ from tb.ledger.events import (
 from tb.ledger.store import Ledger
 from tb.ops.state import RunState, StateMachine
 from tb.ops.watchdog import InstanceLock, InstanceLockRefused, SelfCheck, WatchdogError
+from tb.portfolio.pnl import EquityCurve
 from tb.risk.engine import Evaluation, RiskEngine, entry_request, exit_request, stop_price_for
 from tb.risk.state import AccountState, RiskContext
 from tb.strategy.base import Action, Decision, PositionState, Strategy
@@ -123,6 +124,7 @@ class TradingLoop:
     state: StateMachine
     self_check: SelfCheck
     lock: InstanceLock
+    equity: EquityCurve
     risk: RiskEngine = field(default_factory=RiskEngine)
     clock: Callable[[], datetime] = now_utc
     resolution: str = "daily"
@@ -262,6 +264,28 @@ class TradingLoop:
             state=RunState.TRADING.value,
             heartbeat_path=self.pinned.limits.safety.heartbeat_path,  # type: ignore[arg-type]
         )
+
+        # 6. The equity mark, before any decision. On the first cycle of a
+        #    session this is what establishes the day's opening equity, so a
+        #    cycle that decided first would compute today's P&L against
+        #    yesterday's close and attribute the overnight gap to today —
+        #    firing the daily breaker on exposure the unprotected-window
+        #    sizing had already budgeted for.
+        #
+        #    A broker that reports no equity leaves the curve unmarked, and
+        #    the three loss percentages then reach the rules as `None`, which
+        #    every one of them blocks on. That is the fail-closed reading: an
+        #    unmeasured account is not a flat one.
+        cash = self.broker.get_cash()
+        if cash.equity is not None and cash.equity > 0:
+            positions = self.broker.get_positions()
+            self.equity.mark(
+                equity_ccy=cash.equity,
+                at=at,
+                currency=cash.currency,
+                deployed_ccy=sum((p.market_value or Decimal(0) for p in positions), Decimal(0)),
+                free_cash_ccy=cash.free,
+            )
 
     def _read_regime(self, at: datetime) -> RegimeReading:
         """The portfolio-wide exposure factor.
@@ -507,7 +531,7 @@ class TradingLoop:
             as_of=at,
             limits=self.pinned.limits,
             request=request,
-            account=self._account(total=total, for_symbol=for_symbol),
+            account=self._account(total=total, for_symbol=for_symbol, at=at),
             position_quantity=position.quantity,
             position_entry_at=position.entry_at,
             may_enter=may_enter,
@@ -541,12 +565,21 @@ class TradingLoop:
             },
         )
 
-    def _account(self, *, total: int, for_symbol: int) -> AccountState:
-        """The account as the broker last described it.
+    def _account(self, *, total: int, for_symbol: int, at: datetime) -> AccountState:
+        """The account as the broker last described it, plus its P&L.
 
         Every field stays optional through to the rules. A missing equity must
         reach them as missing rather than as zero, because a percentage cap
-        evaluated against zero passes trivially.
+        evaluated against zero passes trivially — and the three loss
+        percentages must reach them as `None` rather than `0.0` for the same
+        reason. A flat day and an unmeasured day are different facts, and only
+        one of them is a reason to keep trading.
+
+        The P&L comes from the equity curve, which the cycle marks before any
+        decision. That ordering matters on the first cycle of a session: the
+        mark is what establishes the day's opening equity, so a cycle that
+        decided before marking would compute today's P&L against yesterday's
+        close and attribute the overnight gap to today.
         """
         cash = self.broker.get_cash()
         positions = self.broker.get_positions()
@@ -554,6 +587,7 @@ class TradingLoop:
             (p.market_value or Decimal(0) for p in positions),
             Decimal(0),
         )
+        pnl = self.equity.read(at=at)
         return AccountState(
             equity_ccy=cash.equity,
             free_cash_ccy=cash.free,
@@ -561,13 +595,9 @@ class TradingLoop:
             deployed_ccy=deployed,
             n_open_positions=len([p for p in positions if p.quantity > 0]),
             currency=cash.currency,
-            # Zero rather than None: M4 has no P&L series yet, and a `None`
-            # would make every loss breaker block. Stated here because it is a
-            # real gap — M5 computes these from the fill history, and until
-            # then the breakers are structurally present but unexercised.
-            day_pnl_pct=0.0,
-            rolling_5d_pnl_pct=0.0,
-            drawdown_from_peak_pct=0.0,
+            day_pnl_pct=pnl.day_pnl_pct,
+            rolling_5d_pnl_pct=pnl.rolling_pnl_pct,
+            drawdown_from_peak_pct=pnl.drawdown_from_peak_pct,
             orders_today=total,
             orders_today_for_symbol=for_symbol,
             orders_last_hour=total,

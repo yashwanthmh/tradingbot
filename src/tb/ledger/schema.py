@@ -27,7 +27,7 @@ from pathlib import Path
 
 from tb.core.canonical import GENESIS_HASH
 
-LEDGER_SCHEMA_VERSION = 6
+LEDGER_SCHEMA_VERSION = 7
 
 # --------------------------------------------------------------------------
 # Tables
@@ -737,6 +737,33 @@ _TABLES: tuple[str, ...] = (
         released_at       TEXT
     )
     """,
+    # ----------------------------------------------------------------------
+    # v7 (M4a) — the equity curve the loss breakers divide by.
+    # ----------------------------------------------------------------------
+    #
+    # Deliberately not events. One mark per cycle for a year is half a million
+    # rows, and the hash chain is for facts that must be tamper-evident; an
+    # equity mark is a measurement that can be re-taken from the broker.
+    # Inflating the chain with them would make the events that do matter
+    # harder to read.
+    #
+    # `session_date` is stored rather than derived at read time, because the
+    # day's opening equity is looked up by it on every decision and the
+    # mapping from instant to session is a calendar question, not a substring
+    # of the timestamp.
+    """
+    CREATE TABLE IF NOT EXISTS equity_marks (
+        mark_id      TEXT    PRIMARY KEY,
+        run_id       TEXT,
+        at_utc       TEXT    NOT NULL,
+        session_date TEXT    NOT NULL,
+        equity       TEXT    NOT NULL,
+        currency     TEXT,
+        deployed     TEXT,
+        free_cash    TEXT,
+        source       TEXT    NOT NULL DEFAULT 'broker'
+    )
+    """,
 )
 
 # --------------------------------------------------------------------------
@@ -841,6 +868,10 @@ _INDEXES: tuple[str, ...] = (
     # inferred prices" for performance reasons.
     "CREATE INDEX IF NOT EXISTS ix_fills_admissible ON fills (admissible_for_pnl, filled_at)",
     "CREATE INDEX IF NOT EXISTS ix_locks_live ON instance_locks (lock_name, released_at)",
+    # v7 (M4a). Both indexes are on the hot path: the day's opening equity
+    # and the rolling window are looked up on every decision.
+    "CREATE INDEX IF NOT EXISTS ix_equity_marks_at ON equity_marks (at_utc)",
+    "CREATE INDEX IF NOT EXISTS ix_equity_marks_session ON equity_marks (session_date, at_utc)",
 )
 
 
