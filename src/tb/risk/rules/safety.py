@@ -155,12 +155,27 @@ class BarFreshnessRule:
     computed — the age passed in here is `as_of - available_at`, never
     `as_of - bar_open`. Using bar time would understate the age by exactly the
     provider delay, which is the one number this bound exists to catch.
+
+    **The bound is `bar_period + max_bar_staleness_seconds`, not the config
+    value alone.** That is a correction rather than a relaxation, and the
+    reason matters: `max_bar_staleness_seconds` is 180, and a daily bar is by
+    definition many hours old the moment it becomes knowable. Comparing a
+    daily bar's age against 180 seconds refuses every decision at the only
+    resolution `allowed_live_resolutions` currently permits — so the two
+    settings contradicted each other, and the loop simply never traded.
+
+    What the config value actually bounds is *lateness*: how far past the end
+    of its own period a bar may be before the price it carries is not the
+    price now. Adding the period makes that explicit and keeps the minute case
+    at 240 seconds, which is what was intended. The regime gate reached the
+    same conclusion independently and hardcoded four days; this is the general
+    form of that.
     """
 
     name: str = "bar_freshness"
 
     def evaluate(self, ctx: RiskContext) -> RuleVerdict:
-        limit = ctx.limits.execution.max_bar_staleness_seconds
+        limit = ctx.limits.execution.max_bar_staleness_seconds + ctx.bar_period_seconds
         if not ctx.request.is_risk_increasing:
             # An exit priced off a slightly stale bar still beats not exiting.
             # Recorded rather than skipped so the staleness is visible if the

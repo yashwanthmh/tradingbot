@@ -65,6 +65,16 @@ from tb.cli_backtest import backtest_app  # noqa: E402
 
 app.add_typer(backtest_app, name="backtest")
 
+# M4: the trading loop and its supervisor. Registered as two top-level
+# commands rather than a group, because they are two processes: the watchdog
+# exists to catch a wedged trader, and a wedged process cannot supervise
+# itself.
+from tb.cli_engine import run as _run_command  # noqa: E402
+from tb.cli_engine import watchdog as _watchdog_command  # noqa: E402
+
+app.command("run")(_run_command)
+app.command("watchdog")(_watchdog_command)
+
 
 @app.command("reconcile")
 def reconcile(

@@ -215,6 +215,13 @@ class RiskContext:
     regime_state: str | None = None
     # From the data layer.
     bar_age_seconds: float | None = None
+    # The deciding bar's own period, in seconds. Part of the staleness bound
+    # rather than a separate rule, because "how stale is too stale" is
+    # meaningless without it: a daily bar is fifteen hours old the moment it
+    # is knowable, and a minute bar of that age is long dead. Defaults to a
+    # minute so a caller that forgets it gets the tightest bound rather than
+    # the loosest.
+    bar_period_seconds: int = 60
     cross_venue_disagreement_bps: float | None = None
     # From the calendar: minutes since the session opened and until it closes.
     minutes_since_open: int | None = None

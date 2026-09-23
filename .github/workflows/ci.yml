@@ -270,3 +270,88 @@ jobs:
             exit 1
           fi
           echo "tamper detected as expected"
+
+      # --- M4: the live path -------------------------------------------------
+
+      - name: The risk engine cannot be bypassed
+        env:
+          TB_VAR_DIR: var-m4
+        run: |
+          # The AST scan over the whole tree, run as its own gate rather than
+          # only inside the suite. "Every order passes the risk engine" is the
+          # property the whole milestone rests on, and a bypass merging is a
+          # different kind of failure from a test regressing — so it gets a
+          # named step that says what broke.
+          set -o pipefail
+          uv run pytest tests/test_risk_token.py -q
+
+      - name: Exactly one POST per intent, across every crash point
+        env:
+          TB_VAR_DIR: var-m4
+        run: |
+          # Trading 212 has no idempotency key, so exactly-once is synthesised
+          # by ordering. The drills inject a crash at each of the five points
+          # and assert the POST count and the ledger's conclusion — including
+          # the case where the correct conclusion is "unknown, halt".
+          set -o pipefail
+          uv run pytest tests/test_crash_drills.py tests/test_intents.py -q
+
+      - name: The loop refuses to trade an unverified universe
+        env:
+          TB_VAR_DIR: var-m4
+        run: |
+          # A fresh install has no cross-verified mapping, so there is nothing
+          # tradable and `tb run` must refuse rather than start degraded. Exit
+          # 2 with the remedy named.
+          uv run tb init
+          if uv run tb run --mode paper --cycles 1; then
+            echo "::error::tb run started with nothing verified to trade"
+            exit 1
+          fi
+          uv run tb run --mode paper --cycles 1 2>&1 | grep -q "tb symbols verify" \
+            || { echo "::error::the refusal did not name the remedy"; exit 1; }
+          echo "refused as expected, naming tb symbols verify"
+
+      - name: The watchdog engages the kill switch on a missing heartbeat
+        env:
+          TB_VAR_DIR: var-watchdog
+        run: |
+          # Both halves: the watchdog trips (exit 1) and the kill switch is
+          # actually engaged afterwards. Asserting only the exit code would
+          # pass for a watchdog that reported a problem and did nothing about
+          # it, which is the failure that matters.
+          uv run tb init
+          if uv run tb watchdog --cycles 1; then
+            echo "::error::the watchdog reported healthy with no heartbeat at all"
+            exit 1
+          fi
+          uv run tb status 2>&1 | grep -q "kill switch is engaged" \
+            || { echo "::error::the watchdog tripped but did not engage the kill switch"; exit 1; }
+          echo "watchdog tripped and engaged the kill switch"
+
+      - name: A live key cannot reach the trading loop
+        env:
+          TB_VAR_DIR: var-m4
+          T212_LIVE_API_KEY: "not-a-real-key-and-must-never-be-used"
+        run: |
+          # `tb run --mode demo` passes require_demo=True, so a live key is
+          # refused before any network call. There is deliberately no live
+          # mode in this CLI at all — arming a real-money account is a
+          # reviewed change, not a flag.
+          if uv run tb run --mode live --cycles 1; then
+            echo "::error::tb run accepted a live mode that should not exist"
+            exit 1
+          fi
+          # Asserts the *credential* refusal specifically, not merely that
+          # nothing traded. An earlier version of this step grepped for the
+          # absence of "placed" and passed because `tb run` exited at the
+          # universe check before ever building a broker — a step that was
+          # green for a reason unrelated to what it claimed. The broker is now
+          # built first, so this reaches the refusal.
+          if uv run tb run --mode demo --cycles 1 2>&1 | grep -q "refuses to run against a real-money account"; then
+            echo "live key refused at the credential check, as intended"
+          else
+            echo "::error::tb run did not refuse a live key at the credential check"
+            uv run tb run --mode demo --cycles 1 2>&1 | tail -5
+            exit 1
+          fi

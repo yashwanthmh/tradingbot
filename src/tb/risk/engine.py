@@ -419,6 +419,7 @@ def _with_quantity(ctx: RiskContext, quantity: Decimal) -> RiskContext:
         regime_exposure_factor=ctx.regime_exposure_factor,
         regime_state=ctx.regime_state,
         bar_age_seconds=ctx.bar_age_seconds,
+        bar_period_seconds=ctx.bar_period_seconds,
         cross_venue_disagreement_bps=ctx.cross_venue_disagreement_bps,
         minutes_since_open=ctx.minutes_since_open,
         minutes_until_close=ctx.minutes_until_close,
