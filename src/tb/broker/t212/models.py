@@ -38,6 +38,7 @@ from tb.broker.port import (
     Instrument,
     OrderStatus,
     OrderType,
+    PlacedOrder,
     Position,
     Side,
     TimeValidity,
@@ -304,6 +305,57 @@ class OrderResponse(T212Model):
             limit_price=self.limit_price,
             stop_price=self.stop_price,
             time_validity=map_validity(self.time_validity),
+        )
+
+
+class PlacedOrderResponse(T212Model):
+    """The response to a successful order POST.
+
+    **`order_id` is the one field that is strictly required**, and the only
+    place in this module where a missing field is fatal rather than tolerated.
+    Everything else here follows the drift policy — optional, ignored if
+    absent — because the rest is confirmation of what we already sent.
+
+    The id is different in kind. Without it there is an order at the venue we
+    cannot name: nothing to cancel, nothing to reconcile against, nothing to
+    attach a fill to. An accepted order with no id is an *unknown* order, which
+    is the state the whole write-ahead mechanism exists to avoid, so a response
+    lacking it fails parsing and becomes schema drift — a halt — rather than a
+    `PlacedOrder` with an empty string in it.
+
+    `side` and `quantity` are not read back from the response at all. They are
+    passed in from the token, because the token is what was authorised; taking
+    them from the venue's echo would mean an order whose reported side differed
+    from the approved one would be recorded as the venue described it.
+    """
+
+    order_id: int | str = Field(alias="id")
+    ticker: str | None = None
+    quantity: OptMoney = None
+    status: str | None = None
+    order_type: str | None = Field(default=None, alias="type")
+    creation_time: str | None = Field(default=None, alias="creationTime")
+
+    def to_domain(self, *, ticker: str, side: Side, quantity: Decimal) -> PlacedOrder:
+        """Build the domain object, trusting the token over the echo.
+
+        If the venue echoes a different ticker than the one sent, that is
+        worth knowing about loudly rather than silently adopting — so it is
+        checked rather than preferred.
+        """
+        if self.ticker is not None and self.ticker != ticker:
+            raise ValueError(
+                f"the venue accepted an order for {self.ticker!r} but {ticker!r} was sent. "
+                "Recording the venue's answer would attach this order to the wrong "
+                "instrument; recording ours would hide a real mismatch."
+            )
+        return PlacedOrder(
+            broker_order_id=str(self.order_id),
+            ticker=ticker,
+            side=side,
+            status=map_status(self.status),
+            quantity=quantity,
+            raw_status=self.status,
         )
 
 

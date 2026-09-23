@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, TypeVar
 
@@ -31,14 +32,21 @@ from tb.broker.port import (
     BrokerOrder,
     CashBalance,
     Instrument,
+    OrderPurpose,
+    OrderType,
+    PlacedOrder,
     Position,
+    Side,
+    TimeValidity,
 )
 from tb.broker.t212.endpoints import READ_ONLY_ENDPOINTS, Endpoint, spec_for
 from tb.broker.t212.errors import (
     AuthError,
+    BrokerError,
     BrokerHttpError,
     RateLimited,
     SchemaDriftError,
+    UnknownOrderState,
 )
 from tb.broker.t212.models import (
     AccountInfoResponse,
@@ -48,6 +56,7 @@ from tb.broker.t212.models import (
     HistoricalOrderResponse,
     InstrumentResponse,
     OrderResponse,
+    PlacedOrderResponse,
     PositionResponse,
     parse_many,
     parse_one,
@@ -55,11 +64,13 @@ from tb.broker.t212.models import (
 from tb.broker.t212.ratelimit import RateGovernor, RateLimitHeaders
 from tb.broker.t212.raw_archive import RawArchive
 from tb.core.clock import now_utc
+from tb.core.errors import TransportError
 from tb.core.http import HttpxTransport, Transport
 from tb.core.ids import new_id
 from tb.ledger.events import Actor, BrokerRateLimitedPayload, EventType
 from tb.ledger.store import Ledger
 from tb.ops.secrets import BrokerEnvironment, inspect_secrets
+from tb.risk.token import RiskToken
 
 # PEP 695 generics need 3.12; this project targets 3.11.
 ParsedT = TypeVar("ParsedT")
@@ -82,6 +93,18 @@ class AuthScheme(StrEnum):
         return {"Authorization": api_key}
 
 
+# Which endpoint places which order type. A table rather than a chain of
+# `if`s, so an order type with no endpoint is a `None` the caller checks
+# rather than a silent fall-through to the market endpoint — which would turn
+# a limit order into a market order at whatever the book happened to be.
+_ORDER_ENDPOINTS: dict[OrderType, Endpoint] = {
+    OrderType.MARKET: Endpoint.ORDER_MARKET,
+    OrderType.LIMIT: Endpoint.ORDER_LIMIT,
+    OrderType.STOP: Endpoint.ORDER_STOP,
+    OrderType.STOP_LIMIT: Endpoint.ORDER_STOP_LIMIT,
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ClientConfig:
     api_key: str
@@ -89,6 +112,12 @@ class ClientConfig:
     environment: str
     auth_scheme: AuthScheme = AuthScheme.RAW
     timeout: float = 20.0
+    # Writes against a real-money account need an explicit arming step. A
+    # misconfigured environment variable must not be the only thing standing
+    # between a test run and a real trade, and `environment` is derived from
+    # which key is present — so it says which account, not whether a human
+    # meant to trade on it.
+    live_writes_armed: bool = False
 
 
 class T212Client:
@@ -204,21 +233,31 @@ class T212Client:
         *,
         path_params: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
+        json_body: Any = None,
         risk_reducing: bool = False,
         timeout: float | None = None,
         _retrying_auth: bool = False,
+        _allow_write: bool = False,
     ) -> tuple[Any, str]:
         """Perform one governed, archived, validated request.
 
         Returns the decoded JSON body and the archive id, so a parse failure
         downstream can name the exact stored response.
+
+        `_allow_write` is private and is set only by `place_order` and
+        `cancel_order`, which check a `RiskToken` first. Keeping the guard here
+        rather than removing it means a new method that forgets the token also
+        forgets the flag, and is refused — the guard fails closed against its
+        own future callers.
         """
-        if endpoint not in READ_ONLY_ENDPOINTS:
+        if endpoint not in READ_ONLY_ENDPOINTS and not _allow_write:
             raise BrokerHttpError(
                 endpoint.value,
                 0,
-                f"{endpoint.value} is not a read-only endpoint. M1 cannot place or "
-                "cancel orders; that arrives in M4 behind a RiskToken.",
+                f"{endpoint.value} writes to the account, so it may only be reached "
+                "through place_order or cancel_order — which require a RiskToken. "
+                "Route the order through RiskEngine.evaluate rather than calling "
+                "_request directly.",
             )
 
         spec = spec_for(endpoint)
@@ -238,6 +277,7 @@ class T212Client:
                 "Accept": "application/json",
             },
             params=params,
+            json_body=json_body,
             timeout=timeout or self._config.timeout,
         )
 
@@ -279,7 +319,14 @@ class T212Client:
         if response.status_code in (401, 403):
             # Try the other auth shape once before concluding the key is bad.
             # The documentation is unreachable, so this is the empirical answer.
-            if not _retrying_auth and not self._auth_confirmed:
+            #
+            # **Never for a write.** A 401/403 on a POST is overwhelmingly
+            # likely to mean the request was rejected before being processed,
+            # but "overwhelmingly likely" is not good enough when the retry
+            # would place a second order. A write whose auth is rejected is
+            # reported as unknown and resolved by looking, like every other
+            # ambiguous write outcome here.
+            if not _retrying_auth and not self._auth_confirmed and not _allow_write:
                 self._archive.record(
                     endpoint=endpoint.value,
                     method=spec.method,
@@ -500,6 +547,134 @@ class T212Client:
         body, msg_id = self._request(Endpoint.HISTORY_DIVIDENDS, params=params)
         items = body.get("items", []) if isinstance(body, dict) else body
         return self._parse_many(DividendResponse, items, Endpoint.HISTORY_DIVIDENDS, msg_id)
+
+    # -- the write surface -------------------------------------------------
+    #
+    # The only two methods in this class that move money. Both take a
+    # `RiskToken` as their first positional parameter, and both check it
+    # against the order in hand before anything is sent.
+    #
+    # The hard part here is not placing the order — it is classifying what
+    # happened when the response is not a clean 2xx. Three outcomes, and
+    # conflating any two of them is a real failure mode:
+    #
+    # * **2xx** — accepted, id in hand. Known.
+    # * **4xx** — refused, conclusively. The order does not exist, and a
+    #   retry is safe. `BrokerHttpError`.
+    # * **anything else** — timeout, reset, 5xx, rate limit mid-flight, auth
+    #   rejected on a write. **Unknown.** The order may exist. Raised as
+    #   `UnknownOrderState`, which the intent log is built to handle by
+    #   looking rather than by assuming.
+    #
+    # Treating the third case as the second is how a crash becomes a double
+    # fill, so the distinction is made here, once, rather than left to each
+    # caller's `except` clause.
+
+    def place_order(
+        self,
+        token: RiskToken,
+        *,
+        order_type: OrderType,
+        purpose: OrderPurpose,
+        limit_price: Decimal | None = None,
+        stop_price: Decimal | None = None,
+        time_validity: TimeValidity | None = None,
+    ) -> PlacedOrder:
+        """Place one order. Requires a token that authorises exactly it."""
+        token.authorises(
+            t212_ticker=token.t212_ticker,
+            side=token.side,
+            quantity=token.quantity,
+            purpose=purpose,
+            at=now_utc(),
+        )
+        if self._config.environment == "live" and not self._config.live_writes_armed:
+            raise BrokerError(
+                "this client is connected to a real-money account and has not been armed "
+                "for writes. Placing an order needs an explicit arming step, because a "
+                "misconfigured environment variable must not be the only thing between a "
+                "test run and a real trade."
+            )
+
+        endpoint = _ORDER_ENDPOINTS.get(order_type)
+        if endpoint is None:  # pragma: no cover - OrderType is exhaustive above
+            raise BrokerError(f"no endpoint for order type {order_type.value}")
+
+        # Signed quantity: Trading 212 expresses the side as the sign rather
+        # than as a field, so a lost minus sign is a buy where a sell was
+        # meant. Built here, once, from the token's side.
+        signed = token.quantity if token.side is Side.BUY else -token.quantity
+        payload: dict[str, Any] = {"ticker": token.t212_ticker, "quantity": float(signed)}
+        if limit_price is not None:
+            payload["limitPrice"] = float(limit_price)
+        if stop_price is not None:
+            payload["stopPrice"] = float(stop_price)
+        if time_validity is not None:
+            payload["timeValidity"] = time_validity.value
+
+        try:
+            body, msg_id = self._request(
+                endpoint,
+                json_body=payload,
+                risk_reducing=purpose.is_risk_reducing,
+                _allow_write=True,
+            )
+        except (BrokerHttpError, AuthError) as exc:
+            status = getattr(exc, "status_code", 0)
+            if 400 <= status < 500 and status not in (401, 403, 429):
+                # A 4xx that is not auth or throttling is the venue saying no
+                # for a reason about the order itself. Conclusive.
+                raise
+            raise UnknownOrderState(
+                f"{token.t212_ticker} {purpose.value}",
+                f"the request failed with HTTP {status or 'no response'} "
+                f"({type(exc).__name__}), which does not establish whether the order "
+                "was accepted",
+            ) from exc
+        except RateLimited as exc:
+            raise UnknownOrderState(
+                f"{token.t212_ticker} {purpose.value}",
+                f"rate limited after the request left ({exc}); the order may have been "
+                "accepted before the limiter replied",
+            ) from exc
+        except TransportError as exc:
+            raise UnknownOrderState(
+                f"{token.t212_ticker} {purpose.value}",
+                f"transport failure ({exc}); nothing came back, so whether the venue "
+                "processed the order is unknown",
+            ) from exc
+
+        parsed = self._parse_one(PlacedOrderResponse, body, endpoint, msg_id)
+        return parsed.to_domain(ticker=token.t212_ticker, side=token.side, quantity=token.quantity)
+
+    def cancel_order(self, token: RiskToken, *, broker_order_id: str) -> None:
+        """Cancel one order.
+
+        Behind a token even though cancelling usually reduces risk, because
+        cancelling a *protective stop* increases it — and the only thing that
+        distinguishes the two is the purpose the engine approved.
+        """
+        token.authorises(
+            t212_ticker=token.t212_ticker,
+            side=token.side,
+            quantity=token.quantity,
+            purpose=token.purpose,
+            at=now_utc(),
+        )
+        try:
+            self._request(
+                Endpoint.ORDER_CANCEL,
+                path_params={"id": broker_order_id},
+                risk_reducing=token.purpose.is_risk_reducing,
+                _allow_write=True,
+            )
+        except BrokerHttpError as exc:
+            if exc.status_code == 404:
+                # Already gone. Filled, cancelled or expired — and for a
+                # cancel that is success, not a failure: the order is not
+                # working, which is what was wanted.
+                return
+            raise
 
     # -- composite ---------------------------------------------------------
 

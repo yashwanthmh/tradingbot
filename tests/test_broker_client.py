@@ -75,8 +75,16 @@ def client(transport: RecordingTransport, ledger: Ledger, tmp_path: Path) -> Ite
     built.close()
 
 
-class TestReadOnlyEnforcement:
-    """A milestone that cannot lose money should not depend on discipline."""
+class TestWriteEndpointsNeedTheTokenPath:
+    """M1's rule was "no writes at all". M4's is stronger, not weaker.
+
+    The write endpoints now exist, but `_request` still refuses them: only
+    `place_order` and `cancel_order` may reach them, and both check a
+    `RiskToken` first. Keeping the guard rather than deleting it means a new
+    method that forgets the token also forgets the private flag, and is
+    refused — the guard fails closed against its own future callers, which is
+    the property that outlives whoever wrote it.
+    """
 
     @pytest.mark.parametrize(
         "endpoint",
@@ -88,25 +96,50 @@ class TestReadOnlyEnforcement:
             Endpoint.ORDER_CANCEL,
         ],
     )
-    def test_a_write_endpoint_is_refused(
+    def test_a_write_endpoint_cannot_be_reached_directly(
         self, client: T212Client, transport: RecordingTransport, endpoint: Endpoint
     ) -> None:
-        with pytest.raises(BrokerHttpError, match="not a read-only endpoint"):
+        with pytest.raises(BrokerHttpError, match="may only be reached through place_order"):
             client._request(endpoint)
         assert transport.calls == [], "nothing should have reached the network"
 
-    def test_the_client_exposes_no_order_placing_method(self) -> None:
-        forbidden = {"place_order", "submit_order", "cancel_order", "create_order"}
-        assert forbidden.isdisjoint(dir(T212Client))
+    def test_the_refusal_names_the_route_rather_than_just_refusing(
+        self, client: T212Client
+    ) -> None:
+        """A refusal that does not say what to do instead gets worked around."""
+        with pytest.raises(BrokerHttpError) as caught:
+            client._request(Endpoint.ORDER_MARKET)
+        message = str(caught.value)
+        assert "RiskToken" in message
+        assert "RiskEngine.evaluate" in message
 
-    def test_no_write_verb_is_ever_sent(
+    def test_the_read_methods_still_send_only_GET(
         self, client: T212Client, transport: RecordingTransport
     ) -> None:
+        """The read surface must not have acquired a write by accident."""
         client.get_cash()
         client.get_positions()
         client.get_open_orders()
         client.get_instruments()
         assert set(transport.methods_called()) == {"GET"}
+
+    def test_the_write_methods_require_a_token_positionally(self) -> None:
+        """No `token=None` default, or calling without one would type-check.
+
+        Asserted against the signature rather than by calling, because the
+        point is that the *absence* of a token is not expressible — a runtime
+        check would still leave `place_order()` a valid thing to write.
+        """
+        import inspect
+
+        for name in ("place_order", "cancel_order"):
+            signature = inspect.signature(getattr(T212Client, name))
+            first = list(signature.parameters.values())[1]
+            assert first.name == "token", f"{name}'s first parameter should be the token"
+            assert first.default is inspect.Parameter.empty, (
+                f"{name} has a default for its token, so calling it without one would "
+                "type-check — which is exactly what the token exists to prevent"
+            )
 
 
 class TestSecretHandling:

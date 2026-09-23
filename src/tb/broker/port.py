@@ -16,8 +16,9 @@ after the entry fills, which is why `OrderPurpose` exists: the reconciler has to
 be able to tell an unprotected position from a protected one, and that is only
 possible if each order records what it was *for*.
 
-M1 implements the read-only half of this port. `place_order` and `cancel_order`
-arrive in M4, behind a `RiskToken` that only the risk engine can construct.
+M1 implemented the read-only half. M4 adds the write half, behind a
+`RiskToken` that only `tb.risk.engine` can construct — see `tb.risk.token` for
+why that is a type rather than a convention.
 """
 
 from __future__ import annotations
@@ -26,7 +27,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime, types only
+    # `tb.risk.token` imports this module for `Side` and `OrderPurpose`, so the
+    # import has to be deferred. Under TYPE_CHECKING only, which keeps the
+    # annotation honest without the cycle.
+    from tb.risk.token import RiskToken
 
 
 class Side(StrEnum):
@@ -293,3 +300,53 @@ class ReadOnlyBroker(Protocol):
     def get_instruments(self) -> tuple[Instrument, ...]: ...
 
     def snapshot(self) -> AccountSnapshot: ...
+
+
+@dataclass(frozen=True, slots=True)
+class PlacedOrder:
+    """What the broker said when an order was accepted.
+
+    `raw_status` keeps the venue's own word for the state alongside our
+    normalised `status`. Trading 212's API is in beta and its vocabulary has
+    moved once already; when it moves again, the raw value is what says whether
+    a new string means something new or is a rename of something known.
+    """
+
+    broker_order_id: str
+    ticker: str
+    side: Side
+    status: OrderStatus
+    quantity: Decimal | None = None
+    raw_status: str | None = None
+    accepted_at: datetime | None = None
+
+
+@runtime_checkable
+class Broker(ReadOnlyBroker, Protocol):
+    """The full port: reads, plus the two calls that move money.
+
+    Both write methods take a `RiskToken` as their **first** positional
+    parameter, not a keyword with a default. That is deliberate: an optional
+    token would make `place_order(...)` without one a valid call, and the whole
+    point is that it should not type-check.
+
+    The token also carries the order's parameters, so an implementation must
+    call `token.authorises(...)` and refuse a mismatch. `SimulatedBroker` and
+    `T212Client` both do, and a test asserts it for every implementation of
+    this protocol rather than for each one separately — an implementation that
+    accepted any token would be a hole in the risk path shaped exactly like a
+    passing type check.
+    """
+
+    def place_order(
+        self,
+        token: RiskToken,
+        *,
+        order_type: OrderType,
+        purpose: OrderPurpose,
+        limit_price: Decimal | None = None,
+        stop_price: Decimal | None = None,
+        time_validity: TimeValidity | None = None,
+    ) -> PlacedOrder: ...
+
+    def cancel_order(self, token: RiskToken, *, broker_order_id: str) -> None: ...
