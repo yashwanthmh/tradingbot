@@ -52,7 +52,9 @@ from tb.broker.port import (
     BrokerOrder,
     CashBalance,
     Instrument,
+    OrderOutcomeUnknown,
     OrderPurpose,
+    OrderRejected,
     OrderStatus,
     OrderType,
     PlacedOrder,
@@ -70,28 +72,32 @@ class SimulatedBrokerError(TbError):
     """The simulator refused something, the way the venue would."""
 
 
-class SimulatedRejection(SimulatedBrokerError):
+class SimulatedRejection(OrderRejected):
     """An explicit venue rejection, with the venue's own reason.
 
-    Distinct from a transport failure on purpose: a rejection is conclusive
-    (the order does not exist) while a transport failure is not (it may). The
-    intent log treats them completely differently, so the simulator must be
-    able to produce each without the other.
+    Subclasses the *port's* `OrderRejected` rather than defining a parallel
+    type. That matters more than it looks: the submitter branches on refused
+    versus unknown, and if the simulator's exceptions were unrelated to the
+    real adapter's, the submitter would have to recognise them by name — which
+    would mean production code sniffing for its test double.
     """
 
     def __init__(self, reason: str, *, code: str) -> None:
-        super().__init__(f"{code}: {reason}")
-        self.code = code
+        super().__init__(reason, code=code)
         self.reason = reason
 
 
-class SimulatedTransportFailure(SimulatedBrokerError):
+class SimulatedTransportFailure(OrderOutcomeUnknown):
     """The request did not complete. Whether the order exists is unknown.
 
     The failure the write-ahead log exists for. A caller that treats this as a
-    rejection and retries is the double-fill path, so the simulator raises a
-    type that cannot be mistaken for `SimulatedRejection`.
+    rejection and retries is the double-fill path, so it is a sibling of
+    `SimulatedRejection` under the port's taxonomy and cannot be caught by an
+    `except OrderRejected`.
     """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__("simulated order", detail)
 
 
 class CrashPoint(StrEnum):

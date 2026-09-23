@@ -16,6 +16,7 @@ The distinctions here are not cosmetic — each one leads somewhere different:
 
 from __future__ import annotations
 
+from tb.broker.port import OrderOutcomeUnknown
 from tb.core.errors import HaltRequired, TbError
 
 # Re-exported: the transport is shared with the data layer, so the error itself
@@ -97,8 +98,12 @@ class SchemaDriftError(HaltRequired):
         self.msg_id = msg_id
 
 
-class UnknownOrderState(BrokerError):
+class UnknownOrderState(OrderOutcomeUnknown):
     """An order's fate could not be established.
+
+    Subclasses the port's `OrderOutcomeUnknown` so a caller can branch on the
+    venue-neutral type and get the same answer from every adapter. It keeps
+    its own name because the message it builds is the T212-specific one.
 
     Never resolve this to "not placed" on the strength of an absence. The
     broker's open-orders list drops filled orders, and the history endpoint is
@@ -107,8 +112,4 @@ class UnknownOrderState(BrokerError):
     """
 
     def __init__(self, identifier: str, detail: str) -> None:
-        super().__init__(
-            f"cannot establish the state of {identifier}: {detail}. "
-            "Treating this as unknown, not as failed."
-        )
-        self.identifier = identifier
+        super().__init__(identifier, detail)

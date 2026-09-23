@@ -29,6 +29,8 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from tb.core.errors import TbError
+
 if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime, types only
     # `tb.risk.token` imports this module for `Side` and `OrderPurpose`, so the
     # import has to be deferred. Under TYPE_CHECKING only, which keeps the
@@ -300,6 +302,52 @@ class ReadOnlyBroker(Protocol):
     def get_instruments(self) -> tuple[Instrument, ...]: ...
 
     def snapshot(self) -> AccountSnapshot: ...
+
+
+class BrokerWriteError(TbError):
+    """Base for the two outcomes a write can have other than success.
+
+    The taxonomy lives on the *port* rather than in a venue adapter, because
+    the distinction it encodes is what every caller has to branch on and it
+    must mean the same thing for every implementation. A submitter that had to
+    know which adapter it was talking to in order to tell a refusal from a
+    timeout would be one adapter away from getting it wrong.
+    """
+
+
+class OrderRejected(BrokerWriteError):
+    """The venue read the order and refused it. **Conclusive.**
+
+    The order does not exist, so a corrected retry is safe. `code` is the
+    venue's own word for the reason, which is the only evidence of a venue
+    rule we did not know about.
+    """
+
+    def __init__(self, detail: str, *, code: str | None = None) -> None:
+        super().__init__(f"{code}: {detail}" if code else detail)
+        self.code = code
+        self.detail = detail
+
+
+class OrderOutcomeUnknown(BrokerWriteError):
+    """Whether the order exists cannot be established. **Never retry.**
+
+    A timeout, a reset, a 5xx, a rate limit mid-flight. The order may be live.
+    Every caller's correct response is to resolve it by looking at the broker,
+    or to halt — and resolving it to "not placed" on the strength of an
+    absence is how a crash becomes a double fill.
+
+    Kept a sibling of `OrderRejected` rather than a subclass, in either
+    direction, so `except OrderRejected` can never accidentally swallow this.
+    """
+
+    def __init__(self, identifier: str, detail: str) -> None:
+        super().__init__(
+            f"cannot establish the state of {identifier}: {detail}. "
+            "Treating this as unknown, not as failed."
+        )
+        self.identifier = identifier
+        self.detail = detail
 
 
 @dataclass(frozen=True, slots=True)
