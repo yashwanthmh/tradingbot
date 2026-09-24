@@ -41,6 +41,7 @@ from tb.risk.rules.capital import (
     FloorNotionalRule,
     MaxPositionsRule,
     PerPositionCapRule,
+    StrategyAllocationRule,
 )
 from tb.risk.rules.execution import (
     AnomalyRule,
@@ -87,6 +88,11 @@ DEFAULT_RULES: tuple[RiskRule, ...] = (
     PerPositionCapRule(),
     DeployedCapRule(),
     MaxPositionsRule(),
+    # The allocator's and the ladder's decision, as a cap on the order path.
+    # Without it in this tuple M5 binds only in its own tables: a promotion at
+    # rung 0 would open the same position as one at rung 4, and the ratchet
+    # would be a number nothing reads.
+    StrategyAllocationRule(),
     RegimeRule(),
     UnprotectedGapRule(),
     SessionWindowRule(),

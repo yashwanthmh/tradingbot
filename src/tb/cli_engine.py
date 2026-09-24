@@ -34,6 +34,13 @@ from tb.config.loader import PinnedLimits, load_hard_limits
 from tb.core.errors import TbError
 from tb.core.ids import new_run_id
 from tb.data.barstore import BarStore
+from tb.engine.funding import (
+    Book,
+    explicit_book,
+    funded_book,
+    record_book,
+    unfunded_notional,
+)
 from tb.engine.intents import IntentLog
 from tb.engine.loop import LoopHalted, TradingLoop, build_instrument_map
 from tb.engine.orders import OrderSubmitter
@@ -115,6 +122,17 @@ def run(
             help="Run without a supervisor. For a drill only — it removes a control.",
         ),
     ] = False,
+    strategy: Annotated[
+        str | None,
+        typer.Option(
+            "--strategy",
+            help=(
+                "Trade one hand-written strategy instead of the promoted book. "
+                "Only 'trivial' is accepted. For drilling the loop, not the funding path."
+            ),
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """The trading loop: bars in, orders out, every step in the ledger.
 
@@ -126,8 +144,22 @@ def run(
 
     `--cycles 1` by default, so an accidental invocation does one pass and
     stops. Pass `--cycles 0` to run until halted.
+
+    What it trades is the *promoted book* — every strategy the registry says may
+    trade, sized by its rung and its allocation. Nothing promoted is a refusal
+    to start rather than an idle loop: a run that decided nothing all day and a
+    run with nothing to decide with are indistinguishable from the outside, and
+    only one of them means `tb promote evaluate` has never been run.
     """
     pinned = _load(limits)
+    if strategy is not None and strategy != "trivial":
+        err_console.print(
+            f"{BAD} unknown --strategy {strategy!r}. The only hand-written strategy here is "
+            "'trivial'; every other strategy reaches the loop by being promoted, which is "
+            "what `tb promote evaluate` records.",
+            soft_wrap=True,
+        )
+        raise typer.Exit(2)
     if mode not in ("paper", "demo"):
         err_console.print(
             f"{BAD} unknown mode {mode!r}. Use paper (simulated broker) or demo "
@@ -160,6 +192,14 @@ def run(
             )
             raise typer.Exit(2)
 
+        # The book, after the broker and the universe. Both of those refuse for
+        # reasons an operator must fix first — a live key present, nothing
+        # verified to trade — and reporting "nothing is promoted" ahead of
+        # either would name the least urgent problem. Read-only here; it is
+        # recorded once the lease is held, so an instance that loses the lease
+        # leaves no book behind.
+        book = _book(ledger, pinned, strategy=strategy, broker=broker)
+
         store = BarStore(
             ledger,
             root=bars or (Path(ledger.path).parent / "bars"),
@@ -183,13 +223,18 @@ def run(
             err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
             raise typer.Exit(2) from exc
 
+        # Now that this process holds the lease: what it is trading. Not
+        # answerable from the decisions alone, since a funded strategy that
+        # signalled nothing leaves no rows for the instruments it declined and
+        # an excluded one leaves none at all.
+        record_book(ledger, book, run_id=run_id)
+
         loop = TradingLoop(
             ledger=ledger,
             pinned=pinned,
             broker=broker,
             bars=store,
-            strategy=MovingAverageCross(),
-            pipeline=FeaturePipeline(specs=specs()),
+            book=book,
             submitter=submitter,
             log=log,
             run_id=run_id,
@@ -204,6 +249,8 @@ def run(
             f"run [bold]{run_id}[/bold] in [bold]{mode}[/bold] mode over "
             f"{len(universe)} instrument(s), lease to {lease.expires_at.isoformat()}"
         )
+        for line in book.explain().splitlines():
+            console.print(f"  {escape(line)}", soft_wrap=True)
         if no_watchdog:
             console.print(
                 f"{WARN} running without a supervisor. A wedged loop is the one state it "
@@ -284,6 +331,59 @@ def watchdog(
             console.print(f"\n{BAD} tripped on {tripped} of {checked} check(s)")
             raise typer.Exit(1)
         console.print(f"\n{OK} {checked} check(s), heartbeat healthy throughout")
+
+
+def _book(
+    ledger: Ledger,
+    pinned: PinnedLimits,
+    *,
+    strategy: str | None,
+    broker: Broker,
+) -> Book:
+    """The funded book, or the one-strategy drill book `--strategy trivial` asks for.
+
+    Equity comes from the broker rather than from `--equity`, because the rung
+    and the allocation are both intersected with `per_position_pct` of the real
+    account. Sizing the book against a number passed on the command line would
+    let a typo fund a strategy above the cap that is actually in force.
+    """
+    equity = broker.get_cash().equity
+    if strategy == "trivial":
+        # Not funded by the registry, so the ladder does not apply to it and the
+        # M4 caps bind alone — see `unfunded_notional`. Recorded like any other
+        # book by the caller, because "this run was trading a hand-written
+        # strategy" is exactly the thing a reader of the ledger must not have to
+        # infer.
+        book = explicit_book(
+            MovingAverageCross(),
+            FeaturePipeline(specs=specs()),
+            notional_ccy=unfunded_notional(pinned.limits, equity_ccy=equity),
+            detail=(
+                "hand-written, supplied with --strategy trivial: it has passed no gate "
+                "and is bounded by the per-position cap rather than by a rung"
+            ),
+        )
+        console.print(
+            f"{WARN} trading the hand-written trivial strategy, which no gate has cleared. "
+            "The promoted book is what `tb run` trades without --strategy.",
+            soft_wrap=True,
+        )
+        return book
+
+    book = funded_book(ledger, limits=pinned.limits, equity_ccy=equity)
+    if not book.funded:
+        for label, reason in book.excluded:
+            err_console.print(f"{BAD} {escape(label)}: {escape(reason)}", soft_wrap=True)
+        err_console.print(
+            f"{BAD} no strategy is promoted, so there is nothing to trade. "
+            "`tb promote evaluate <strategy-id>` runs the gate and prints every check; "
+            "`tb registry list` shows what is registered. `--strategy trivial` runs the "
+            "hand-written strategy instead, which is a drill of the loop rather than of "
+            "the funding path.",
+            soft_wrap=True,
+        )
+        raise typer.Exit(2)
+    return book
 
 
 def _broker(mode: str, pinned: PinnedLimits, *, equity: Decimal) -> Broker:

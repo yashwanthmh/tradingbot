@@ -14,7 +14,8 @@ an order would have placed it under caps that were no longer in force.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -23,18 +24,18 @@ from typing import Any
 import pytest
 
 from tb.broker.simulated import SimulatedBroker
-from tb.config.loader import PinnedLimits, load_hard_limits
+from tb.config.loader import PinnedLimits
 from tb.data.barstore import BarStore
 from tb.data.calendar import TradingCalendar
 from tb.data.provider import Bar, BarBatch, Provenance, Resolution, Session
 from tb.data.symbols import Confidence, SymbolMap, SymbolMapping
+from tb.engine.funding import Book, explicit_book, unfunded_notional
 from tb.engine.intents import IntentLog
 from tb.engine.loop import LoopHalted, TradingLoop, build_instrument_map
 from tb.engine.orders import OrderSubmitter
 from tb.features.pipeline import FeaturePipeline
 from tb.ledger.store import Ledger
 from tb.ledger.verify import verify_chain
-from tb.ops.killswitch import write_heartbeat
 from tb.ops.state import RunState, StateMachine
 from tb.ops.watchdog import InstanceLock, SelfCheck
 from tb.portfolio.pnl import EquityCurve
@@ -47,31 +48,6 @@ CAL = TradingCalendar()
 
 # Mid-session on a regular trading day, well clear of both session windows.
 AS_OF = datetime(2026, 4, 1, 15, 30, tzinfo=UTC)
-
-
-@pytest.fixture
-def env(tmp_path: Path, write_limits: Callable[[dict[str, Any]], Path]) -> dict[str, Any]:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir(exist_ok=True)
-    limits = write_limits(
-        {
-            "safety": {
-                "kill_switch_path": str(run_dir / "KILL"),
-                "heartbeat_path": str(run_dir / "heartbeat"),
-            }
-        }
-    )
-    # The watchdog's liveness marker, so the self-check passes. Written here
-    # rather than disabled, because `require_watchdog=False` is a different
-    # code path and the default one is what production runs.
-    write_heartbeat(run_dir / "watchdog", run_id="watchdog", state="supervising")
-    return {
-        "limits": limits,
-        "db": tmp_path / "ledger.db",
-        "bars": tmp_path / "bars",
-        "run_dir": run_dir,
-        "pinned": load_hard_limits(limits),
-    }
 
 
 def _rising_bars(*, days: int, uid: str = UID) -> list[Bar]:
@@ -226,6 +202,24 @@ def _seed(
         )
 
 
+STRATEGY_ID = "trivial_ma_cross"
+
+
+def _book(pinned: PinnedLimits) -> Book:
+    """A one-strategy book at the size an unfunded strategy gets.
+
+    `unfunded_notional` rather than a rung: the trivial strategy has passed no
+    gate, so the ladder does not apply to it and the M4 caps bind alone — which
+    is what these tests were written against. A funded book is exercised in
+    `tests/test_funding.py`, where the rung is the point.
+    """
+    return explicit_book(
+        MovingAverageCross(),
+        FeaturePipeline(specs=specs()),
+        notional_ccy=unfunded_notional(pinned.limits, equity_ccy=Decimal("10000.00")),
+    )
+
+
 def _loop(
     env: dict[str, Any],
     ledger: Ledger,
@@ -233,6 +227,7 @@ def _loop(
     *,
     run_id: str = "run_loop",
     at: datetime = AS_OF,
+    book: Book | None = None,
 ) -> TradingLoop:
     pinned: PinnedLimits = env["pinned"]
     log = IntentLog(ledger, run_id=run_id)
@@ -241,8 +236,7 @@ def _loop(
         pinned=pinned,
         broker=broker,
         bars=BarStore(ledger, root=env["bars"], scale=pinned.limits.data.price_scale),
-        strategy=MovingAverageCross(),
-        pipeline=FeaturePipeline(specs=specs()),
+        book=book if book is not None else _book(pinned),
         submitter=OrderSubmitter(
             ledger=ledger, broker=broker, log=log, run_id=run_id, clock=lambda: at
         ),
@@ -260,6 +254,118 @@ def _loop(
         equity=EquityCurve(ledger, run_id=run_id),
         clock=lambda: at,
     )
+
+
+def _own(
+    env: dict[str, Any],
+    *,
+    strategy_id: str = STRATEGY_ID,
+    version: int = 1,
+    ticker: str = TICKER,
+    uid: str = UID,
+    at: datetime = AS_OF - timedelta(days=30),
+    ledger: Ledger | None = None,
+    suffix: str = "seeded",
+    seq: int = 0,
+) -> None:
+    """Attribute a hand-seeded position to a strategy.
+
+    A position seeded straight into the broker has no decision lineage behind
+    it, and ownership is resolved *from* that lineage — the broker reports a
+    position per instrument and knows nothing about strategies. So a test that
+    seeds a position must seed the entry that opened it, or the loop correctly
+    treats the holding as owned by nobody and flattens it.
+
+    Written as two projection rows rather than by running a cycle, because the
+    fixtures here seed one fixed bar series and an entry-then-exit would need
+    two. The rows are the same shape the loop writes. `seq` is the ordering key
+    ownership is resolved by, so a test seeding two owners must give the later
+    one a higher value.
+
+    `ledger` takes an already-open handle. Opening a second connection to the
+    same file while a test holds one works, but it is the sort of thing that
+    starts failing under WAL for reasons unrelated to what is being tested.
+    """
+    pinned: PinnedLimits = env["pinned"]
+    with _maybe(env, pinned, ledger) as opened:
+        _write_ownership(
+            opened,
+            strategy_id=strategy_id,
+            version=version,
+            ticker=ticker,
+            uid=uid,
+            at=at,
+            suffix=suffix,
+            seq=seq,
+        )
+
+
+@contextmanager
+def _maybe(env: dict[str, Any], pinned: PinnedLimits, ledger: Ledger | None) -> Iterator[Ledger]:
+    if ledger is not None:
+        yield ledger
+        return
+    with Ledger(env["db"], config_hash=pinned.config_hash) as opened:
+        yield opened
+
+
+def _write_ownership(
+    ledger: Ledger,
+    *,
+    strategy_id: str,
+    version: int,
+    ticker: str,
+    uid: str,
+    at: datetime,
+    suffix: str,
+    seq: int,
+) -> None:
+    ledger.conn.execute(
+        "INSERT INTO decisions (decision_id, run_id, strategy_id, strategy_version,"
+        " instrument_uid, t212_ticker, as_of_utc, resolution, feature_snapshot_hash,"
+        " feature_vector_json, action, expected_edge_bps, rationale, decided_at,"
+        " deciding_event_seq) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            f"dec_{suffix}",
+            "run_seed",
+            strategy_id,
+            version,
+            uid,
+            ticker,
+            at.isoformat(),
+            "daily",
+            f"hash_{suffix}",
+            "{}",
+            "enter",
+            450.0,
+            "seeded by the test fixture",
+            at.isoformat(),
+            seq,
+        ),
+    )
+    ledger.conn.execute(
+        "INSERT INTO order_intents (intent_id, decision_id, run_id, instrument_uid,"
+        " t212_ticker, side, order_type, purpose, priority_class, quantity,"
+        " risk_token_id, state, wal_committed_at, committing_event_seq)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            f"int_{suffix}",
+            f"dec_{suffix}",
+            "run_seed",
+            uid,
+            ticker,
+            "BUY",
+            "MARKET",
+            "entry",
+            "risk_increasing",
+            "1",
+            f"tok_{suffix}",
+            "resolved_filled",
+            at.isoformat(),
+            seq,
+        ),
+    )
+    ledger.conn.commit()
 
 
 def _broker(*, price: Decimal = Decimal("150.00")) -> SimulatedBroker:
@@ -616,6 +722,7 @@ def test_an_exit_is_processed_before_any_entry(env: dict[str, Any]) -> None:
         average_price=Decimal("150.00"),
         entered_at=AS_OF - timedelta(days=30),
     )
+    _own(env)
 
     with Ledger(env["db"], config_hash=env["pinned"].config_hash) as ledger:
         loop = _loop(env, ledger, broker)
@@ -646,6 +753,7 @@ def test_an_exit_is_not_scaled_by_the_regime_factor(env: dict[str, Any]) -> None
         average_price=Decimal("150.00"),
         entered_at=AS_OF - timedelta(days=30),
     )
+    _own(env)
 
     with Ledger(env["db"], config_hash=env["pinned"].config_hash) as ledger:
         loop = _loop(env, ledger, broker)
@@ -811,6 +919,7 @@ def test_an_exit_still_goes_through_with_the_day_breached(env: dict[str, Any]) -
         average_price=Decimal("150.00"),
         entered_at=AS_OF - timedelta(days=30),
     )
+    _own(env)
 
     with Ledger(env["db"], config_hash=env["pinned"].config_hash) as ledger:
         loop = _loop(env, ledger, broker)

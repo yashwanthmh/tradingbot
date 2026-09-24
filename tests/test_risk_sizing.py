@@ -47,6 +47,11 @@ def _context(
     regime_factor: Decimal | None,
     equity: Decimal,
     price: Decimal = Decimal("150.00"),
+    # The allocator's per-position size, deliberately far above every other cap
+    # so the *per-position cap* stays the binding one. These tests are about
+    # which bound wins and what happens at the floor, and an allocation that
+    # also bound would make it ambiguous which rule produced the size.
+    notional: Decimal = Decimal("100000.00"),
 ) -> RiskContext:
     return RiskContext(
         as_of=AS_OF,
@@ -77,6 +82,7 @@ def _context(
         bar_period_seconds=86400,
         minutes_since_open=60,
         minutes_until_close=120,
+        strategy_notional_ccy=notional,
         extra={"isin": "US0378331005", "instrument_currency": "USD"},
     )
 

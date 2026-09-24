@@ -22,6 +22,7 @@ import yaml
 from tb.config.loader import PinnedLimits, load_hard_limits
 from tb.ledger.chain import GENESIS_HASH, compute_chain_hash, compute_payload_hash
 from tb.ledger.store import Ledger
+from tb.ops.killswitch import write_heartbeat
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_LIMITS = REPO_ROOT / "config" / "hard_limits.yaml"
@@ -74,6 +75,38 @@ def write_limits(tmp_path: Path) -> Callable[[dict[str, Any]], Path]:
 @pytest.fixture
 def pinned(limits_file: Path) -> PinnedLimits:
     return load_hard_limits(limits_file)
+
+
+@pytest.fixture
+def env(tmp_path: Path, write_limits: Callable[[dict[str, Any]], Path]) -> dict[str, Any]:
+    """A run directory a trading loop can actually start in.
+
+    Here rather than in one test module because both `test_loop` and
+    `test_funding` drive the loop, and two copies of "a working run directory"
+    is how a suite ends up proving something about a fixture rather than about
+    the system.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(exist_ok=True)
+    limits = write_limits(
+        {
+            "safety": {
+                "kill_switch_path": str(run_dir / "KILL"),
+                "heartbeat_path": str(run_dir / "heartbeat"),
+            }
+        }
+    )
+    # The watchdog's liveness marker, so the self-check passes. Written here
+    # rather than disabled, because `require_watchdog=False` is a different
+    # code path and the default one is what production runs.
+    write_heartbeat(run_dir / "watchdog", run_id="watchdog", state="supervising")
+    return {
+        "limits": limits,
+        "db": tmp_path / "ledger.db",
+        "bars": tmp_path / "bars",
+        "run_dir": run_dir,
+        "pinned": load_hard_limits(limits),
+    }
 
 
 @pytest.fixture

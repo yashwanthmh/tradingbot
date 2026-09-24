@@ -298,6 +298,27 @@ class SpecRegistry:
         ).fetchall()
         return [_row_to_record(row) for row in rows]
 
+    def blocked_after_promotion(self) -> list[StrategyRecord]:
+        """Strategies that were funded once and are blocked now.
+
+        Read beside `promoted()` when assembling the live book, because a
+        strategy blocked by its lineage's loss budget has already left
+        `promoted()` — so a book built from that alone would show an empty list
+        and no reason. "Four were promoted and all four are out of budget" and
+        "nothing was ever promoted" are the same picture otherwise, and only one
+        of them is about the searcher.
+
+        Retired strategies are deliberately not here. Retirement is the normal
+        way out and listing every past strategy on every run would bury the one
+        row that means something.
+        """
+        rows = self._ledger.conn.execute(
+            "SELECT * FROM strategy_status WHERE status = ? AND promoted_at IS NOT NULL "
+            "ORDER BY promoted_at",
+            (StrategyStatus.BLOCKED.value,),
+        ).fetchall()
+        return [_row_to_record(row) for row in rows]
+
     def may_trade(self, strategy_id: str, version: int = 1) -> tuple[bool, str]:
         """Whether this strategy may trade, and why not if it may not.
 
@@ -314,6 +335,12 @@ class SpecRegistry:
                 "where the promotion gate records its decision."
             )
         if not record.status.may_trade:
+            # The stored reason when there is one. "blocked" alone does not say
+            # whether a lineage ran out of budget or a review killed it, and
+            # `retire_reason` already holds the sentence that does — a caller
+            # reporting only the status would send an operator looking for it.
+            if record.retire_reason:
+                return False, f"{record.label} is {record.status.value}: {record.retire_reason}"
             return False, f"{record.label} is {record.status.value}"
         budget = self.budget_for(record.lineage_id)
         if budget is not None and budget.is_exhausted:

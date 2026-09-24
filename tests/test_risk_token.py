@@ -247,6 +247,12 @@ def _issue_via_engine(engine: object) -> RiskToken | None:
         minutes_since_open=60,
         minutes_until_close=120,
         extra={"isin": "US0378331005", "instrument_currency": "USD"},
+        # The allocator's per-position size. Fail-closed at the rule, so a
+        # context that omits it refuses every entry — see
+        # `StrategyAllocationRule`. Well above the caps here, so the M4 caps
+        # stay the binding ones and these tests keep measuring what they were
+        # written to measure.
+        strategy_notional_ccy=Decimal("1000.00"),
     )
     return engine.evaluate(ctx, run_id="run_test").token
 

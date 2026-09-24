@@ -495,3 +495,59 @@ jobs:
             || { echo "::error::tb research null-gate did not report a rate against the ceiling"; exit 1; }
           grep -q "reached the statistical checks" /tmp/nullgate.txt \
             || { echo "::error::the command did not report how many candidates reached the statistics"; exit 1; }
+
+      - name: A promotion changes what the loop trades
+        run: |
+          # The M5b property, and it is the one that makes every control in M5
+          # true of the account rather than only of the database. Before this
+          # wiring the loop held one hardcoded strategy and read neither
+          # `strategy_status` nor the ladder nor the allocator, so a promotion
+          # changed nothing, a rung changed nothing, and an allocation changed
+          # nothing.
+          #
+          # Asserted as a named step rather than only inside the Test job
+          # because it is a claim about the *system*: same bars, same broker,
+          # same universe, promoted versus not.
+          set -o pipefail
+          uv run pytest tests/test_funding.py -q 2>&1 | tail -5
+
+      - name: A run with nothing promoted refuses rather than idling
+        env:
+          TB_VAR_DIR: var-m5b
+        run: |
+          # An empty book must not start. A loop that started anyway would
+          # write a run record, a heartbeat and a cycle event saying nothing
+          # traded — indistinguishable from a working day on which nothing
+          # signalled, which is the normal state of a correct system.
+          #
+          # This install has no verified symbol either, so `tb run` stops at the
+          # universe check first. Both refusals are exit 2 and both name their
+          # remedy; this step asserts the ordering has not been inverted, since
+          # an operator told "nothing is promoted" would go and run the searcher
+          # when the actual problem is that nothing is tradable.
+          uv run tb init
+          if uv run tb run --mode paper --cycles 1 > /tmp/run.txt 2>&1; then
+            echo "::error::tb run started with an empty book"
+            cat /tmp/run.txt
+            exit 1
+          fi
+          grep -q "tb symbols verify" /tmp/run.txt || {
+            echo "::error::the refusal did not name the more urgent remedy first"
+            cat /tmp/run.txt
+            exit 1
+          }
+          # And the flag that opts into the hand-written strategy is the only
+          # accepted one: every other strategy reaches the loop by being
+          # promoted.
+          if uv run tb run --mode paper --cycles 1 --strategy definitely-not-a-strategy \
+              > /tmp/run2.txt 2>&1; then
+            echo "::error::tb run accepted an unknown --strategy"
+            cat /tmp/run2.txt
+            exit 1
+          fi
+          grep -q "tb promote evaluate" /tmp/run2.txt || {
+            echo "::error::the refusal did not say how a strategy is meant to reach the loop"
+            cat /tmp/run2.txt
+            exit 1
+          }
+          echo "refused, remedies named in the right order"

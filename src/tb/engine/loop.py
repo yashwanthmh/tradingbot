@@ -3,11 +3,27 @@
 This is where every layer built so far meets, and the order is the design:
 
     self-check -> lease -> recover -> config hash -> regime
-      -> per instrument: features -> strategy -> risk -> intent -> broker
+      -> flatten what no funded strategy owns
+      -> per instrument, per funded strategy:
+           features -> strategy -> risk -> intent -> broker
       -> protective stop
       -> record the cycle
 
-Five things about that order are load-bearing.
+Seven things about that order are load-bearing.
+
+**The loop trades a funded *book*, not a strategy.** `book` comes from
+`tb.engine.funding`, which reads the registry, the ladder and the allocator —
+so a promotion changes what this loop asks and a retirement changes it back.
+Each funded strategy carries its own spec-derived pipeline, because a shared
+pipeline that happened not to compute a feature some spec reads would make that
+spec evaluate to `UNKNOWN` at every decision and look like a strategy that
+never found an opportunity.
+
+**A position belongs to the strategy whose entry opened it.** Only that
+strategy is asked about it, so two strategies cannot take turns deciding the
+same holding — and an instrument no funded strategy owns is flattened before
+anything else happens, because a position nothing will ever decide to close is
+unmanaged exposure and that is the state this whole design exists to avoid.
 
 **Recovery runs before the first decision of every cycle, not only after a
 known crash.** A run that ended cleanly cannot be distinguished from one that
@@ -34,6 +50,12 @@ of a second long, and the sizing rules assume the short version.
 verdict goes to the ledger whether the order was placed or not, because "why
 did it stop trading" is the more common question.
 
+**Two funded strategies wanting the same flat instrument is resolved, not
+averaged.** The first in book order takes it and the second is refused with the
+winner named. Book order is by label, so the resolution is a function of
+identity rather than of promotion time — which is what makes a replay resolve
+the contention the same way the live run did.
+
 The loop holds no clock and no network of its own: the clock is injected, the
 broker and the provider are passed in. `run_cycle` is a single pass so a test
 can drive it one tick at a time, and `run_forever` is a thin sleep-and-repeat
@@ -56,14 +78,16 @@ from tb.core.ids import new_id
 from tb.data.asof import BarSource, BarWindow, visible_bars
 from tb.data.regime import RegimeGate, RegimeReading
 from tb.data.symbols import SymbolMap
+from tb.engine.funding import Book, FundedStrategy, Ownership, owner_of, unowned_positions
 from tb.engine.intents import IntentLog
 from tb.engine.orders import OrderSubmitter, SubmissionError, SubmissionUnknown
-from tb.features.pipeline import FeaturePipeline, FeatureSnapshot
+from tb.features.pipeline import FeatureSnapshot
 from tb.ledger.events import (
     Actor,
     DecisionPayload,
     EventType,
     LoopCyclePayload,
+    PositionOrphanedPayload,
     RiskEvaluationPayload,
     RiskVerdictRow,
 )
@@ -73,7 +97,13 @@ from tb.ops.watchdog import InstanceLock, InstanceLockRefused, SelfCheck, Watchd
 from tb.portfolio.pnl import EquityCurve
 from tb.risk.engine import Evaluation, RiskEngine, entry_request, exit_request, stop_price_for
 from tb.risk.state import AccountState, RiskContext
-from tb.strategy.base import Action, Decision, PositionState, Strategy
+from tb.strategy.base import Action, Decision, PositionState
+
+# What one consultation produced: the decision, the intent it submitted, a
+# refusal, and the protective stop behind it. A tuple rather than a value object
+# because it is assembled and consumed in this module only, and naming it here
+# keeps the signatures readable.
+_Outcome = tuple[Decision | None, str | None, tuple[str, str] | None, str | None]
 
 
 class LoopHalted(TbError):
@@ -92,6 +122,11 @@ class CycleResult:
     refusals: tuple[tuple[str, str], ...] = ()
     stops_placed: tuple[str, ...] = ()
     regime: RegimeReading | None = None
+    # Tickers held by no funded strategy, and what happened to each. Carried on
+    # the result rather than only in the ledger because it is the one outcome an
+    # operator should see immediately: a position nothing in the book will close
+    # is unmanaged exposure, whether or not the flattening order got through.
+    unowned: tuple[tuple[str, str], ...] = ()
     duration_ms: float = 0.0
     halted: bool = False
     detail: str = ""
@@ -109,14 +144,17 @@ class TradingLoop:
     stored under. Both are needed and neither derives from the other: the
     order goes to the ticker, the features come from the uid, and conflating
     them is the mismapping the symbol layer exists to prevent.
+
+    `book` is the funded set — see `tb.engine.funding`. It is passed in rather
+    than read here, so the loop does not have to decide what "funded" means and
+    a test can hand it one strategy at a known size.
     """
 
     ledger: Ledger
     pinned: PinnedLimits
     broker: Broker
     bars: BarSource
-    strategy: Strategy
-    pipeline: FeaturePipeline
+    book: Book
     submitter: OrderSubmitter
     log: IntentLog
     run_id: str
@@ -146,30 +184,46 @@ class TradingLoop:
         refusals: list[tuple[str, str]] = []
         stops: list[str] = []
 
+        # Before anything the book might want: positions the book will never
+        # decide about. Risk-reducing, and ahead of the exits a funded strategy
+        # might ask for, because an unowned position is the only holding in the
+        # account that nothing is managing.
+        unowned = self._flatten_unowned(at=at, submitted=submitted, refusals=refusals)
+
         # Two passes, risk-reducing first. An ordering rather than a queue
         # object: the per-cycle work is small and bounded, and the property
         # that matters is only that no entry is attempted before every exit
         # has been.
+        #
+        # Instruments outer, strategies inner: the position and its owner are
+        # facts about the instrument, so resolving them once per instrument is
+        # what keeps two strategies from both acting on one holding.
+        stood_down = {ticker for ticker, _, _ in unowned}
         for risk_reducing in (True, False):
             for ticker, uid in sorted(self.instruments.items()):
-                outcome = self._consider(
+                if ticker in stood_down:
+                    # Flattened, or refused a flatten, this cycle. Either way
+                    # nothing in the book should open a position on top of it:
+                    # a flatten that has not settled would net against the
+                    # entry unpredictably, and one that was refused means the
+                    # unattributed holding is still there.
+                    continue
+                outcomes = self._consider_instrument(
                     ticker=ticker,
                     uid=uid,
                     at=at,
                     regime=regime,
                     risk_reducing_pass=risk_reducing,
                 )
-                if outcome is None:
-                    continue
-                decision, intent_id, refusal, stop_id = outcome
-                if decision is not None:
-                    decisions.append(decision)
-                if intent_id is not None:
-                    submitted.append(intent_id)
-                if refusal is not None:
-                    refusals.append(refusal)
-                if stop_id is not None:
-                    stops.append(stop_id)
+                for decision, intent_id, refusal, stop_id in outcomes:
+                    if decision is not None:
+                        decisions.append(decision)
+                    if intent_id is not None:
+                        submitted.append(intent_id)
+                    if refusal is not None:
+                        refusals.append(refusal)
+                    if stop_id is not None:
+                        stops.append(stop_id)
 
         duration = (time.monotonic() - started) * 1000
         result = CycleResult(
@@ -181,6 +235,7 @@ class TradingLoop:
             refusals=tuple(refusals),
             stops_placed=tuple(stops),
             regime=regime,
+            unowned=tuple((ticker, reason) for ticker, _, reason in unowned),
             duration_ms=duration,
         )
         self._record_cycle(result)
@@ -298,7 +353,7 @@ class TradingLoop:
 
     # -- one instrument ----------------------------------------------------
 
-    def _consider(
+    def _consider_instrument(
         self,
         *,
         ticker: str,
@@ -306,12 +361,13 @@ class TradingLoop:
         at: datetime,
         regime: RegimeReading,
         risk_reducing_pass: bool,
-    ) -> tuple[Decision | None, str | None, tuple[str, str] | None, str | None] | None:
-        """Ask the strategy about one instrument and act on the answer.
+    ) -> list[_Outcome]:
+        """Ask whichever funded strategies may act on this instrument.
 
-        Returns `None` when this instrument is not this pass's business, so
-        the caller can tell "considered and declined" from "not considered" —
-        which matters for the cycle record.
+        Returns one outcome per strategy consulted, and an empty list when the
+        instrument is not this pass's business — so the caller can tell
+        "considered and declined" from "not considered", which matters for the
+        cycle record.
         """
         position = self._position(ticker, uid)
 
@@ -320,11 +376,77 @@ class TradingLoop:
         # pass and skipped on the second, so an add is deferred a cycle rather
         # than competing with its own exit for the budget.
         if risk_reducing_pass != position.is_open:
-            return None
+            return []
 
+        candidates = self._candidates_for(ticker, position=position)
+        outcomes: list[_Outcome] = []
+        for index, funded in enumerate(candidates):
+            decision, intent_id, refusal, stop_id = self._consider(
+                funded=funded,
+                ticker=ticker,
+                uid=uid,
+                at=at,
+                regime=regime,
+                position=position,
+            )
+            outcomes.append((decision, intent_id, refusal, stop_id))
+            if intent_id is None:
+                continue
+            # An order went out for this instrument. Whoever comes next in book
+            # order is refused rather than allowed to add to a position their
+            # own allocation did not pay for — and refused explicitly, because a
+            # silent skip would look identical to a strategy that simply held.
+            for loser in candidates[index + 1 :]:
+                outcomes.append(
+                    (
+                        None,
+                        None,
+                        (
+                            ticker,
+                            f"{loser.label}: {funded.label} placed an order on this "
+                            "instrument first in this cycle. Two strategies sharing one "
+                            "position would each be sized against an allocation that "
+                            "paid for part of it.",
+                        ),
+                        None,
+                    )
+                )
+            break
+        return outcomes
+
+    def _candidates_for(self, ticker: str, *, position: PositionState) -> list[FundedStrategy]:
+        """Which funded strategies may act on this instrument, in book order.
+
+        A held position is its owner's alone: only the strategy whose entry
+        opened it is asked, so two strategies cannot take turns deciding one
+        holding, and an add is charged against the allocation that already paid
+        for the rest of it. A position with no owner in the book has already
+        been flattened this cycle, so there is nobody to ask.
+
+        A flat instrument is offered to the whole book in order, and the first
+        strategy to get an order out takes it.
+        """
+        if not position.is_open:
+            return list(self.book.funded)
+        owner = owner_of(self.ledger, t212_ticker=ticker)
+        if owner is None:
+            return []
+        return [funded for funded in self.book.funded if funded.key == owner.key]
+
+    def _consider(
+        self,
+        *,
+        funded: FundedStrategy,
+        ticker: str,
+        uid: str,
+        at: datetime,
+        regime: RegimeReading,
+        position: PositionState,
+    ) -> _Outcome:
+        """Ask one strategy about one instrument and act on the answer."""
         window = self._window(uid, at)
-        snapshot = self.pipeline.compute(window, uid)
-        decision = self.strategy.decide(snapshot=snapshot, window=window, position=position)
+        snapshot = funded.pipeline.compute(window, uid)
+        decision = funded.strategy.decide(snapshot=snapshot, window=window, position=position)
         decision_id = self._record_decision(
             decision, ticker=ticker, snapshot=snapshot, regime=regime
         )
@@ -339,6 +461,7 @@ class TradingLoop:
         evaluation = self._evaluate(
             decision=decision,
             decision_id=decision_id,
+            funded=funded,
             ticker=ticker,
             uid=uid,
             at=at,
@@ -373,6 +496,7 @@ class TradingLoop:
         stop_id: str | None = None
         if decision.action is Action.ENTER and submission.filled:
             stop_id = self._protect(
+                funded=funded,
                 ticker=ticker,
                 uid=uid,
                 quantity=evaluation.approved_quantity or Decimal(0),
@@ -384,9 +508,161 @@ class TradingLoop:
 
         return decision, submission.intent.intent_id, None, stop_id
 
+    # -- positions the book does not own -----------------------------------
+
+    def _flatten_unowned(
+        self,
+        *,
+        at: datetime,
+        submitted: list[str],
+        refusals: list[tuple[str, str]],
+    ) -> list[tuple[str, Ownership | None, str]]:
+        """Close positions no funded strategy will ever decide about.
+
+        Two ways to arrive here: the strategy that opened the position has been
+        retired, blocked or has run its lineage out of budget, or no entry in the
+        intent log can be attributed to a decision at all. Either way nothing in
+        the book will produce an exit for it, and an open position that nothing
+        is managing — with no bracket order behind it on this venue — is the
+        state the whole safety design is about.
+
+        Flattened through the risk engine like any other order, so the refusal
+        of a flatten is as recorded as its submission. A refusal is *not* a halt:
+        the minimum holding period blocks a young position's exit, and halting
+        the loop over a position it will be allowed to close in an hour would
+        stop it managing everything else in the meantime.
+
+        Scoped to `instruments` — the loop's own universe — and not to the whole
+        account. A holding in something this run cannot even price is not the
+        loop's to close: it has no bars for it, so it could not size the order
+        or check the staleness bound, and selling an instrument it knows nothing
+        about is a worse answer than reporting it. `tb reconcile` is what reads
+        the account as a whole.
+        """
+        if not self.instruments:
+            return []
+        # One `get_positions` rather than a `get_position` per instrument. The
+        # per-ticker endpoint is a network call each, so at 25 symbols this
+        # sweep would double the portfolio calls every cycle makes against an
+        # endpoint the rate governor is already rationing.
+        held = [
+            position.ticker
+            for position in self.broker.get_positions()
+            if position.quantity > 0 and position.ticker in self.instruments
+        ]
+        unowned = unowned_positions(self.ledger, book=self.book, held=held)
+        for ticker, owner, reason in unowned:
+            uid = self.instruments[ticker]
+            state = self._position(ticker, uid)
+            intent_id, action = self._flatten(
+                ticker=ticker,
+                uid=uid,
+                position=state,
+                at=at,
+                reason=reason,
+            )
+            self._record_orphan(
+                ticker=ticker,
+                uid=uid,
+                position=state,
+                owner=owner,
+                reason=reason,
+                action_taken=action,
+                intent_id=intent_id,
+            )
+            if intent_id is not None:
+                submitted.append(intent_id)
+            else:
+                refusals.append((ticker, f"unowned position not flattened: {action}"))
+        return unowned
+
+    def _flatten(
+        self,
+        *,
+        ticker: str,
+        uid: str,
+        position: PositionState,
+        at: datetime,
+        reason: str,
+    ) -> tuple[str | None, str]:
+        """Submit a flattening order. Returns `(intent_id, what happened)`."""
+        window = self._window(uid, at)
+        reference = self._reference_price(window, uid)
+        if reference is None:
+            return None, "no usable reference price in the window, so no order could be sized"
+
+        request = exit_request(
+            t212_ticker=ticker,
+            instrument_uid=uid,
+            reference_price=reference,
+            quantity=position.quantity,
+            purpose=OrderPurpose.FLATTEN,
+        )
+        evaluation = self.risk.evaluate(
+            self._context(
+                request=request,
+                at=at,
+                position=position,
+                regime=None,
+                ticker=ticker,
+                # No allocation: a flatten belongs to no strategy, which is the
+                # whole reason it is happening. The allocation rule reads a
+                # risk-reducing order as not applicable, so this is explicit
+                # rather than load-bearing.
+                notional_ccy=None,
+            ),
+            run_id=self.run_id,
+        )
+        if evaluation.token is None:
+            return None, f"risk refused the flatten: {evaluation.refusal_summary}"
+
+        try:
+            submission = self.submitter.submit(
+                evaluation.token,
+                order_type=OrderType.MARKET,
+                purpose=OrderPurpose.FLATTEN,
+                instrument_uid=uid,
+            )
+        except SubmissionUnknown as exc:
+            self._halt(str(exc))
+            raise  # pragma: no cover - _halt always raises
+        except SubmissionError as exc:
+            return None, f"the broker rejected the flatten: {exc}"
+        return submission.intent.intent_id, f"flattened {position.quantity} ({reason})"
+
+    def _record_orphan(
+        self,
+        *,
+        ticker: str,
+        uid: str,
+        position: PositionState,
+        owner: Ownership | None,
+        reason: str,
+        action_taken: str,
+        intent_id: str | None,
+    ) -> None:
+        self.ledger.append(
+            EventType.POSITION_ORPHANED,
+            ticker,
+            PositionOrphanedPayload(
+                t212_ticker=ticker,
+                instrument_uid=uid,
+                quantity=str(position.quantity),
+                owner_strategy_id=None if owner is None else owner.strategy_id,
+                owner_version=None if owner is None else owner.version,
+                owner_intent_id=None if owner is None else owner.intent_id,
+                reason=reason,
+                action_taken=action_taken,
+                intent_id=intent_id,
+            ),
+            actor=Actor.SYSTEM,
+            run_id=self.run_id,
+        )
+
     def _protect(
         self,
         *,
+        funded: FundedStrategy,
         ticker: str,
         uid: str,
         quantity: Decimal,
@@ -420,6 +696,7 @@ class TradingLoop:
                 position=PositionState(instrument_uid=uid, quantity=quantity, entry_at=at),
                 regime=None,
                 ticker=ticker,
+                notional_ccy=funded.notional_ccy,
             ),
             run_id=self.run_id,
         )
@@ -471,6 +748,7 @@ class TradingLoop:
         *,
         decision: Decision,
         decision_id: str,
+        funded: FundedStrategy,
         ticker: str,
         uid: str,
         at: datetime,
@@ -497,7 +775,14 @@ class TradingLoop:
                 strategy_id=decision.strategy_id,
             )
         return self.risk.evaluate(
-            self._context(request=request, at=at, position=position, regime=regime, ticker=ticker),
+            self._context(
+                request=request,
+                at=at,
+                position=position,
+                regime=regime,
+                ticker=ticker,
+                notional_ccy=funded.notional_ccy,
+            ),
             run_id=self.run_id,
         )
 
@@ -509,6 +794,7 @@ class TradingLoop:
         position: PositionState,
         regime: RegimeReading | None,
         ticker: str,
+        notional_ccy: Decimal | None,
     ) -> RiskContext:
         """Build the snapshot every rule reads, once per decision.
 
@@ -551,6 +837,12 @@ class TradingLoop:
             minutes_until_close=until_close,
             min_trade_quantity=instrument.min_trade_quantity if instrument else None,
             max_open_quantity=instrument.max_open_quantity if instrument else None,
+            # What the ladder and the allocator gave this strategy. Passed
+            # through rather than applied here, so the allocation appears as a
+            # verdict row beside every other cap — "why is this position small"
+            # is then answerable from the same place as "why was this order
+            # refused".
+            strategy_notional_ccy=notional_ccy,
             extra={
                 # The ISIN comes from the broker's cached instrument record in
                 # the ledger, not from the live instrument list: `/instruments`

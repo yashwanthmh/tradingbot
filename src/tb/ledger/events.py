@@ -187,6 +187,21 @@ class EventType(StrEnum):
     ALLOCATION_DECIDED = "allocation.decided"
     STRATEGY_REVIEWED = "strategy.reviewed"
 
+    # --- funding the live loop (M5b) ---
+    #
+    # What a run was actually trading. Not answerable from the decisions alone:
+    # a funded strategy that signalled nothing leaves no rows for the
+    # instruments it declined, and an excluded one leaves none at all — so
+    # "four were promoted and all four were out of budget" would otherwise look
+    # identical to "nothing was ever promoted".
+    BOOK_FUNDED = "book.funded"
+    # A held position no funded strategy will ever close, and what was done
+    # about it. Its own type rather than a note on the flattening order,
+    # because the *detection* is the fact worth querying: a strategy retired
+    # while holding is how a position ends up unmanaged, and the count of
+    # these is how you notice it happening regularly.
+    POSITION_ORPHANED = "position.orphaned"
+
 
 class EventPayload(BaseModel):
     """Base for every payload.
@@ -1234,6 +1249,53 @@ class StrategyReviewedPayload(EventPayload):
 
 
 # --------------------------------------------------------------------------
+# Funding the live loop
+# --------------------------------------------------------------------------
+
+
+class BookFundedPayload(EventPayload):
+    """The strategies a run will trade, with the size each may deploy.
+
+    `excluded` is on the payload for the same reason the gate records its
+    failures: a run that traded nothing because four promoted strategies were
+    all out of lineage budget is a different fact from a run that traded nothing
+    because nothing was ever promoted, and only one of them is a reason to look
+    at the searcher.
+    """
+
+    run_id: str
+    as_of_utc: str
+    source: str = "registry"
+    n_funded: int
+    n_excluded: int = 0
+    equity_ccy: str | None = None
+    entries: list[dict[str, Any]] = Field(default_factory=list)
+    excluded: list[dict[str, str]] = Field(default_factory=list)
+    detail: str = ""
+
+
+class PositionOrphanedPayload(EventPayload):
+    """A held position no funded strategy will close, and what was done.
+
+    `owner_strategy_id` is optional and its absence is meaningful: a position
+    whose owner is known but retired is the bot's own, while one that cannot be
+    attributed at all came from somewhere this lineage does not cover. The
+    action taken is recorded either way, because flattening a position is not a
+    thing to have to infer from a later order.
+    """
+
+    t212_ticker: str
+    instrument_uid: str | None = None
+    quantity: str
+    owner_strategy_id: str | None = None
+    owner_version: int | None = None
+    owner_intent_id: str | None = None
+    reason: str
+    action_taken: str
+    intent_id: str | None = None
+
+
+# --------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------
 
@@ -1302,6 +1364,9 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.LADDER_MOVED: LadderMovePayload,
     EventType.ALLOCATION_DECIDED: AllocationPayload,
     EventType.STRATEGY_REVIEWED: StrategyReviewedPayload,
+    # M5b
+    EventType.BOOK_FUNDED: BookFundedPayload,
+    EventType.POSITION_ORPHANED: PositionOrphanedPayload,
 }
 
 # The default aggregate each event type is filed under, so callers do not have
@@ -1384,6 +1449,11 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     EventType.LADDER_MOVED: AggregateType.STRATEGY,
     EventType.ALLOCATION_DECIDED: AggregateType.RUN,
     EventType.STRATEGY_REVIEWED: AggregateType.STRATEGY,
+    # M5b. The book is a fact about the run: the same strategies funded under a
+    # different allocation are a different run's book, and filing it under one
+    # of the strategies would hide the ones that were excluded.
+    EventType.BOOK_FUNDED: AggregateType.RUN,
+    EventType.POSITION_ORPHANED: AggregateType.POSITION,
 }
 
 

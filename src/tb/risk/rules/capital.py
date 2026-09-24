@@ -337,3 +337,81 @@ class BrokerQuantityRule:
             observed_value=quantity,
             limit_value=minimum,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyAllocationRule:
+    """No position larger than what the allocator and the ladder gave this strategy.
+
+    A sizing rule, and the one that makes M5 bind on real orders. The ladder's
+    rung and the allocator's weight decide a per-position notional; without
+    this rule they decide it in their own tables and nothing on the order path
+    reads them, so a promotion at rung 0 would open the same position as one at
+    rung 4.
+
+    It lives here rather than in the loop for the reason every other cap does:
+    a cap applied by the caller leaves no verdict row, so "why is this position
+    small" would be answerable only by joining against the allocator's history,
+    while "why was this order refused" is answerable from the decision. One
+    place, one shape.
+
+    **A missing allocation blocks.** For a promoted strategy an absent notional
+    is a wiring error, not an unlimited budget — and the permissive reading of
+    a wiring error is an order sized by nothing at all.
+    """
+
+    name: str = "strategy_allocation"
+
+    def evaluate(self, ctx: RiskContext) -> RuleVerdict:
+        if not ctx.request.is_risk_increasing:
+            # An exit closes the position, whatever the strategy's current
+            # allocation is. A strategy whose allocation fell to zero still
+            # has to be able to get out — that is the asymmetry the whole
+            # system is built around.
+            return RuleVerdict(self.name, Verdict.NOT_APPLICABLE, detail="exit")
+
+        allocated = ctx.strategy_notional_ccy
+        if allocated is None:
+            return RuleVerdict(
+                self.name,
+                Verdict.BLOCK,
+                detail=(
+                    "no allocation was supplied for this strategy. For a promoted "
+                    "strategy that is a wiring error rather than an unlimited budget, "
+                    "and the permissive reading would size an order by nothing at all."
+                ),
+                observed_value="unknown",
+            )
+        if allocated <= 0:
+            return RuleVerdict(
+                self.name,
+                Verdict.BLOCK,
+                detail=(
+                    "the allocator gave this strategy nothing to deploy — its blended "
+                    "edge was non-positive, or its family is at its cap"
+                ),
+                observed_value=allocated,
+                limit_value=allocated,
+            )
+
+        held_ccy = ctx.position_quantity * ctx.request.reference_price
+        headroom = allocated - held_ccy
+        if headroom <= 0:
+            return RuleVerdict(
+                self.name,
+                Verdict.BLOCK,
+                detail=(
+                    f"already holding {held_ccy} of {ctx.request.t212_ticker} against an "
+                    f"allocation of {allocated}"
+                ),
+                observed_value=held_ccy,
+                limit_value=allocated,
+            )
+        return RuleVerdict(
+            self.name,
+            Verdict.PASS,
+            detail=f"{headroom} of {allocated} allocated headroom",
+            observed_value=held_ccy,
+            limit_value=allocated,
+            max_quantity=_quantity_for(headroom, ctx.request.reference_price),
+        )

@@ -235,6 +235,18 @@ class RiskContext:
     # being under the minimum leaves a naked position, so sizing has to know.
     min_trade_quantity: Decimal | None = None
     max_open_quantity: Decimal | None = None
+    # What the allocator and the ladder decided this strategy may deploy per
+    # position, in the account currency.
+    #
+    # It reaches the rules rather than being applied by the loop, so the
+    # allocation appears as a verdict row beside every other cap. A position
+    # sized down by the ladder then says so in the ledger — and "why is this
+    # position small" is answerable from the same place as "why was this order
+    # refused", instead of requiring a join against the allocator's own table.
+    #
+    # `None` means no allocation was supplied, which for a promoted strategy is
+    # a wiring error rather than an unlimited budget: the rule refuses it.
+    strategy_notional_ccy: Decimal | None = None
     extra: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

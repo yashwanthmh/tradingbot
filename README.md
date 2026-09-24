@@ -359,6 +359,45 @@ figure matters as much as the first: a gate that refused everything because
 nothing traded would meet any ceiling while proving nothing, so the suite
 asserts both, and separately that a genuinely good strategy still promotes.
 
+And then the part that makes all of it true of the account rather than only of
+the database — `tb run` trades the **promoted book**:
+
+```bash
+tb run --mode paper                   # every promoted strategy, at its funded size
+tb run --mode paper --strategy trivial  # the hand-written one, for drilling the loop
+```
+
+The loop reads `registry.promoted()`, loads each spec, builds **each strategy's
+own pipeline from its own spec**, and sizes every order at
+`min(allocation, rung notional)` — which reaches the order path as a risk
+verdict row like every other cap, so "why is this position small" is answerable
+from the same place as "why was this order refused". A missing allocation on a
+promoted strategy blocks rather than sizing by nothing: on the order path an
+absent number is a wiring error, not an unlimited budget.
+
+Three consequences worth stating, because each is a thing that can only be got
+wrong once:
+
+**Nothing promoted is a refusal to start, not an idle loop.** A run that
+started with an empty book would write a run record, a heartbeat and a cycle
+saying nothing traded — which is exactly what a correct system looks like on a
+quiet day.
+
+**A position belongs to the strategy whose entry opened it**, resolved by
+joining `order_intents` to `decisions`, because the broker reports a position
+per instrument and knows nothing about strategies. Only the owner is asked about
+it, so two strategies cannot take turns deciding one holding, and an add is
+charged against the allocation that paid for the rest of it. Two strategies
+wanting the same *flat* instrument is resolved by book order — which is sorted
+by identity, so a replay resolves it the same way the live run did.
+
+**A position no funded strategy owns is flattened.** Retiring a strategy while
+it holds is the searcher's normal outcome, and nothing in the book would ever
+produce an exit for what it left behind. An open position with no bracket order
+behind it and nothing managing it is the state this whole design exists to
+avoid, so the loop closes it itself and records which of the two causes it was:
+an owner that is no longer funded, or an entry that cannot be attributed at all.
+
 ## Risk and honest limitations
 
 - **The fee schedule beats most intraday ideas before they start.** See constraint 2 above.
