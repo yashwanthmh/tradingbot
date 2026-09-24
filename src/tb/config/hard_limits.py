@@ -60,6 +60,13 @@ class CapitalLimits(_Section):
     per_position_pct: Percent
     max_positions: int = Field(ge=1, le=100)
     floor_notional_ccy: Money
+    # Long-only means every strategy here is a long-equity beta expression, so
+    # "ten uncorrelated strategies" is a claim that needs measuring rather than
+    # assuming. This caps what one *measured* family may hold, and it binds
+    # tighter than `max_deployed_pct` on purpose: the failure it prevents is
+    # ten strategies discovering the same trade and the portfolio being one
+    # position with ten names on it.
+    max_family_deployed_pct: Percent
 
     @model_validator(mode="after")
     def _check_coherent(self) -> CapitalLimits:
@@ -67,6 +74,19 @@ class CapitalLimits(_Section):
             raise ValueError(
                 f"per_position_pct ({self.per_position_pct}) exceeds max_deployed_pct "
                 f"({self.max_deployed_pct}): a single position could breach the total cap"
+            )
+        if self.max_family_deployed_pct > self.max_deployed_pct:
+            raise ValueError(
+                f"max_family_deployed_pct ({self.max_family_deployed_pct}) exceeds "
+                f"max_deployed_pct ({self.max_deployed_pct}): a family cap looser than "
+                "the total cap constrains nothing, and would read as a control that is "
+                "in force when it is not"
+            )
+        if self.per_position_pct > self.max_family_deployed_pct:
+            raise ValueError(
+                f"per_position_pct ({self.per_position_pct}) exceeds "
+                f"max_family_deployed_pct ({self.max_family_deployed_pct}): one position "
+                "could breach its own family's cap, so the cap could never bind"
             )
         if self.floor_notional_ccy > self.absolute_ceiling_ccy:
             raise ValueError(
@@ -211,12 +231,30 @@ class RegimeLimits(_Section):
 
 
 class PromotionLimits(_Section):
-    """The gate between a generated strategy and real money."""
+    """The gate between a generated strategy and real money.
+
+    With `paper_shadow_sessions: 0` there is nothing after this gate — a
+    strategy that clears it is funded at floor notional without a human
+    looking. The two deflation thresholds are the load-bearing pair, and they
+    are deliberately in different units because they fail in different regimes:
+
+    * `min_oos_deflated_sharpe` is a **Sharpe level**, net of the expected
+      maximum a search of this size would produce from noise alone. It catches
+      a strategy whose edge is real-looking but smaller than the haircut.
+    * `min_deflated_sharpe_probability` is a **probability** that the true
+      Sharpe exceeds that haircut benchmark. It catches a strategy that clears
+      the level on a short sample with fat tails, where the level is positive
+      and the confidence in it is not.
+
+    A strategy has to clear both. Either alone is a number that a long enough
+    search will eventually produce by chance.
+    """
 
     paper_shadow_sessions: int = Field(ge=0)
     paper_shadow_min_trades: int = Field(ge=0)
 
     min_oos_deflated_sharpe: float
+    min_deflated_sharpe_probability: float = Field(gt=0.0, le=1.0)
     max_oos_drawdown_pct: Percent
     min_oos_trades: int = Field(ge=1)
     max_probability_of_backtest_overfitting: float = Field(gt=0.0, le=1.0)
@@ -225,6 +263,18 @@ class PromotionLimits(_Section):
     ratchet_min_days_between_promotions: int = Field(ge=1)
     ratchet_rungs_lost_on_breach: int = Field(ge=1)
     ratchet_max_rung: int = Field(ge=1, le=20)
+
+    @model_validator(mode="after")
+    def _check_coherent(self) -> PromotionLimits:
+        if self.ratchet_rungs_lost_on_breach < 2:
+            raise ValueError(
+                f"ratchet_rungs_lost_on_breach is {self.ratchet_rungs_lost_on_breach}. "
+                "The ladder is asymmetric on purpose: a strategy earns a rung over days "
+                "of holding statistics and loses two on a breach. Losing one would make "
+                "the ladder symmetric, so a strategy oscillating around its threshold "
+                "would sit at its maximum size half the time."
+            )
+        return self
 
 
 class DataLimits(_Section):

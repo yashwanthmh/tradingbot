@@ -139,10 +139,19 @@ def test_unprotected_gap_risk_must_fit_inside_the_daily_budget(
     A 5% position taking the assumed 15% gap loses 0.75% of equity, which is
     fine; a 30% position loses 4.5%, which blows through a 2% daily limit before
     any breaker can fire. The config refuses to express that combination.
+
+    The family cap is raised alongside the position size. It is not incidental
+    tidying: leaving it at its default made the *family* coherence check fire
+    first and this test pass on the wrong error, which is the failure mode
+    where a passing test stops testing anything.
     """
     path = write_limits(
         {
-            "capital": {"per_position_pct": 30.0, "max_deployed_pct": 40.0},
+            "capital": {
+                "per_position_pct": 30.0,
+                "max_deployed_pct": 40.0,
+                "max_family_deployed_pct": 40.0,
+            },
             "execution": {"unprotected_gap_pct_assumption": 15.0},
             "loss": {"daily_halt_pct": 2.0},
         }

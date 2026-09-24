@@ -44,6 +44,24 @@ class LookaheadError(DataError):
     """
 
 
+class HoldoutViolation(LookaheadError):
+    """A research process reached into the sealed holdout.
+
+    A subclass of `LookaheadError` rather than a sibling, because that is what
+    it is: the holdout is data the process that produced a strategy must not
+    have seen, so reading it is looking ahead — just at a coarser granularity
+    than a `.shift(-1)`.
+
+    The distinction from an ordinary lookahead is *who* it damages. A lookahead
+    inside the training window produces a strategy whose backtest is wrong. A
+    lookahead into the holdout produces a strategy whose backtest is wrong *and*
+    whose independent check has been spent, so there is nothing left to catch
+    it with. That is why it is fatal rather than a warning, and why the
+    boundary is enforced here — in the one function every read goes through —
+    rather than by a convention in the research code.
+    """
+
+
 class UnknownValueError(DataError):
     """An `UNKNOWN` value was used as if it were a number or a boolean."""
 
@@ -429,6 +447,16 @@ class ForwardOnlyReader:
     instrument_uids: tuple[str, ...]
     lookback: timedelta | None = None
     include_extended: bool = False
+    # The holdout boundary, when this reader is a *research* reader. Advancing
+    # to it or past it raises rather than returning a shorter window.
+    #
+    # It lives on the reader rather than in the research code because this is
+    # the one function every read goes through, and a boundary enforced beside
+    # the caller is a boundary the next caller forgets. Reading the holdout
+    # while fitting does not merely produce a wrong backtest — it spends the
+    # single independent check that would have caught the wrongness, which is
+    # why it is fatal.
+    sealed_from: datetime | None = None
     _current: datetime | None = None
     _advances: int = 0
 
@@ -449,6 +477,18 @@ class ForwardOnlyReader:
                 f"cannot rewind from {self._current.isoformat()} to "
                 f"{decision_time.isoformat()}. A reader that can revisit an earlier "
                 "moment can fit on data it then predicts."
+            )
+        if self.sealed_from is not None and decision_time >= self.sealed_from:
+            # At the boundary, not merely past it. `available_at <= as_of`
+            # includes a bar available at exactly `as_of`, so a decision *at*
+            # the boundary instant is already the first holdout decision.
+            raise HoldoutViolation(
+                f"cannot advance to {decision_time.isoformat()}: the holdout is sealed "
+                f"from {self.sealed_from.isoformat()}. This reader belongs to a process "
+                "that must not see the holdout, because the holdout is the only "
+                "independent check on what that process produces — reading it does not "
+                "just bias the result, it removes the thing that would have caught the "
+                "bias."
             )
         self._current = decision_time
         self._advances += 1

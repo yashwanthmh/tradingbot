@@ -17,7 +17,7 @@
 #  Changing a value takes effect on the next process start, not mid-run.
 # ============================================================================
 
-schema_version: 3
+schema_version: 4
 
 # Currency of every *_ccy figure below. Asserted against the base currency the
 # broker reports for the account at startup; a mismatch is fatal, because a
@@ -35,6 +35,14 @@ capital:
   max_deployed_pct: 10.0
   per_position_pct: 1.0
   max_positions: 10
+
+  # Long-only means every strategy here is a long-equity beta expression, so
+  # "ten uncorrelated strategies" is a claim to be measured rather than
+  # assumed. Families are discovered from realised position overlap, not
+  # declared, and this caps what one family may hold. Tighter than
+  # max_deployed_pct deliberately: the failure it prevents is ten strategies
+  # finding the same trade and the portfolio quietly being one position.
+  max_family_deployed_pct: 4.0
 
   # Smallest order the bot may place. Newly promoted strategies start here and
   # ratchet up only as realised statistics hold.
@@ -142,7 +150,17 @@ promotion:
 
   # Because there is no shadow period, the backtest gate is the only thing
   # between a noise strategy and real money. These thresholds carry that weight.
+  #
+  # The two deflation numbers are in different units on purpose, and a
+  # strategy must clear both. The first is a Sharpe *level* after subtracting
+  # the best a search of this size would be expected to produce from noise
+  # alone; the second is the *probability* that the true Sharpe beats that
+  # same benchmark. The level misses a strategy that clears it on a short
+  # sample with fat tails; the probability misses one that is confidently
+  # barely-positive. Either alone is a number a long enough search finds by
+  # chance.
   min_oos_deflated_sharpe: 0.5
+  min_deflated_sharpe_probability: 0.95
   max_oos_drawdown_pct: 15.0
   min_oos_trades: 30
   max_probability_of_backtest_overfitting: 0.25

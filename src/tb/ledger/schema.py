@@ -27,7 +27,7 @@ from pathlib import Path
 
 from tb.core.canonical import GENESIS_HASH
 
-LEDGER_SCHEMA_VERSION = 7
+LEDGER_SCHEMA_VERSION = 8
 
 # --------------------------------------------------------------------------
 # Tables
@@ -764,6 +764,195 @@ _TABLES: tuple[str, ...] = (
         source       TEXT    NOT NULL DEFAULT 'broker'
     )
     """,
+    # ----------------------------------------------------------------------
+    # v8 (M5) — the promotion pipeline. With `paper_shadow_sessions: 0` a
+    # strategy goes from this gate straight to real money at floor size, so
+    # these tables carry the weight a shadow period would otherwise carry.
+    # ----------------------------------------------------------------------
+    #
+    # Every trial, and rejections above all. Deflated Sharpe divides out the
+    # multiplicity of the search that produced a candidate, and multiplicity is
+    # measured by counting — so a table holding only the survivors would report
+    # a search of three where a thousand happened, and every deflated number
+    # computed from it would be wrong in the permissive direction.
+    #
+    # `search_id` is stored beside `lineage_id` deliberately. Counting only
+    # within a lineage leaves an evasion open that a searcher would find by
+    # accident: give every candidate its own lineage and each one is a search
+    # of size one, with no haircut at all. The selection universe is the
+    # search, so the gate deflates on the larger of the two counts.
+    """
+    CREATE TABLE IF NOT EXISTS trials (
+        trial_id          TEXT    PRIMARY KEY,
+        search_id         TEXT    NOT NULL,
+        lineage_id        TEXT    NOT NULL,
+        strategy_id       TEXT,
+        strategy_version  INTEGER,
+        spec_hash         TEXT    NOT NULL,
+        author_kind       TEXT    NOT NULL,
+        parent_strategy_id TEXT,
+        generation        INTEGER NOT NULL DEFAULT 0,
+        outcome           TEXT    NOT NULL,
+        rejection_reason  TEXT,
+        backtest_id       TEXT,
+        vintage_id        TEXT,
+        net_sharpe        REAL,
+        net_return_pct    REAL,
+        max_drawdown_pct  REAL,
+        n_trades          INTEGER,
+        cost_drag_bps     REAL,
+        returns_json      TEXT,
+        trials_in_lineage_at_time INTEGER NOT NULL DEFAULT 0,
+        trials_in_search_at_time  INTEGER NOT NULL DEFAULT 0,
+        recorded_at       TEXT    NOT NULL,
+        recording_event_seq INTEGER
+    )
+    """,
+    # The sealed holdout, evaluated once and only once.
+    #
+    # `UNIQUE (strategy_id, version)` is the whole mechanism. A holdout a
+    # strategy may be re-evaluated against is not a holdout — it is a slower
+    # training set, because "failed, tweak, try again" is fitting to it one bit
+    # at a time. The constraint makes the second evaluation raise at the
+    # database rather than be caught by a reviewer noticing.
+    """
+    CREATE TABLE IF NOT EXISTS holdout_evaluations (
+        evaluation_id     TEXT    PRIMARY KEY,
+        strategy_id       TEXT    NOT NULL,
+        version           INTEGER NOT NULL,
+        lineage_id        TEXT    NOT NULL,
+        spec_hash         TEXT    NOT NULL,
+        vintage_id        TEXT    NOT NULL,
+        sealed_from       TEXT    NOT NULL,
+        window_start      TEXT,
+        window_end        TEXT,
+        backtest_id       TEXT,
+        n_trades          INTEGER,
+        net_sharpe        REAL,
+        net_return_pct    REAL,
+        max_drawdown_pct  REAL,
+        cost_drag_bps     REAL,
+        returns_json      TEXT,
+        passed            INTEGER NOT NULL,
+        detail            TEXT,
+        evaluated_at      TEXT    NOT NULL,
+        evaluating_event_seq INTEGER NOT NULL,
+        UNIQUE (strategy_id, version)
+    )
+    """,
+    # One row per promotion decision, carrying every gate's verdict rather than
+    # the first failure. "Refused" and "refused by six independent checks" are
+    # different facts about a candidate, and only the full set distinguishes a
+    # near miss from noise — which is exactly the judgement the search loop
+    # needs when deciding whether a lineage is worth continuing.
+    """
+    CREATE TABLE IF NOT EXISTS promotions (
+        promotion_id      TEXT    PRIMARY KEY,
+        strategy_id       TEXT    NOT NULL,
+        version           INTEGER NOT NULL,
+        lineage_id        TEXT    NOT NULL,
+        spec_hash         TEXT    NOT NULL,
+        decision          TEXT    NOT NULL,
+        n_gates           INTEGER NOT NULL,
+        n_failed          INTEGER NOT NULL,
+        gate_results_json TEXT    NOT NULL,
+        deflated_sharpe   REAL,
+        deflated_sharpe_probability REAL,
+        pbo               REAL,
+        n_trials_deflated_by INTEGER,
+        vintage_id        TEXT,
+        holdout_evaluation_id TEXT,
+        effective_at      TEXT,
+        decided_at        TEXT    NOT NULL,
+        deciding_event_seq INTEGER NOT NULL
+    )
+    """,
+    # Where a strategy stands right now. A projection of the events above, kept
+    # as its own row because the live loop reads it on every cycle and walking
+    # the event log per cycle to answer "may this strategy trade" would put the
+    # chain on the hot path.
+    """
+    CREATE TABLE IF NOT EXISTS strategy_status (
+        strategy_id       TEXT    NOT NULL,
+        version           INTEGER NOT NULL,
+        lineage_id        TEXT    NOT NULL,
+        status            TEXT    NOT NULL,
+        rung              INTEGER NOT NULL DEFAULT 0,
+        rung_changed_at   TEXT,
+        promoted_at       TEXT,
+        retired_at        TEXT,
+        retire_reason     TEXT,
+        realised_pnl_ccy  TEXT    NOT NULL DEFAULT '0',
+        n_realised_trades INTEGER NOT NULL DEFAULT 0,
+        updated_at        TEXT    NOT NULL,
+        PRIMARY KEY (strategy_id, version)
+    )
+    """,
+    # Lifetime loss budgets, per lineage rather than per strategy.
+    #
+    # Per strategy alone is defeated by renaming: a lineage that has lost its
+    # budget produces a child with a fresh one and keeps going, which is the
+    # failure mode an autonomous searcher arrives at without anybody intending
+    # it. The budget is charged against the lineage, so the child inherits the
+    # exhaustion.
+    """
+    CREATE TABLE IF NOT EXISTS lineage_budgets (
+        lineage_id        TEXT    PRIMARY KEY,
+        budget_ccy        TEXT    NOT NULL,
+        consumed_ccy      TEXT    NOT NULL DEFAULT '0',
+        n_strategies      INTEGER NOT NULL DEFAULT 0,
+        exhausted_at      TEXT,
+        opened_at         TEXT    NOT NULL,
+        updated_at        TEXT    NOT NULL
+    )
+    """,
+    # Every rung change, up and down, with the evidence that justified it. The
+    # ratchet is asymmetric by design, and an append-only history is what makes
+    # "it went up three times in a week" a query rather than an impression.
+    """
+    CREATE TABLE IF NOT EXISTS ladder_moves (
+        move_id           TEXT    PRIMARY KEY,
+        strategy_id       TEXT    NOT NULL,
+        version           INTEGER NOT NULL,
+        from_rung         INTEGER NOT NULL,
+        to_rung           INTEGER NOT NULL,
+        direction         TEXT    NOT NULL,
+        reason            TEXT    NOT NULL,
+        n_trades_at_move  INTEGER,
+        days_at_rung      INTEGER,
+        notional_ccy      TEXT,
+        moved_at          TEXT    NOT NULL,
+        moving_event_seq  INTEGER NOT NULL
+    )
+    """,
+    # What the allocator decided and, more usefully, why. `prior_weight`,
+    # `realised_weight` and `shrinkage` are stored separately rather than as a
+    # single blended number, because the blend is the whole judgement: at ten
+    # trades a strategy's realised edge is noise, and a row that recorded only
+    # the result could not show whether the allocator knew that.
+    """
+    CREATE TABLE IF NOT EXISTS allocations (
+        allocation_id     TEXT    PRIMARY KEY,
+        run_id            TEXT,
+        as_of_utc         TEXT    NOT NULL,
+        strategy_id       TEXT    NOT NULL,
+        version           INTEGER NOT NULL,
+        lineage_id        TEXT    NOT NULL,
+        family            TEXT,
+        prior_edge_bps    TEXT,
+        realised_edge_bps TEXT,
+        shrinkage         TEXT    NOT NULL,
+        blended_edge_bps  TEXT,
+        raw_weight        TEXT,
+        weight            TEXT    NOT NULL,
+        rung              INTEGER NOT NULL DEFAULT 0,
+        notional_ccy      TEXT    NOT NULL,
+        n_realised_trades INTEGER NOT NULL DEFAULT 0,
+        correlation_cap_applied INTEGER NOT NULL DEFAULT 0,
+        detail            TEXT,
+        allocating_event_seq INTEGER
+    )
+    """,
 )
 
 # --------------------------------------------------------------------------
@@ -872,6 +1061,22 @@ _INDEXES: tuple[str, ...] = (
     # and the rolling window are looked up on every decision.
     "CREATE INDEX IF NOT EXISTS ix_equity_marks_at ON equity_marks (at_utc)",
     "CREATE INDEX IF NOT EXISTS ix_equity_marks_session ON equity_marks (session_date, at_utc)",
+    # v8 (M5). The first two are the multiplicity counts, read once per
+    # promotion evaluation over every trial ever run — the one query whose
+    # cost grows with the search rather than with the portfolio.
+    "CREATE INDEX IF NOT EXISTS ix_trials_lineage ON trials (lineage_id, recorded_at)",
+    "CREATE INDEX IF NOT EXISTS ix_trials_search ON trials (search_id, recorded_at)",
+    "CREATE INDEX IF NOT EXISTS ix_trials_spec ON trials (spec_hash)",
+    "CREATE INDEX IF NOT EXISTS ix_trials_outcome ON trials (outcome)",
+    "CREATE INDEX IF NOT EXISTS ix_holdout_lineage ON holdout_evaluations (lineage_id)",
+    "CREATE INDEX IF NOT EXISTS ix_promotions_strategy ON promotions (strategy_id, version)",
+    "CREATE INDEX IF NOT EXISTS ix_promotions_lineage ON promotions (lineage_id, decided_at)",
+    "CREATE INDEX IF NOT EXISTS ix_strategy_status_live ON strategy_status (status)",
+    "CREATE INDEX IF NOT EXISTS ix_strategy_status_lineage ON strategy_status (lineage_id)",
+    "CREATE INDEX IF NOT EXISTS ix_ladder_moves_strategy "
+    "ON ladder_moves (strategy_id, version, moved_at)",
+    "CREATE INDEX IF NOT EXISTS ix_allocations_as_of ON allocations (as_of_utc)",
+    "CREATE INDEX IF NOT EXISTS ix_allocations_strategy ON allocations (strategy_id, version)",
 )
 
 

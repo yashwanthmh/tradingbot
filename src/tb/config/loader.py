@@ -35,12 +35,20 @@ ENV_PATH_VAR = "TB_HARD_LIMITS_PATH"
 # The schema versions this build knows how to interpret. A limits file from the
 # future is refused rather than partially understood.
 #
-# Only v3. A v2 file has no `costs` section, and every model here is
-# `extra="forbid"` with required fields, so it could not be loaded anyway —
-# listing 2 would advertise a compatibility this build does not have, and the
-# resulting error would name a missing field rather than the real problem.
-# Whoever upgrades gets told to add the section.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({3})
+# Only v4. Each earlier version is missing fields this build requires — v3 has
+# no `capital.max_family_deployed_pct` and no
+# `promotion.min_deflated_sharpe_probability`, v2 has no `costs` section at all
+# — and every model here is `extra="forbid"` with required fields, so an older
+# file could not be loaded regardless. Listing the older versions would
+# advertise a compatibility this build does not have, and the resulting error
+# would name a missing field rather than the real problem. Whoever upgrades
+# gets told which version they are on and which one is wanted.
+#
+# The new v4 fields are both *tightenings*: a family cap below the total
+# deployed cap, and a second deflation threshold a candidate must also clear.
+# Defaulting them would have let an un-upgraded file silently run without
+# either control, which is the one direction a missing limit must never fail.
+SUPPORTED_SCHEMA_VERSIONS = frozenset({4})
 
 
 @dataclass(frozen=True, slots=True)

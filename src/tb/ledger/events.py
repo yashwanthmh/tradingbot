@@ -159,6 +159,34 @@ class EventType(StrEnum):
     INSTANCE_LOCK_RELEASED = "instance.lock_released"
     LOOP_CYCLE_COMPLETED = "loop.cycle_completed"
 
+    # --- the promotion pipeline (M5) ---
+    #
+    # A trial is recorded whether it was evaluated, rejected before evaluation
+    # or errored. The rejections are the load-bearing ones: deflated Sharpe
+    # divides out the multiplicity of the search, and multiplicity is a count
+    # of everything tried, not of what survived.
+    TRIAL_RECORDED = "trial.recorded"
+    # One per search session, carrying the totals. Separate from the per-trial
+    # events so "how big was the search that produced this" is answerable
+    # without scanning every trial in it.
+    SEARCH_COMPLETED = "search.completed"
+    # The sealed holdout, evaluated once. A second evaluation of the same
+    # version is refused by a uniqueness constraint, so this event appearing
+    # twice for one version is impossible rather than merely unexpected.
+    HOLDOUT_EVALUATED = "holdout.evaluated"
+    HOLDOUT_VIOLATION_ATTEMPTED = "holdout.violation_attempted"
+    # Every promotion decision, refusals included and with every gate's
+    # verdict attached. With no paper-shadow period this event is the moment a
+    # generated strategy becomes eligible for real money.
+    PROMOTION_EVALUATED = "promotion.evaluated"
+    STRATEGY_RETIRED = "strategy.retired"
+    LINEAGE_BUDGET_EXHAUSTED = "lineage.budget_exhausted"
+    # Rung changes, up and down. Up is slow and needs evidence; down is fast
+    # and needs almost none, which is the asymmetry the ladder exists for.
+    LADDER_MOVED = "ladder.moved"
+    ALLOCATION_DECIDED = "allocation.decided"
+    STRATEGY_REVIEWED = "strategy.reviewed"
+
 
 class EventPayload(BaseModel):
     """Base for every payload.
@@ -1000,6 +1028,212 @@ class CalibrationPayload(EventPayload):
 
 
 # --------------------------------------------------------------------------
+# The promotion pipeline (M5)
+# --------------------------------------------------------------------------
+
+
+class TrialPayload(EventPayload):
+    """One candidate evaluated, or refused before evaluation.
+
+    Both counts are carried because each closes a different hole. The lineage
+    count is the obvious one. The *search* count is the one that matters more:
+    a searcher that gives every candidate its own lineage makes each one a
+    search of size one and takes no multiplicity haircut at all — not by
+    cheating, just by naming things. Recording both at the moment of the trial
+    means the count cannot be recomputed later against a table that has grown.
+    """
+
+    trial_id: str
+    search_id: str
+    lineage_id: str
+    spec_hash: str
+    author_kind: str
+    outcome: str
+    strategy_id: str | None = None
+    strategy_version: int | None = None
+    parent_strategy_id: str | None = None
+    generation: int = 0
+    rejection_reason: str | None = None
+    backtest_id: str | None = None
+    vintage_id: str | None = None
+    net_sharpe: float | None = None
+    n_trades: int | None = None
+    trials_in_lineage_at_time: int = 0
+    trials_in_search_at_time: int = 0
+
+
+class SearchCompletedPayload(EventPayload):
+    """The totals for one search session.
+
+    `n_proposed` against `n_promoted` is the number that says whether the gate
+    is doing its job. A search that promotes a tenth of what it proposes has
+    either found a market inefficiency or a bug in this repo, and the second is
+    overwhelmingly more likely.
+    """
+
+    search_id: str
+    lineage_ids: list[str] = Field(default_factory=list)
+    n_proposed: int
+    n_evaluated: int
+    n_rejected: int
+    n_errored: int = 0
+    n_passed_gate: int = 0
+    duration_seconds: float | None = None
+    detail: str = ""
+
+
+class HoldoutEvaluatedPayload(EventPayload):
+    """The sealed holdout, evaluated — once.
+
+    `sealed_from` is recorded on the event rather than looked up later, because
+    the seal is the claim being made: that no part of the process that produced
+    this strategy could see data past this instant. A boundary read back from
+    current config would be a boundary that moved.
+    """
+
+    evaluation_id: str
+    strategy_id: str
+    version: int
+    lineage_id: str
+    spec_hash: str
+    vintage_id: str
+    sealed_from: str
+    passed: bool
+    n_trades: int | None = None
+    net_sharpe: float | None = None
+    net_return_pct: float | None = None
+    max_drawdown_pct: float | None = None
+    detail: str = ""
+
+
+class HoldoutViolationPayload(EventPayload):
+    """Something asked for data past the seal.
+
+    Recorded rather than only raised. A raise stops one process; the event is
+    what makes a *pattern* of attempts visible, and a searcher repeatedly
+    reaching past the boundary is a finding about the searcher rather than an
+    accident.
+    """
+
+    strategy_id: str | None = None
+    lineage_id: str | None = None
+    sealed_from: str
+    requested_at: str
+    caller: str = ""
+    detail: str = ""
+
+
+class PromotionPayload(EventPayload):
+    """A promotion decision, with every gate's verdict.
+
+    `gate_results` holds one entry per gate including the ones that passed. A
+    record of only the failures cannot distinguish "refused by one gate at 99%
+    of its threshold" from "refused by six", and those call for opposite
+    responses from the search loop.
+    """
+
+    promotion_id: str
+    strategy_id: str
+    version: int
+    lineage_id: str
+    spec_hash: str
+    decision: str
+    n_gates: int
+    n_failed: int
+    gate_results: list[dict[str, Any]] = Field(default_factory=list)
+    deflated_sharpe: float | None = None
+    deflated_sharpe_probability: float | None = None
+    pbo: float | None = None
+    n_trials_deflated_by: int | None = None
+    vintage_id: str | None = None
+    holdout_evaluation_id: str | None = None
+    effective_at: str | None = None
+
+
+class StrategyRetiredPayload(EventPayload):
+    """A strategy stopped trading, and why.
+
+    Retirement is cheap on purpose. KILL requires little evidence and SCALE
+    requires a lot, because at ten trades a month the cost of retiring a good
+    strategy is a missed opportunity and the cost of keeping a bad one is money.
+    """
+
+    strategy_id: str
+    version: int
+    lineage_id: str
+    reason: str
+    realised_pnl_ccy: str | None = None
+    n_realised_trades: int = 0
+    detail: str = ""
+
+
+class LineageBudgetPayload(EventPayload):
+    """A lineage's lifetime loss budget is spent.
+
+    Blocks the lineage, not the strategy. A per-strategy budget is defeated by
+    producing a child, which is what an autonomous searcher does by default
+    rather than by intent.
+    """
+
+    lineage_id: str
+    budget_ccy: str
+    consumed_ccy: str
+    n_strategies: int
+    triggering_strategy_id: str | None = None
+    detail: str = ""
+
+
+class LadderMovePayload(EventPayload):
+    """A size rung change, up or down."""
+
+    move_id: str
+    strategy_id: str
+    version: int
+    from_rung: int
+    to_rung: int
+    direction: str
+    reason: str
+    n_trades_at_move: int | None = None
+    days_at_rung: int | None = None
+    notional_ccy: str | None = None
+
+
+class AllocationPayload(EventPayload):
+    """What the allocator gave a strategy, and the blend behind it.
+
+    The shrinkage weight is on the event because it is the claim being made
+    about how much the realised record is worth believing. At floor size with
+    multi-day holds a strategy produces 10-20 trades a month, and a number
+    derived mostly from the prior should say so rather than presenting itself
+    as a measurement.
+    """
+
+    allocation_id: str
+    as_of_utc: str
+    run_id: str | None = None
+    n_strategies: int
+    total_notional_ccy: str
+    entries: list[dict[str, Any]] = Field(default_factory=list)
+    n_correlation_capped: int = 0
+    detail: str = ""
+
+
+class StrategyReviewedPayload(EventPayload):
+    """KEEP / KILL / ITERATE / SCALE, with the evidence behind the verdict."""
+
+    strategy_id: str
+    version: int
+    lineage_id: str
+    verdict: str
+    n_realised_trades: int
+    realised_pnl_ccy: str | None = None
+    realised_edge_bps: str | None = None
+    declared_edge_bps: str | None = None
+    evidence_sufficient: bool = False
+    reasons: list[str] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------
 
@@ -1058,6 +1292,16 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.INSTANCE_LOCK_REFUSED: InstanceLockPayload,
     EventType.INSTANCE_LOCK_RELEASED: InstanceLockPayload,
     EventType.LOOP_CYCLE_COMPLETED: LoopCyclePayload,
+    EventType.TRIAL_RECORDED: TrialPayload,
+    EventType.SEARCH_COMPLETED: SearchCompletedPayload,
+    EventType.HOLDOUT_EVALUATED: HoldoutEvaluatedPayload,
+    EventType.HOLDOUT_VIOLATION_ATTEMPTED: HoldoutViolationPayload,
+    EventType.PROMOTION_EVALUATED: PromotionPayload,
+    EventType.STRATEGY_RETIRED: StrategyRetiredPayload,
+    EventType.LINEAGE_BUDGET_EXHAUSTED: LineageBudgetPayload,
+    EventType.LADDER_MOVED: LadderMovePayload,
+    EventType.ALLOCATION_DECIDED: AllocationPayload,
+    EventType.STRATEGY_REVIEWED: StrategyReviewedPayload,
 }
 
 # The default aggregate each event type is filed under, so callers do not have
@@ -1122,6 +1366,24 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     EventType.INSTANCE_LOCK_REFUSED: AggregateType.SAFETY,
     EventType.INSTANCE_LOCK_RELEASED: AggregateType.SAFETY,
     EventType.LOOP_CYCLE_COMPLETED: AggregateType.RUN,
+    # M5. A trial and a search are facts about the *search* rather than about
+    # any one strategy — filing a rejected candidate under STRATEGY would
+    # create an aggregate per discarded idea, which is the opposite of what an
+    # aggregate is for. Everything downstream of the gate is about a strategy.
+    EventType.TRIAL_RECORDED: AggregateType.RUN,
+    EventType.SEARCH_COMPLETED: AggregateType.RUN,
+    EventType.HOLDOUT_EVALUATED: AggregateType.STRATEGY,
+    # Filed under SAFETY rather than STRATEGY: an attempt to read past the
+    # seal is a fault in the process, and it is the kind of thing an operator
+    # should find by filtering for safety events rather than by knowing which
+    # strategy to look under.
+    EventType.HOLDOUT_VIOLATION_ATTEMPTED: AggregateType.SAFETY,
+    EventType.PROMOTION_EVALUATED: AggregateType.STRATEGY,
+    EventType.STRATEGY_RETIRED: AggregateType.STRATEGY,
+    EventType.LINEAGE_BUDGET_EXHAUSTED: AggregateType.STRATEGY,
+    EventType.LADDER_MOVED: AggregateType.STRATEGY,
+    EventType.ALLOCATION_DECIDED: AggregateType.RUN,
+    EventType.STRATEGY_REVIEWED: AggregateType.STRATEGY,
 }
 
 
