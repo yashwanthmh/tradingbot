@@ -33,6 +33,7 @@ make the same promotion decision produce different numbers on a re-read.
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -54,6 +55,14 @@ from tb.registry.models import AuthorKind, TrialOutcome
 # a longer series changes a cross-validated answer, and small enough that a
 # thousand-trial search stores tens of megabytes rather than gigabytes.
 MAX_STORED_RETURNS = 2_000
+
+# How many trials the PBO matrix may be built from.
+#
+# CSCV costs `combinations x columns x periods` arithmetic in pure Python, so a
+# thousand-trial search takes minutes rather than seconds — a real constraint on
+# the pipeline, not only on its tests. 64 columns over 70 combinations is a few
+# seconds and gives an estimate precise enough for a threshold of 0.25.
+MAX_PBO_TRIALS = 64
 
 
 class TrialError(TbError):
@@ -467,21 +476,40 @@ def multiplicity_of(trial: Trial, peers: Sequence[Trial]) -> Multiplicity:
     )
 
 
-def returns_matrix(trials: Sequence[Trial]) -> tuple[tuple[float, ...], ...]:
-    """The trials' return series, truncated to their common length.
+def returns_matrix(
+    trials: Sequence[Trial],
+    *,
+    max_trials: int = MAX_PBO_TRIALS,
+    seed: int = 0,
+) -> tuple[tuple[float, ...], ...]:
+    """The trials' return series as period rows, ready for cross-validation.
 
-    Columns are trials and rows are periods, which is the orientation PBO's
-    cross-validation wants. Truncated to the shortest series rather than padded:
-    padding with zeros would invent flat periods, and a flat period lowers
-    dispersion and raises every Sharpe in the matrix.
+    Rows are periods and each row holds one value per trial, which is the
+    orientation PBO wants: it partitions *time* and compares across trials.
+
+    **Truncated to the shortest series, never padded.** Padding with zeros
+    would invent flat periods, and a flat period lowers dispersion and raises
+    every Sharpe in the matrix.
+
+    **Capped at `max_trials` columns, by a seeded random sample.** CSCV costs
+    `combinations x columns x periods` in Python, so a thousand-trial search
+    would take minutes — in the real pipeline as much as in a test. The sample
+    is random rather than the top-N by Sharpe: taking the best would change
+    what the statistic measures, since CSCV asks whether the in-sample winner
+    of a candidate set holds up, and a set containing only winners has a
+    different answer. A smaller sample makes the estimate noisier without
+    moving its expectation.
     """
     series = [t.returns for t in trials if t.returns]
     if not series:
         return ()
+    if len(series) > max_trials:
+        series = random.Random(seed).sample(series, max_trials)  # noqa: S311
     length = min(len(s) for s in series)
     if length == 0:
         return ()
-    return tuple(tuple(s[-length:]) for s in series)
+    columns = [s[-length:] for s in series]
+    return tuple(tuple(column[row] for column in columns) for row in range(length))
 
 
 def _stdev(values: Sequence[float]) -> float | None:

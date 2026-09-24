@@ -126,8 +126,8 @@ data*, then *can I reconcile broker state*, then *is there any edge after costs*
 | M1 | Broker adapter (read-only), rate governor, reconciler, symbol map | **done** |
 | M2 | Point-in-time data layer, provider bake-off | **done** |
 | M3 | Cost model, non-cheating backtester, strategy DSL | **done** |
-| M4 | Risk engine, live loop, crash drills | |
-| M5 | Registry, promotion gate, capital allocator | |
+| M4 | Risk engine, live loop, crash drills | **done** |
+| M5 | Registry, promotion gate, capital allocator | **done** |
 | M6 | Self-strategising search (LLM optional) | |
 | M7 | ML signal layer | |
 | M8 | Live at floor size, dashboard, daily journal | |
@@ -314,6 +314,51 @@ Strategy specs are validated data, never code. A test walks the AST of
 exists anywhere in the interpretation path — features are selected from a fixed
 library table by name, which is what makes interpreting generated specs safe.
 
+Then the pipeline that decides whether a strategy gets money:
+
+```bash
+tb registry register spec.json   # a candidate, and nothing more
+tb research holdout <id> <vint>  # spend its one out-of-sample evaluation
+tb promote evaluate <id>         # every gate: pass/fail, observed, threshold
+tb allocator explain             # the prior/realised shrinkage behind each size
+tb registry review               # KEEP / KILL / ITERATE / SCALE on the live book
+tb research null-gate            # re-measure the false-promotion rate
+```
+
+`paper_shadow_sessions` is 0, so a strategy that clears `tb promote evaluate`
+is funded at floor notional with no human approval. Four things carry that
+weight:
+
+**The gate runs every check and does not short-circuit.** "Refused by one check
+at 99% of its threshold" and "refused by six" call for opposite responses from
+a search loop, and a gate that stopped at the first could not tell them apart.
+An unmeasurable input — a deflated probability on too short a sample, PBO on
+too few trials, a feed-noise figure with no bake-off — **refuses**, because
+otherwise a candidate clears the gate by arranging for a computation to fail,
+which is easier than clearing it on merit.
+
+**The holdout is enforced by the data layer and spent once.** A research
+process gets a `BarSource` holding no bar past the boundary and a reader that
+raises rather than returning a short window, and `UNIQUE(strategy_id, version)`
+makes a second evaluation impossible rather than discouraged. A holdout that
+can be re-evaluated is a slower training set: "failed, tweak, resubmit" fits it
+one bit per attempt.
+
+**Multiplicity is counted over the whole search, not the lineage.** Deflated
+Sharpe divides out the best result a search of N trials would produce from
+noise, so N has to be honest. Every trial is logged including rejections and
+errors, and the count is stamped when the trial happens — a searcher that gave
+each candidate its own lineage would otherwise face no haircut at all.
+
+**The release gate is a number, not a claim.** `tb research null-gate` — and a
+test that runs the same function over 1,000 specs — draws random specs from the
+real grammar, backtests them on a random walk with zero drift, and counts how
+many the gate promotes. The result is 0 of 1,000 against a 1% ceiling, with 477
+candidates reaching the statistical checks with measured numbers. That second
+figure matters as much as the first: a gate that refused everything because
+nothing traded would meet any ceiling while proving nothing, so the suite
+asserts both, and separately that a genuinely good strategy still promotes.
+
 ## Risk and honest limitations
 
 - **The fee schedule beats most intraday ideas before they start.** See constraint 2 above.
@@ -332,5 +377,13 @@ library table by name, which is what makes interpreting generated specs safe.
 - **The unprotected window is real.** With no bracket orders, an entry fill always precedes
   its protective stop. Position size is capped so a gap across that window is survivable
   inside the daily loss budget; the config validator refuses limits where it is not.
+- **The size of a search decides what edge it can prove.** The multiplicity haircut is the
+  best Sharpe a search of N trials would produce from noise alone, so it grows with N: at a
+  trial dispersion of 1.0 it is about 1.6 Sharpe for a search of ten and about 3.3 for a
+  search of a thousand. An out-of-sample Sharpe of 3.0 — an excellent real result — is
+  therefore promotable out of a focused search and is not out of a thousand-spec sweep. That
+  is the arithmetic working rather than a threshold to loosen, and its consequence for M6 is
+  concrete: many small searches, with the trial count spent as a budget. See
+  `docs/decisions/0002-search-size-and-provable-edge.md`.
 - **Backtest results are not predictions**, and a strategy that cleared a gate is a strategy
   that cleared a gate.

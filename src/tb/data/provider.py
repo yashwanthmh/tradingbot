@@ -427,12 +427,25 @@ class Bar:
         }
 
     @property
-    def identity(self) -> tuple[str, str, str, str]:
-        """What makes two bars the same bar, ignoring vintage."""
+    def identity(self) -> tuple[str, Resolution, datetime, str]:
+        """What makes two bars the same bar, ignoring vintage.
+
+        A dict key, never a serialised value — so the members are the objects
+        themselves rather than their string forms. That is not a micro-
+        optimisation: this is called once per visible bar per decision, so a
+        backtest over N bars calls it O(N^2) times, and the previous version's
+        `isoformat()` was 25% of the entire runtime of a backtest. Profiling one
+        null-population run showed 3.8 million calls to it.
+
+        Two aware datetimes for the same instant compare equal and hash equal
+        whatever their offsets, so dropping the explicit `astimezone(UTC)`
+        changes no answer — a bar timestamped in New York and the same bar
+        timestamped in UTC still collapse to one.
+        """
         return (
             self.instrument_uid,
-            self.resolution.value,
-            self.bar_open_utc.astimezone(UTC).isoformat(),
+            self.resolution,
+            self.bar_open_utc,
             self.provider,
         )
 
@@ -684,11 +697,12 @@ def dedupe_latest(bars: Iterable[Bar]) -> tuple[Bar, ...]:
     discards the pre-revision value, which is precisely the value an as-of query
     over an earlier instant needs to return; see `dedupe_vintages`.
     """
-    latest: dict[tuple[str, str, str, str], Bar] = {}
+    latest: dict[tuple[str, Resolution, datetime, str], Bar] = {}
     for bar in bars:
-        existing = latest.get(bar.identity)
+        key = bar.identity
+        existing = latest.get(key)
         if existing is None or bar.ingested_at_utc >= existing.ingested_at_utc:
-            latest[bar.identity] = bar
+            latest[key] = bar
     return tuple(sorted(latest.values(), key=lambda b: b.bar_open_utc))
 
 
@@ -701,8 +715,8 @@ def dedupe_vintages(bars: Iterable[Bar]) -> tuple[Bar, ...]:
     answer "what did this bar say at the time" rather than only "what does the
     vendor say now".
     """
-    seen: dict[tuple[str, str, str, str, str], Bar] = {}
+    seen: dict[tuple[str, Resolution, datetime, str, datetime], Bar] = {}
     for bar in bars:
-        key = (*bar.identity, bar.ingested_at_utc.astimezone(UTC).isoformat())
+        key = (*bar.identity, bar.ingested_at_utc)
         seen.setdefault(key, bar)
     return tuple(sorted(seen.values(), key=lambda b: (b.bar_open_utc, b.ingested_at_utc)))

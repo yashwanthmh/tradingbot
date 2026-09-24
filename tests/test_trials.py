@@ -349,11 +349,42 @@ def test_the_returns_matrix_truncates_rather_than_pads() -> None:
         ),
     ]
     matrix = returns_matrix(trials)
-    assert matrix == ((0.3, 0.4), (0.5, 0.6))
+    # Period-major: one row per period, one value per trial in each row. The
+    # first draft returned this transposed, which PBO would have read as two
+    # periods and four trials — treating time as trials and trials as time.
+    assert matrix == ((0.3, 0.5), (0.4, 0.6))
+    assert len(matrix) == 2, "two common periods"
+    assert len(matrix[0]) == 2, "two trials"
 
 
 def test_the_returns_matrix_is_empty_when_nothing_has_returns() -> None:
     assert returns_matrix([a_trial()]) == ()
+
+
+def test_the_returns_matrix_is_capped_by_a_seeded_sample() -> None:
+    """CSCV costs combinations x columns x periods in pure Python, so a
+    thousand-trial search takes minutes — in the pipeline, not only in a test.
+    The sample is random rather than the best N, because a candidate set
+    containing only winners answers a different question."""
+    many = [
+        Trial(
+            trial_id=f"t{index}",
+            search_id="s",
+            lineage_id="l",
+            spec_hash=f"h{index}",
+            author_kind=AuthorKind.SEARCH,
+            outcome=TrialOutcome.EVALUATED,
+            recorded_at=AS_OF,
+            returns=(0.01 * index, 0.02 * index, 0.03 * index),
+        )
+        for index in range(1, 200)
+    ]
+    matrix = returns_matrix(many, max_trials=16, seed=5)
+    assert len(matrix) == 3
+    assert len(matrix[0]) == 16
+    # Deterministic given the seed, so a failure is reproducible.
+    assert returns_matrix(many, max_trials=16, seed=5) == matrix
+    assert returns_matrix(many, max_trials=16, seed=6) != matrix
 
 
 # --------------------------------------------------------------------------

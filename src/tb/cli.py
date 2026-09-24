@@ -75,6 +75,17 @@ from tb.cli_engine import watchdog as _watchdog_command  # noqa: E402
 app.command("run")(_run_command)
 app.command("watchdog")(_watchdog_command)
 
+# M5: the registry, the promotion gate and the allocator. `promote` is its own
+# group rather than a bare command because the gate has two useful verbs —
+# evaluate it, and read back what it decided before.
+from tb.cli_registry import allocator_app, promote_app, registry_app  # noqa: E402
+from tb.cli_research import research_app  # noqa: E402
+
+app.add_typer(registry_app, name="registry")
+app.add_typer(promote_app, name="promote")
+app.add_typer(allocator_app, name="allocator")
+app.add_typer(research_app, name="research")
+
 
 @app.command("reconcile")
 def reconcile(

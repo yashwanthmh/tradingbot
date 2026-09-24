@@ -355,3 +355,137 @@ jobs:
             uv run tb run --mode demo --cycles 1 2>&1 | tail -5
             exit 1
           fi
+
+      - name: 1,000 random specs promote at or below the ceiling
+        run: |
+          # The release gate. With paper_shadow_sessions at 0, this rate is the
+          # number of noise strategies that reach real money — so it is a named
+          # CI step rather than only a test in the suite, and the three parts
+          # are asserted together: the ceiling, that the population actually
+          # reached the statistical checks, and that the refusals were
+          # statistical rather than procedural. A ceiling met by a gate that
+          # refuses everything is not a gate.
+          uv run pytest tests/test_release_gate.py -q
+
+      - name: A strategy cannot be promoted without passing the gate
+        env:
+          TB_VAR_DIR: var-m5
+        run: |
+          # `PROMOTED` is written in exactly one place. This registers a spec
+          # and asserts it is a candidate that may not trade, so a refactor
+          # that promoted on registration fails here rather than in production.
+          uv run tb init
+          cat > /tmp/spec.json <<'JSON'
+          {
+            "name": "ci-sma-cross",
+            "entry": {"kind": "compare", "op": "gt",
+                      "left": {"kind": "feature", "name": "sma", "lookback": 20},
+                      "right": {"kind": "feature", "name": "sma", "lookback": 100}},
+            "exit": {"kind": "compare", "op": "lt",
+                     "left": {"kind": "feature", "name": "sma", "lookback": 20},
+                     "right": {"kind": "feature", "name": "sma", "lookback": 100}},
+            "expected_edge_bps": "300",
+            "min_holding_minutes": 1440
+          }
+          JSON
+          # Output goes to a file and the file is grepped, rather than piping
+          # into `grep -q`. `grep -q` exits on its first match and SIGPIPEs the
+          # producer, so under `set -o pipefail` the step fails with the
+          # assertion satisfied — a trap worth avoiding even though this
+          # workflow's default shell does not set pipefail. The file also lets
+          # the step print what it saw when an assertion does fail.
+          uv run tb registry register /tmp/spec.json > /tmp/register.txt 2>&1
+          grep -q "status candidate" /tmp/register.txt || {
+            echo "::error::registration did not produce a candidate"
+            cat /tmp/register.txt
+            exit 1
+          }
+          uv run tb registry list > /tmp/list.txt 2>&1
+          STRATEGY=$(grep -o 'stg_[0-9a-f]*' /tmp/list.txt | head -1)
+          test -n "$STRATEGY" || {
+            echo "::error::no strategy id in tb registry list"
+            cat /tmp/list.txt
+            exit 1
+          }
+          # A fresh candidate has no holdout, no calibration and no vintage, so
+          # the gate must refuse — and exit 1, because a refusal is a finding.
+          if uv run tb promote evaluate "$STRATEGY" --apply > /tmp/promote.txt 2>&1; then
+            echo "::error::tb promote evaluate promoted a candidate with no evidence at all"
+            cat /tmp/promote.txt
+            exit 1
+          fi
+          # Every gate reported, not only the failures: that distinction is what
+          # tells a searcher whether a lineage is worth continuing.
+          for GATE in sealed_vintage engine_calibrated sealed_holdout deflated_sharpe \
+                      deflated_probability pbo cost_to_edge holding_period lineage_budget; do
+            grep -q "$GATE" /tmp/promote.txt || {
+              echo "::error::$GATE was not reported by tb promote evaluate"
+              cat /tmp/promote.txt
+              exit 1
+            }
+          done
+          uv run tb registry list > /tmp/list2.txt 2>&1
+          grep -q "candidate" /tmp/list2.txt || {
+            echo "::error::a refused candidate did not stay a candidate"
+            cat /tmp/list2.txt
+            exit 1
+          }
+          echo "refused as expected, every gate reported, and still a candidate"
+
+      - name: The holdout cannot be evaluated twice
+        env:
+          TB_VAR_DIR: var-m5
+        run: |
+          # UNIQUE(strategy_id, version) is the whole mechanism. A holdout that
+          # can be re-evaluated is a slower training set, because "failed,
+          # tweak, resubmit" fits it one bit per attempt.
+          STRATEGY=$(uv run tb registry list 2>&1 | grep -o 'stg_[0-9a-f]*' | head -1)
+          uv run python - "$STRATEGY" <<'PY'
+          import sys
+          from datetime import UTC, datetime
+          from tb.config.loader import load_hard_limits
+          from tb.ledger.store import Ledger, default_ledger_path
+          from tb.registry.lineage import SpecRegistry
+          from tb.research.holdout import HoldoutAlreadyEvaluated, HoldoutRegistry
+
+          strategy_id = sys.argv[1]
+          pinned = load_hard_limits(None)
+          with Ledger(default_ledger_path(), config_hash=pinned.config_hash) as ledger:
+              registry = SpecRegistry(
+                  ledger, per_lineage_budget_ccy=pinned.limits.loss.per_lineage_budget_ccy
+              )
+              spec = registry.get(strategy_id)
+              assert spec is not None, f"{strategy_id} is not registered"
+              holdouts = HoldoutRegistry(ledger)
+              kwargs = dict(
+                  strategy_id=strategy_id,
+                  version=1,
+                  lineage_id=spec.lineage_id,
+                  spec_hash=spec.spec_hash,
+                  vintage_id="vint_ci",
+                  sealed_from=datetime(2026, 1, 1, tzinfo=UTC),
+                  passed=False,
+              )
+              holdouts.record(**kwargs)
+              try:
+                  holdouts.record(**kwargs)
+              except HoldoutAlreadyEvaluated:
+                  print("the second evaluation was refused, as intended")
+              else:
+                  raise SystemExit("a version was evaluated against the holdout twice")
+          PY
+
+      - name: The false-promotion rate is measurable from the command line
+        env:
+          TB_VAR_DIR: var-m5-null
+        run: |
+          # The same measurement the release gate makes, through the same
+          # function, as a command — because the thresholds it depends on live
+          # in a file a human edits, and after editing one the operator has to
+          # be able to ask what it did without reading the test suite.
+          uv run tb init
+          uv run tb research null-gate --specs 60 --days 400 2>&1 | tee /tmp/nullgate.txt
+          grep -q "within the" /tmp/nullgate.txt \
+            || { echo "::error::tb research null-gate did not report a rate against the ceiling"; exit 1; }
+          grep -q "reached the statistical checks" /tmp/nullgate.txt \
+            || { echo "::error::the command did not report how many candidates reached the statistics"; exit 1; }
