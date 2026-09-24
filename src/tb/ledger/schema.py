@@ -823,6 +823,7 @@ _TABLES: tuple[str, ...] = (
         lineage_id        TEXT    NOT NULL,
         spec_hash         TEXT    NOT NULL,
         vintage_id        TEXT    NOT NULL,
+        resolution        TEXT    NOT NULL DEFAULT 'daily',
         sealed_from       TEXT    NOT NULL,
         window_start      TEXT,
         window_end        TEXT,
@@ -1114,8 +1115,87 @@ def connect(
     return conn
 
 
+class SchemaDriftError(RuntimeError):
+    """A table exists but is missing columns this build expects.
+
+    The failure mode `CREATE TABLE IF NOT EXISTS` cannot prevent, and the one
+    this file has warned about since M2: adding a *table* is free, adding a
+    *column* to an existing one is silently ignored. The table stays as it was,
+    the statement succeeds, and the first read of the new column raises an
+    `IndexError` from deep inside a row mapper — with nothing naming the real
+    cause.
+
+    So it is checked explicitly and named. Raised at open time rather than at
+    read time, because a ledger that cannot store what this build records
+    should refuse to be opened rather than fail on the one code path that
+    happens to touch the new column.
+    """
+
+
+def _expected_columns(statement: str) -> tuple[str, tuple[str, ...]]:
+    """The table name and column names a CREATE TABLE statement declares.
+
+    A small parser rather than a second hand-maintained list, because a list
+    that has to be updated alongside the DDL is a list that will disagree with
+    it — and the disagreement would be in the check meant to catch
+    disagreements.
+    """
+    head, _, body = statement.partition("(")
+    name = head.split()[-1]
+    columns: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for char in body.rsplit(")", 1)[0]:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if char == "," and depth == 0:
+            columns.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    columns.append("".join(current))
+
+    names: list[str] = []
+    for clause in columns:
+        first = clause.strip().split()
+        if not first:
+            continue
+        # Table constraints, not columns.
+        if first[0].upper() in ("PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "CONSTRAINT"):
+            continue
+        names.append(first[0])
+    return name, tuple(names)
+
+
+def check_schema_drift(conn: sqlite3.Connection) -> list[str]:
+    """Every table whose stored columns are missing something this build needs.
+
+    Returns descriptions rather than raising, so a caller that wants to report
+    rather than refuse can. `apply_schema` raises on a non-empty result.
+    """
+    problems: list[str] = []
+    for statement in _TABLES:
+        table, expected = _expected_columns(statement)
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if not rows:
+            continue
+        actual = {str(row[1]) for row in rows}
+        missing = [column for column in expected if column not in actual]
+        if missing:
+            problems.append(f"{table} is missing {', '.join(missing)}")
+    return problems
+
+
 def apply_schema(conn: sqlite3.Connection) -> None:
-    """Create tables, triggers and indexes. Idempotent."""
+    """Create tables, triggers and indexes, and refuse a drifted database.
+
+    Idempotent, and deliberately not a migration tool. `CREATE TABLE IF NOT
+    EXISTS` adds new tables and silently ignores new *columns* on tables that
+    already exist, so the drift check after it is what turns that from a silent
+    trap into a named failure.
+    """
     cur = conn.cursor()
     cur.execute("BEGIN IMMEDIATE")
     try:
@@ -1132,6 +1212,17 @@ def apply_schema(conn: sqlite3.Connection) -> None:
         raise
     finally:
         cur.close()
+
+    problems = check_schema_drift(conn)
+    if problems:
+        raise SchemaDriftError(
+            "this ledger predates the current schema and cannot be upgraded in place:\n  "
+            + "\n  ".join(problems)
+            + f"\n\n`CREATE TABLE IF NOT EXISTS` adds tables but never columns, so schema "
+            f"v{LEDGER_SCHEMA_VERSION} could not complete. There is deliberately no "
+            "migration tool: start a fresh ledger, or add the columns by hand with ALTER "
+            "TABLE if the existing history matters."
+        )
 
 
 def schema_version(conn: sqlite3.Connection) -> int | None:

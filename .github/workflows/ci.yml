@@ -58,7 +58,11 @@ jobs:
       # that a root development container has to skip actually execute here:
       # the unreadable-kill-switch path and the writable-limits-file report.
       - name: Test
-        run: uv run pytest -v
+        # The release gate is deselected here and run as its own named step
+        # below. Not to save the 90 seconds — so that when it fails the job list
+        # says "1,000 random specs promote at or below the ceiling" rather than
+        # "Test", which is the whole reason a release gate gets a name.
+        run: uv run pytest -v --deselect tests/test_release_gate.py
 
       - name: Control plane smoke test
         env:
@@ -365,6 +369,8 @@ jobs:
           # reached the statistical checks, and that the refusals were
           # statistical rather than procedural. A ceiling met by a gate that
           # refuses everything is not a gate.
+          #
+          # Deselected from the Test step above, so this is the only run of it.
           uv run pytest tests/test_release_gate.py -q
 
       - name: A strategy cannot be promoted without passing the gate

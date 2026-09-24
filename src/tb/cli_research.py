@@ -321,6 +321,7 @@ def holdout(
                 lineage_id=registered.lineage_id,
                 spec_hash=registered.spec_hash,
                 vintage_id=vintage_id,
+                resolution=Resolution.DAILY.value,
                 sealed_from=window.sealed_from,
                 window_start=window.sealed_from,
                 window_end=window.holdout_end,
@@ -342,6 +343,21 @@ def holdout(
         except HoldoutAlreadyEvaluated as exc:
             err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
             raise typer.Exit(2) from exc
+
+        if not passed:
+            # Retired, not left as a candidate. Failing is terminal — the
+            # evaluation cannot be re-run and the gate requires a passing one,
+            # so this version can never be promoted. Leaving it a candidate
+            # would say the opposite in the one table an operator reads, and
+            # would invite a searcher to keep re-evaluating something that is
+            # already finished. It remains available as a parent: a mutation is
+            # a new strategy in the same lineage, which is what carries this
+            # one's trial count into the next haircut.
+            registry.retire(
+                strategy_id,
+                version=version,
+                reason="failed the sealed holdout, which is terminal for a version",
+            )
 
     if passed:
         console.print(f"{OK} {recorded.label} passed the holdout ({recorded.evaluation_id})")

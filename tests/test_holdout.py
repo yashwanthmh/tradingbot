@@ -373,3 +373,30 @@ def test_a_violation_attempt_is_recorded(holdouts: HoldoutRegistry, ledger: Ledg
     ).fetchone()
     assert row is not None
     assert "searcher" in str(row["payload_json"])
+
+
+def test_the_evaluations_resolution_is_recorded(holdouts: HoldoutRegistry) -> None:
+    """The deflated probability converts an annualised Sharpe to a per-period
+    one, and the factor differs by about eight times between daily and minute.
+    Reading it from config at gate time would annualise a daily strategy by a
+    minute factor the moment `allowed_live_resolutions` widened."""
+    record_one(holdouts)
+    stored = holdouts.existing("stg_1", 1)
+    assert stored is not None
+    assert stored.resolution == "daily"
+
+
+def test_a_minute_evaluation_records_minute(holdouts: HoldoutRegistry) -> None:
+    holdouts.record(
+        strategy_id="stg_minute",
+        version=1,
+        lineage_id="lin_1",
+        spec_hash="hash_m",
+        vintage_id="vint_test",
+        sealed_from=SEAL,
+        resolution="minute",
+        passed=True,
+    )
+    stored = holdouts.existing("stg_minute", 1)
+    assert stored is not None
+    assert stored.resolution == "minute"

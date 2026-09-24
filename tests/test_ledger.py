@@ -517,3 +517,43 @@ class TestReading:
     def test_opening_a_missing_read_only_ledger_fails(self, tmp_path: Path) -> None:
         with pytest.raises(LedgerError, match="no ledger at"):
             Ledger(tmp_path / "absent.db", read_only=True).open()
+
+
+def test_schema_drift_is_named_rather_than_silently_ignored(tmp_path: Path) -> None:
+    """The failure `CREATE TABLE IF NOT EXISTS` cannot prevent.
+
+    Adding a table is free; adding a column to an existing one is silently
+    ignored, the statement succeeds, and the first read of the new column
+    raises an IndexError from inside a row mapper with nothing naming the
+    cause. This drops a column from a live table and asserts that opening the
+    ledger refuses, names the table and the column, and says what to do.
+    """
+    import sqlite3
+
+    from tb.ledger.schema import SchemaDriftError, apply_schema, check_schema_drift
+
+    path = tmp_path / "drifted.db"
+    with Ledger(path) as ledger:
+        ledger.initialise(created_by="test")
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("ALTER TABLE holdout_evaluations DROP COLUMN resolution")
+        conn.commit()
+        assert any("resolution" in note for note in check_schema_drift(conn))
+    finally:
+        conn.close()
+
+    with pytest.raises(SchemaDriftError) as caught, Ledger(path) as ledger:
+        apply_schema(ledger.conn)
+    message = str(caught.value)
+    assert "holdout_evaluations is missing resolution" in message
+    assert "start a fresh ledger" in message
+
+
+def test_an_intact_ledger_reports_no_drift(ledger: Ledger) -> None:
+    """The other half: the check must not fire on a healthy database, or it
+    would refuse every open and nobody would keep it."""
+    from tb.ledger.schema import check_schema_drift
+
+    assert check_schema_drift(ledger.conn) == []

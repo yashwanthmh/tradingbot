@@ -28,6 +28,14 @@ and silently shrink its neighbours.
 the hard limits bound, and every per-strategy result is intersected with that
 strategy's rung notional. It can move capital between strategies and can hand
 out less than the total; it cannot hand out more.
+
+**The regime gate is deliberately not applied here.** When the reference index
+is below its long moving average, `RegimeRule` scales exposure at decision
+time, per order, in the risk layer — above the allocator, because a strategy
+can be killed and a regime cannot. Applying it here as well would halve twice:
+the allocation would shrink, and then each order sized from it would shrink
+again. The allocator's job is relative weight between strategies; how much of
+that weight the market permits today is somebody else's.
 """
 
 from __future__ import annotations

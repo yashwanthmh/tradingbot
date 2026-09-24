@@ -780,3 +780,97 @@ def test_null_gate_refuses_a_fixture_too_short_to_split(env: dict[str, Any]) -> 
     result = _run(["research", "null-gate", "--specs", "4", "--days", "3", *env["args"]])
     assert result.exit_code == 2
     assert "cannot be split" in _out(result)
+
+
+def test_failing_the_holdout_retires_the_version(env: dict[str, Any]) -> None:
+    """Terminal means terminal, and visibly so.
+
+    The evaluation cannot be re-run and the gate requires a passing one, so a
+    failed version can never be promoted. Leaving it a candidate would say the
+    opposite in the one table an operator reads.
+    """
+    _init(env)
+    seed_bars(env)
+    strategy_id = registered_id(env)
+    _run(["data", "seal", "--resolution", "daily", *env["bar_args"]])
+    with _ledger(env) as ledger:
+        row = ledger.conn.execute("SELECT vintage_id FROM data_snapshots").fetchone()
+
+    result = _run(
+        [
+            "research",
+            "holdout",
+            strategy_id,
+            str(row["vintage_id"]),
+            "--apply",
+            *env["bar_args"],
+        ]
+    )
+    assert result.exit_code == 1
+    with _ledger(env) as ledger:
+        record = _registry(env, ledger).status_of(strategy_id)
+    assert record is not None
+    assert record.status is StrategyStatus.RETIRED
+    assert "terminal" in record.retire_reason
+
+
+def test_a_retired_version_can_still_parent_a_mutation(env: dict[str, Any], tmp_path: Path) -> None:
+    """A failed holdout ends the version, not the idea. The mutation belongs to
+    the same lineage, which is what carries the parent's trial count into the
+    next multiplicity haircut."""
+    _init(env)
+    strategy_id = registered_id(env)
+    with _ledger(env) as ledger:
+        registry = _registry(env, ledger)
+        registry.retire(strategy_id, reason="failed the sealed holdout", at=AS_OF)
+        parent = registry.get(strategy_id)
+        assert parent is not None
+
+    mutated = dict(SPEC)
+    mutated["entry"] = {
+        "kind": "compare",
+        "op": "gt",
+        "left": {"kind": "feature", "name": "sma", "lookback": 30},
+        "right": {"kind": "feature", "name": "sma", "lookback": 100},
+    }
+    child_file = tmp_path / "child.json"
+    child_file.write_text(json.dumps(mutated), encoding="utf-8")
+
+    result = _run(
+        [
+            "registry",
+            "register",
+            str(child_file),
+            "--author",
+            "mutation",
+            "--parent",
+            strategy_id,
+            *env["args"],
+        ]
+    )
+    assert result.exit_code == 0
+    assert parent.lineage_id in _out(result)
+
+
+def test_the_annualisation_factor_follows_the_evaluation_not_the_config() -> None:
+    """The latent bug this closes.
+
+    The first draft read `allowed_live_resolutions` and picked the fastest
+    permitted one, which is correct only while that list holds a single entry.
+    Widening it would have re-annualised every daily strategy by a minute
+    factor — a config edit silently changing the arithmetic of the most
+    important gate.
+    """
+    from tb.backtest.metrics import (
+        PERIODS_PER_YEAR_DAILY,
+        PERIODS_PER_YEAR_HOURLY,
+        PERIODS_PER_YEAR_MINUTE,
+    )
+    from tb.cli_registry import periods_per_year_for
+
+    assert periods_per_year_for("daily") == PERIODS_PER_YEAR_DAILY
+    assert periods_per_year_for("hourly") == PERIODS_PER_YEAR_HOURLY
+    assert periods_per_year_for("minute") == PERIODS_PER_YEAR_MINUTE
+    # A row from a future build naming something this one does not know is a
+    # reporting problem, not a reason to refuse: daily overstates nothing.
+    assert periods_per_year_for("fortnightly") == PERIODS_PER_YEAR_DAILY

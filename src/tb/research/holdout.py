@@ -121,6 +121,13 @@ class HoldoutResult:
     sealed_from: datetime
     passed: bool
     evaluated_at: datetime
+    # The bar resolution the evaluation ran at. Stored rather than assumed,
+    # because the deflated *probability* converts an annualised Sharpe to a
+    # per-period one and the factor differs by about eight times between daily
+    # and minute. Reading it from config at gate time would annualise a daily
+    # strategy by a minute factor the moment someone widened
+    # `allowed_live_resolutions`.
+    resolution: str = "daily"
     n_trades: int | None = None
     net_sharpe: float | None = None
     net_return_pct: float | None = None
@@ -314,6 +321,7 @@ class HoldoutRegistry:
         vintage_id: str,
         sealed_from: datetime,
         passed: bool,
+        resolution: str = "daily",
         window_start: datetime | None = None,
         window_end: datetime | None = None,
         backtest_id: str | None = None,
@@ -358,6 +366,7 @@ class HoldoutRegistry:
             sealed_from=sealed_from,
             passed=passed,
             evaluated_at=moment,
+            resolution=resolution,
             n_trades=n_trades,
             net_sharpe=net_sharpe,
             net_return_pct=net_return_pct,
@@ -394,11 +403,11 @@ class HoldoutRegistry:
                     """
                     INSERT INTO holdout_evaluations (
                         evaluation_id, strategy_id, version, lineage_id, spec_hash,
-                        vintage_id, sealed_from, window_start, window_end, backtest_id,
-                        n_trades, net_sharpe, net_return_pct, max_drawdown_pct,
-                        cost_drag_bps, returns_json, passed, detail, evaluated_at,
-                        evaluating_event_seq
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        vintage_id, resolution, sealed_from, window_start, window_end,
+                        backtest_id, n_trades, net_sharpe, net_return_pct,
+                        max_drawdown_pct, cost_drag_bps, returns_json, passed, detail,
+                        evaluated_at, evaluating_event_seq
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         result.evaluation_id,
@@ -407,6 +416,7 @@ class HoldoutRegistry:
                         lineage_id,
                         spec_hash,
                         vintage_id,
+                        resolution,
                         to_iso(sealed_from),
                         None if window_start is None else to_iso(window_start),
                         None if window_end is None else to_iso(window_end),
@@ -482,6 +492,7 @@ def _row_to_result(row: sqlite3.Row) -> HoldoutResult:
         sealed_from=from_iso(str(row["sealed_from"])),
         passed=bool(row["passed"]),
         evaluated_at=from_iso(str(row["evaluated_at"])),
+        resolution=str(row["resolution"]),
         n_trades=None if row["n_trades"] is None else int(row["n_trades"]),
         net_sharpe=None if row["net_sharpe"] is None else float(row["net_sharpe"]),
         net_return_pct=None if row["net_return_pct"] is None else float(row["net_return_pct"]),

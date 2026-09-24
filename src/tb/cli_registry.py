@@ -487,7 +487,7 @@ def evaluate(
                 returns=list(holdout.returns),
                 n_trials=multiplicity.n_trials,
                 sharpe_dispersion=multiplicity.sharpe_dispersion,
-                periods_per_year=_periods_per_year(pinned),
+                periods_per_year=periods_per_year_for(holdout.resolution),
                 dispersion_measured=multiplicity.dispersion_measured,
             )
 
@@ -574,13 +574,21 @@ def _vintage_check(
     return SnapshotStore(ledger, store).is_admissible(vintage_id)
 
 
-def _periods_per_year(pinned: PinnedLimits) -> int:
-    """The annualisation factor for the resolution the bot may trade live.
+def periods_per_year_for(resolution: str) -> int:
+    """The annualisation factor for the resolution an evaluation ran at.
 
-    Read from the limits rather than assumed. A minute strategy annualises by a
-    factor about eight times a daily one, so hardcoding 252 would overstate a
-    minute strategy's Sharpe by that much — and the deflated figure is computed
-    from it.
+    Taken from the *evaluation*, not from `allowed_live_resolutions`. The first
+    draft read the config and picked the fastest permitted resolution, which is
+    correct only while that list holds one entry: the moment minute were
+    allowed, a daily strategy's Sharpe would be converted to a per-period one by
+    a factor about eight times too large, and its deflated probability would
+    collapse toward 0.5. Conservative, and wrong — and wrong in a way that would
+    appear on a config edit rather than on a code change.
+
+    An unrecognised name falls back to daily rather than raising. A stored row
+    from a future build naming a resolution this one does not know is a
+    reporting problem, not a reason to refuse to evaluate; daily is the slowest
+    factor and therefore the one that overstates nothing.
     """
     from tb.backtest.metrics import (
         PERIODS_PER_YEAR_DAILY,
@@ -588,12 +596,11 @@ def _periods_per_year(pinned: PinnedLimits) -> int:
         PERIODS_PER_YEAR_MINUTE,
     )
 
-    allowed = set(pinned.limits.data.allowed_live_resolutions)
-    if "minute" in allowed:
-        return PERIODS_PER_YEAR_MINUTE
-    if "hourly" in allowed:
-        return PERIODS_PER_YEAR_HOURLY
-    return PERIODS_PER_YEAR_DAILY
+    return {
+        "minute": PERIODS_PER_YEAR_MINUTE,
+        "hourly": PERIODS_PER_YEAR_HOURLY,
+        "daily": PERIODS_PER_YEAR_DAILY,
+    }.get(resolution.lower(), PERIODS_PER_YEAR_DAILY)
 
 
 def _jurisdiction(name: str) -> Jurisdiction:
