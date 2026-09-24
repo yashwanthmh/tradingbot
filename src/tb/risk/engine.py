@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import timedelta
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
 from tb.broker.port import OrderPurpose, Side
 from tb.config.hard_limits import HardLimits
@@ -290,6 +290,10 @@ class RiskEngine:
         An explicitly requested quantity is honoured as a *ceiling*, never as a
         floor: an exit asks for the exact position size and must get it, while
         an entry that asked for more than the caps allow gets the caps.
+
+        The regime factor is applied last and is bounded below by the minimum
+        ticket size — see `_scaled_by_regime`, which is where that reasoning
+        lives.
         """
         notes: list[str] = []
         # An explicit loop rather than a comprehension: a comprehension's `if`
@@ -322,10 +326,7 @@ class RiskEngine:
         limiting_rule, quantity = min(opinions, key=lambda pair: pair[1])
         notes.append(f"{limiting_rule} is the binding constraint at {quantity}")
 
-        factor = ctx.regime_exposure_factor
-        if factor is not None and factor < 1:
-            quantity = (quantity * factor).quantize(Decimal("0.00000001"))
-            notes.append(f"regime factor x{factor} applied -> {quantity}")
+        quantity = self._scale_and_floor(ctx, quantity, notes)
 
         requested = ctx.request.quantity
         if requested is not None and requested < quantity:
@@ -333,6 +334,71 @@ class RiskEngine:
             notes.append(f"the request asked for less ({requested}) than the caps allow")
 
         return quantity, tuple(notes)
+
+    @staticmethod
+    def _scale_and_floor(ctx: RiskContext, capped: Decimal, notes: list[str]) -> Decimal:
+        """Apply the regime factor, but never size below the minimum ticket.
+
+        Two ways a size can end up a hair under `floor_notional_ccy` while the
+        cap that produced it was at or above the floor, and both would refuse an
+        order that should be placed:
+
+        **The regime factor.** A strategy at rung 0 is allocated exactly
+        `floor_notional_ccy`, so *any* factor below 1 puts it under the floor.
+        The regime gate's cold-start reading is 0.5 — an account with under ten
+        months of reference history cannot see the index — so a freshly promoted
+        strategy could never open its first position, and the bot would look
+        broken for exactly the reason that cold-start default exists to avoid.
+
+        **Quantisation.** `max_quantity` is rounded *down* to the quantum, which
+        is right for a cap and means a cap sitting exactly on the floor produces
+        a notional a fraction under it. At £15 and a £7 share that is
+        14.99999998, which the floor rule refuses — so rung 0 would be
+        untradeable on any instrument whose price does not divide the floor.
+
+        Both are handled the same way, because they are the same policy: below
+        the floor an order is not a smaller position, it is an unplaceable one,
+        so the size is held at the minimum ticket rather than scaled through it.
+        Gross exposure stays bounded by `max_deployed_pct` and the absolute
+        ceiling, and climbing the ladder is what makes a position large enough
+        for the factor to bite.
+
+        What it must *not* do is enlarge an order past the cap that bound it. A
+        strategy whose allocation is genuinely below the floor stays refused,
+        and the discriminator is one quantum: `capped` came from
+        `floor(cap / price)`, so the cap it represents is somewhere in
+        `[capped * price, (capped + quantum) * price)`. If even the top of that
+        interval misses the floor, the cap really is too small.
+        """
+        quantum = Decimal("0.00000001")
+        price = ctx.request.reference_price
+        floor = ctx.limits.capital.floor_notional_ccy
+
+        quantity = capped
+        factor = ctx.regime_exposure_factor
+        if factor is not None and factor < 1:
+            quantity = (capped * factor).quantize(quantum)
+            notes.append(f"regime factor x{factor} applied -> {quantity}")
+
+        if quantity * price >= floor:
+            return quantity
+        if (capped + quantum) * price < floor:
+            # The binding cap itself is under the floor. Returned unchanged so
+            # `floor_notional` refuses it on the second pass and says so with
+            # both numbers — a silent bump to the floor here would hand out more
+            # capital than the cap allowed.
+            return quantity
+        # Rounded *up*, unlike every other sizing step: the minimum ticket has
+        # to actually reach the minimum. The overshoot against the binding cap
+        # is at most one quantum — 1e-8 shares — which no cap above notices.
+        ticket = (floor / price).quantize(quantum, rounding=ROUND_UP)
+        notes.append(
+            f"{quantity} is {quantity * price}, under the {floor} minimum ticket; held at "
+            f"{ticket} instead — below the floor an order is unplaceable rather than small, "
+            "and neither a reduced regime nor rounding down to the quantum may stop a "
+            "floor-size strategy trading at all"
+        )
+        return ticket
 
     def _refuse(
         self,
