@@ -545,7 +545,14 @@ def _mutate_edge(
     which is why that ceiling exists.
     """
     factor = Decimal(rng.choice(EDGE_STEPS))
-    moved = bounds.clamp_edge((spec.expected_edge_bps * factor).quantize(Decimal("1")))
+    try:
+        moved = bounds.clamp_edge((spec.expected_edge_bps * factor).quantize(Decimal("1")))
+    except ArithmeticError:
+        # An edge the decimal context cannot scale. The schema bounds the
+        # declared edge now; a seed read from a registry row that predates the
+        # bound may not be, and — as with `_perturb_constant` — one such parent
+        # must not take the whole search down.
+        return None
     if moved == spec.expected_edge_bps:
         return None
     payload = spec.model_dump(mode="json")

@@ -50,6 +50,13 @@ MAX_LOOKBACK = 400
 # any listed instrument trades at by several orders, and far below the point
 # where the decimal context overflows on a multiplication — see `Constant`.
 MAX_CONSTANT_MAGNITUDE = Decimal("1E+9")
+# The largest edge a spec may declare: a round trip that doubles the money.
+# Not the tradable band — `costs.max_expected_edge_bps` in the hash-pinned file
+# is that, and the validator enforces it — but the point past which a number is
+# not a claim at all. It exists for the same reason as the constant bound: the
+# searcher does arithmetic on the declared edge, and `1E+999999999` overflowed
+# the edge mutation the way it overflowed the constant one.
+MAX_DECLARED_EDGE_BPS = Decimal("10000")
 
 
 class SpecError(TbError):
@@ -267,6 +274,12 @@ class StrategySpec(_Node):
             )
         if not self.expected_edge_bps.is_finite():
             raise ValueError("expected_edge_bps must be finite")
+        if self.expected_edge_bps > MAX_DECLARED_EDGE_BPS:
+            raise ValueError(
+                f"expected_edge_bps {self.expected_edge_bps} is beyond {MAX_DECLARED_EDGE_BPS}: "
+                "a round trip that more than doubles the money is not a claim a spec can make, "
+                "and arithmetic on a number that size overflows the decimal context."
+            )
         return self
 
     @property

@@ -50,6 +50,7 @@ from tb.research.mutate import MUTATIONS, ProposalBounds, mutate, seed_spec
 from tb.strategy.dsl.interpreter import EvaluationError, evaluate
 from tb.strategy.dsl.schema import (
     MAX_CONSTANT_MAGNITUDE,
+    MAX_DECLARED_EDGE_BPS,
     MAX_DEPTH,
     SpecError,
     StrategySpec,
@@ -384,6 +385,46 @@ def test_perturbing_an_unrepresentable_constant_does_not_crash_the_proposer() ->
     for _ in range(50):
         # Called directly: the operator is what must not raise.
         MUTATIONS["perturb_constant"](tree, rng, BOUNDS)
+
+
+@pytest.mark.parametrize(
+    "edge", ["1E+999999999", "1E+28", "9" * 5_000, str(MAX_DECLARED_EDGE_BPS + 1)]
+)
+def test_a_declared_edge_that_is_not_a_claim_is_refused(edge: str) -> None:
+    """**The same regression, one field over.**
+
+    Found while writing the LLM proposer's hostile-reply tests: the declared
+    edge was finite-checked and nothing more, so `1E+999999999` parsed \u2014 and the
+    edge mutation's `quantize` raised `decimal.Overflow` on it. The tradable band is
+    the validator's (`costs.max_expected_edge_bps`); this bound is where a
+    number stops being a claim at all.
+    """
+    payload = _spec_payload(_deep(0), _deep(0))
+    payload["expected_edge_bps"] = edge
+    with nothing_executes(), pytest.raises(SpecError):
+        StrategySpec.parse(payload)
+
+
+def test_a_declared_edge_at_the_bound_is_still_a_spec() -> None:
+    payload = _spec_payload(_deep(0), _deep(0))
+    payload["expected_edge_bps"] = str(MAX_DECLARED_EDGE_BPS)
+    StrategySpec.parse(payload)
+
+
+def test_mutating_an_unrepresentable_edge_does_not_crash_the_proposer() -> None:
+    """Defence in depth, as for constants: a seed read from a registry row that
+    predates the bound is skipped by the edge mutation rather than raised out of
+    the search."""
+    legacy = StrategySpec.model_construct(
+        **{
+            **StrategySpec.parse(_spec_payload(_deep(0), _deep(0))).__dict__,
+            "expected_edge_bps": Decimal("1E+999999999"),
+        }
+    )
+    rng = random.Random(0)
+    for index in range(50):
+        proposal = mutate(legacy, rng=rng, bounds=BOUNDS, index=index)
+        assert proposal is None or proposal.spec.expected_edge_bps <= MAX_DECLARED_EDGE_BPS
 
 
 @pytest.mark.parametrize("name", ["sma\u0430", "SMA", "sma ", "sma\x00", "__import__", "open"])
