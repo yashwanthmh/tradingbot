@@ -660,6 +660,21 @@ class IntentLog:
         ).fetchall()
         return tuple(_from_row(row) for row in rows)
 
+    def by_broker_order_id(self, broker_order_id: str) -> OrderIntent | None:
+        """The intent behind a broker order, or `None` for an order we did not place.
+
+        What turns a row from the broker's order list back into something with a
+        purpose and an owner. `None` is a real answer: an order placed by hand in
+        the venue's app has no intent, and code acting on it must say so rather
+        than invent one.
+        """
+        row = self._ledger.conn.execute(
+            "SELECT * FROM order_intents WHERE broker_order_id = ?"
+            " ORDER BY wal_committed_at DESC LIMIT 1",
+            (broker_order_id,),
+        ).fetchone()
+        return None if row is None else _from_row(row)
+
     def protective_for(self, t212_ticker: str) -> tuple[OrderIntent, ...]:
         """Live protective stops for a ticker.
 

@@ -41,7 +41,7 @@ drills are about.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -180,8 +180,16 @@ class SimulatedBroker:
     # positions. Not a feed — the simulator is not a data provider.
     prices: dict[str, Decimal] = field(default_factory=dict)
     # Fill immediately on accept. False models a working order that has not
-    # traded, which is what a limit order usually is.
+    # traded, which is what a limit order usually is — and what a Trading 212
+    # market order is too, since the venue fills asynchronously and a market
+    # order placed outside the session waits for the open.
     fill_on_accept: bool = True
+    # Shares committed to a pending sell cannot be sold again. Trading 212
+    # reports this per position as `maxSell`, so the venue is expected to
+    # refuse a market exit for shares its own protective stop has reserved.
+    # Modelled rather than assumed away: without it an engine that forgot to
+    # withdraw the stop before exiting fills in simulation and fails live.
+    reserve_pending_sells: bool = True
     fail_at: CrashPoint | None = None
     # Rejections the drill wants, keyed by ticker. Each fires once, so a
     # retry after a rejection can be shown to succeed.
@@ -240,6 +248,8 @@ class SimulatedBroker:
         quantity = token.quantity
         self._check_quantity(ticker, quantity, purpose=purpose)
         self._check_pending_ceiling(ticker, purpose=purpose)
+        if token.side is Side.SELL:
+            self._check_free_to_sell(ticker, quantity, purpose=purpose)
 
         rejection = self.reject_once.pop(ticker, None)
         if rejection is not None:
@@ -388,6 +398,51 @@ class SimulatedBroker:
                     code="MaxQuantityExceeded",
                 )
 
+    def _reserved_by_pending_sells(self, ticker: str) -> Decimal:
+        return sum(
+            (
+                (order.quantity or Decimal(0)) - (order.filled_quantity or Decimal(0))
+                for order in self._orders.values()
+                if order.ticker == ticker and order.status.is_open and order.side is Side.SELL
+            ),
+            Decimal(0),
+        )
+
+    def _free_to_sell(self, ticker: str) -> Decimal:
+        held = self._positions.get(ticker)
+        owned = held.quantity if held else Decimal(0)
+        if not self.reserve_pending_sells:
+            return owned
+        return owned - self._reserved_by_pending_sells(ticker)
+
+    def _check_free_to_sell(self, ticker: str, quantity: Decimal, *, purpose: OrderPurpose) -> None:
+        """A sell for shares a pending sell has already committed is refused.
+
+        The case this exists for is an exit placed while the position's own
+        protective stop is working: the stop holds every share, so the exit has
+        nothing to sell. An engine has to withdraw the stop first — and one that
+        does not finds out here rather than on the live venue.
+        """
+        held = self._positions.get(ticker)
+        owned = held.quantity if held else Decimal(0)
+        if quantity > owned:
+            # Not a reservation question at all: there are not that many shares.
+            # The same refusal the fill would give, raised before the order
+            # exists, since this account cannot go short.
+            raise SimulatedRejection(
+                f"selling {quantity} of {ticker} with {owned} held would go short, "
+                "and this account cannot",
+                code="InsufficientQuantity",
+            )
+        free = self._free_to_sell(ticker)
+        if quantity > free:
+            raise SimulatedRejection(
+                f"selling {quantity} of {ticker}: {owned} held, "
+                f"{owned - free} already committed to pending sell orders, {free} free. "
+                "Withdraw the working sell (usually the position's protective stop) first.",
+                code="InsufficientFreeQuantity",
+            )
+
     def _check_pending_ceiling(self, ticker: str, *, purpose: OrderPurpose) -> None:
         pending = sum(
             1 for order in self._orders.values() if order.ticker == ticker and order.status.is_open
@@ -485,7 +540,7 @@ class SimulatedBroker:
         )
 
     def get_positions(self) -> tuple[Position, ...]:
-        return tuple(self._positions.values())
+        return tuple(self._with_max_sell(position) for position in self._positions.values())
 
     def get_position(self, ticker: str) -> Position | None:
         """Only a held position has a `currentPrice`.
@@ -494,7 +549,12 @@ class SimulatedBroker:
         cannot speak for a first entry — which is what the two-tier symbol
         verification exists to work around.
         """
-        return self._positions.get(ticker)
+        position = self._positions.get(ticker)
+        return None if position is None else self._with_max_sell(position)
+
+    def _with_max_sell(self, position: Position) -> Position:
+        """`maxSell` as the venue reports it: what no pending sell has committed."""
+        return replace(position, max_sell=self._free_to_sell(position.ticker))
 
     def get_open_orders(self) -> tuple[BrokerOrder, ...]:
         return tuple(o for o in self._orders.values() if o.status.is_open)

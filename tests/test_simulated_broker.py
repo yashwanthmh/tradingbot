@@ -262,6 +262,33 @@ def test_selling_more_than_held_is_rejected_rather_than_going_short(
         broker.place_order(token, order_type=OrderType.MARKET, purpose=OrderPurpose.EXIT)
 
 
+def test_shares_a_working_stop_has_reserved_cannot_be_sold_again(
+    broker: SimulatedBroker,
+) -> None:
+    """**What `maxSell` reports, modelled.** A protective stop commits every
+    share it covers, so a market exit sent past it has nothing to sell.
+
+    The simulator used to fill that exit anyway, which is how an engine that
+    never withdrew its stops passed every test here and would have had its
+    exits refused on the venue. `max_sell` reads the same reservation back.
+    """
+    broker.seed_position(TICKER, quantity=Decimal("2"), average_price=Decimal("100"))
+    broker.place_order(
+        _token(purpose=OrderPurpose.PROTECTIVE_STOP, held=Decimal("2"), quantity=Decimal("2")),
+        order_type=OrderType.STOP,
+        purpose=OrderPurpose.PROTECTIVE_STOP,
+        stop_price=Decimal("85"),
+        time_validity=TimeValidity.GOOD_TILL_CANCEL,
+    )
+    position = broker.get_position(TICKER)
+    assert position is not None and position.max_sell == 0
+
+    exit_token = _token(purpose=OrderPurpose.EXIT, held=Decimal("2"), quantity=Decimal("2"))
+    with pytest.raises(SimulatedRejection) as caught:
+        broker.place_order(exit_token, order_type=OrderType.MARKET, purpose=OrderPurpose.EXIT)
+    assert caught.value.code == "InsufficientFreeQuantity"
+
+
 def test_a_rejection_fires_once_so_a_retry_can_succeed(broker: SimulatedBroker) -> None:
     broker.reject_once[TICKER] = ("InsufficientFunds", "not enough cash")
     token = _token()

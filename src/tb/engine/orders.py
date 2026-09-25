@@ -50,10 +50,11 @@ from tb.ledger.events import (
     Actor,
     EventType,
     FillPayload,
+    OrderOutcomePayload,
     ProtectionPayload,
 )
 from tb.ledger.store import Ledger
-from tb.risk.token import RiskToken
+from tb.risk.token import RiskToken, RiskTokenError
 
 
 class SubmissionError(TbError):
@@ -95,6 +96,27 @@ class Submission:
 
     @property
     def filled(self) -> bool:
+        return self.status is OrderStatus.FILLED
+
+
+@dataclass(frozen=True, slots=True)
+class Withdrawal:
+    """What became of one attempt to withdraw a working order.
+
+    `withdrawn` is the fact a caller acts on: the order is no longer working, so
+    whatever it had reserved at the venue is released. It is deliberately not
+    "the cancel call returned" — on this venue a cancel that finds the order
+    already gone succeeds silently, and gone can mean *filled*.
+    """
+
+    broker_order_id: str
+    status: OrderStatus
+    withdrawn: bool
+    detail: str = ""
+
+    @property
+    def filled_first(self) -> bool:
+        """The order traded before the withdrawal reached it."""
         return self.status is OrderStatus.FILLED
 
 
@@ -182,6 +204,19 @@ class OrderSubmitter:
             # Every adapter raises this for the same situation, so the
             # submitter does not need to know which one it is talking to.
             raise SubmissionUnknown(intent, str(exc)) from exc
+        except RiskTokenError as exc:
+            # Conclusive, and before the wire: every adapter checks the token
+            # before building a request, so an expired or mismatched token
+            # means nothing was sent. It happens when approval and send are
+            # separated by other broker calls — an exit waits on its stop's
+            # withdrawal — and treating it as unknown would halt the loop over
+            # an order that provably does not exist.
+            self.log.mark_rejected(
+                intent.intent_id,
+                detail=f"the risk token was refused before sending: {exc}",
+                at=self._now(),
+            )
+            raise SubmissionError(f"{intent.intent_id} was not sent: {exc}") from exc
         except OrderRejected as exc:
             # Conclusive: the venue read the order and said no.
             self.log.mark_rejected(
@@ -223,6 +258,100 @@ class OrderSubmitter:
             detail=f"venue status {placed.raw_status or placed.status.value}",
         )
         return Submission(intent, placed.broker_order_id, placed.status)
+
+    # -- withdrawal --------------------------------------------------------
+
+    def cancel(
+        self,
+        token: RiskToken,
+        *,
+        broker_order_id: str,
+        t212_ticker: str,
+        reason: str,
+    ) -> Withdrawal:
+        """Withdraw one working order, then read it back and record what it became.
+
+        Read back rather than trusted, because the cancel call's return says
+        little: this venue answers a cancel for an order that is already gone as
+        a success, and gone can mean a protective stop that *fired* a moment
+        earlier. So afterwards the order is fetched and:
+
+        * `CANCELLED` — withdrawn, and its intent (if we placed it) is resolved so;
+        * `FILLED` — it traded first, resolved as filled, and the caller must not
+          act as though the shares are still held;
+        * absent from the venue's active orders — withdrawn one way or the other.
+          The intent is left for the fill sweep, which reads history, to settle;
+        * still working (the venue reports `CANCELLING` as working) — not
+          withdrawn yet. Nothing is resolved, and the caller must not assume the
+          shares are free.
+
+        No write-ahead row, unlike `submit`. A cancel is idempotent — withdrawing
+        an order twice has the effect of withdrawing it once — so a lost
+        response is settled by reading the order back, never by a duplicate.
+        """
+        intent = self.log.by_broker_order_id(broker_order_id)
+        detail = reason
+        try:
+            self.broker.cancel_order(token, broker_order_id=broker_order_id)
+        except OrderRejected as exc:
+            # Usually "already terminal". Which terminal state is what the
+            # read-back below is for.
+            detail = f"{reason}; the venue refused the cancel: {exc}"
+        except (OrderOutcomeUnknown, TransportError, BrokerHttpError) as exc:
+            detail = f"{reason}; the cancel's outcome is unknown: {exc}"
+
+        try:
+            order = self.broker.get_order(broker_order_id)
+        except (TransportError, BrokerHttpError) as exc:
+            return Withdrawal(
+                broker_order_id,
+                OrderStatus.UNKNOWN,
+                withdrawn=False,
+                detail=f"{detail}; could not read the order back: {exc}",
+            )
+
+        if order is None:
+            status = OrderStatus.UNKNOWN
+            withdrawn = True
+            detail = f"{detail}; no longer among the venue's active orders"
+        else:
+            status = order.status
+            withdrawn = order.status.is_terminal
+
+        moment = self._now()
+        if status is OrderStatus.CANCELLED or (order is None and withdrawn):
+            self.ledger.append(
+                EventType.ORDER_CANCELLED,
+                t212_ticker,
+                OrderOutcomePayload(
+                    intent_id=None if intent is None else intent.intent_id,
+                    run_id=self.run_id,
+                    t212_ticker=t212_ticker,
+                    broker_order_id=broker_order_id,
+                    status=OrderStatus.CANCELLED.value if order else "gone",
+                    detail=detail,
+                ),
+                actor=Actor.RISK,
+                run_id=self.run_id,
+            )
+        if intent is not None and not intent.state.is_terminal:
+            if status is OrderStatus.CANCELLED:
+                self.log.resolve(
+                    intent.intent_id,
+                    state=IntentState.RESOLVED_CANCELLED,
+                    resolved_by="withdrawn_by_engine",
+                    detail=detail,
+                    at=moment,
+                )
+            elif status is OrderStatus.FILLED:
+                self.log.resolve(
+                    intent.intent_id,
+                    state=IntentState.RESOLVED_FILLED,
+                    resolved_by="discovered_filled_at_withdrawal",
+                    detail=detail,
+                    at=moment,
+                )
+        return Withdrawal(broker_order_id, status, withdrawn=withdrawn, detail=detail)
 
     # -- recovery ----------------------------------------------------------
 

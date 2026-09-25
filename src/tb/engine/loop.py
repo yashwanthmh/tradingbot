@@ -70,7 +70,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
-from tb.broker.port import Broker, OrderPurpose, OrderType, TimeValidity
+from tb.broker.port import Broker, OrderPurpose, OrderType, Side, TimeValidity
 from tb.config.loader import PinnedLimits, load_hard_limits
 from tb.core.clock import now_utc
 from tb.core.errors import TbError
@@ -189,6 +189,15 @@ class TradingLoop:
         # might ask for, because an unowned position is the only holding in the
         # account that nothing is managing.
         unowned = self._flatten_unowned(at=at, submitted=submitted, refusals=refusals)
+        stood_down = {ticker for ticker, _, _ in unowned}
+
+        # Protection follows the position, not the entry's response. Every
+        # cycle, each held position gets a working stop for exactly what is
+        # held, and a stop with nothing behind it is withdrawn. On this venue a
+        # market order fills asynchronously — the POST answers before the fill
+        # — so a stop placed only "when the entry reports filled" would never
+        # be placed at all, and nothing else would notice.
+        stops.extend(self._maintain_protection(at=at, skip=stood_down, refusals=refusals))
 
         # Two passes, risk-reducing first. An ordering rather than a queue
         # object: the per-cycle work is small and bounded, and the property
@@ -198,7 +207,6 @@ class TradingLoop:
         # Instruments outer, strategies inner: the position and its owner are
         # facts about the instrument, so resolving them once per instrument is
         # what keeps two strategies from both acting on one holding.
-        stood_down = {ticker for ticker, _, _ in unowned}
         for risk_reducing in (True, False):
             for ticker, uid in sorted(self.instruments.items()):
                 if ticker in stood_down:
@@ -474,13 +482,25 @@ class TradingLoop:
         if evaluation.token is None:
             return decision, None, (ticker, evaluation.refusal_summary), None
 
+        exiting = decision.action is Action.EXIT
+        if exiting:
+            # After the approval, before the sell. The position's own stop has
+            # every share reserved at the venue, so an exit sent past it has
+            # nothing to sell; and a stop left working after the exit is a sell
+            # order for shares nobody holds, waiting to close whatever position
+            # comes next at an old price. Withdrawn only once the exit is
+            # approved, so a refused exit never costs the position its stop.
+            cleared, why = self._withdraw_protection(
+                ticker, at=at, reason=f"making way for {funded.label}'s exit"
+            )
+            if not cleared:
+                return decision, None, (ticker, f"exit deferred: {why}"), None
+
         try:
             submission = self.submitter.submit(
                 evaluation.token,
                 order_type=OrderType.MARKET,
-                purpose=(
-                    OrderPurpose.EXIT if decision.action is Action.EXIT else OrderPurpose.ENTRY
-                ),
+                purpose=OrderPurpose.EXIT if exiting else OrderPurpose.ENTRY,
                 instrument_uid=uid,
             )
         except SubmissionUnknown as exc:
@@ -490,13 +510,20 @@ class TradingLoop:
             raise  # pragma: no cover - _halt always raises
         except SubmissionError as exc:
             # Conclusive refusal. Recorded and skipped, not halted: an
-            # ordinary rejection must not stop the whole loop.
-            return decision, None, (ticker, f"rejected: {exc}"), None
+            # ordinary rejection must not stop the whole loop. An exit refused
+            # after its stop was withdrawn is re-protected now rather than next
+            # cycle — the one window this ordering opens is closed in the same
+            # breath.
+            restored = self._reprotect(ticker, uid, at=at) if exiting else None
+            return decision, None, (ticker, f"rejected: {exc}"), restored
 
         stop_id: str | None = None
         if decision.action is Action.ENTER and submission.filled:
+            # Protected in the same cycle when the venue fills synchronously,
+            # as the simulator does. When it does not, the next cycle's
+            # protection pass sees the position and places the stop.
             stop_id = self._protect(
-                funded=funded,
+                notional_ccy=funded.notional_ccy,
                 ticker=ticker,
                 uid=uid,
                 quantity=evaluation.approved_quantity or Decimal(0),
@@ -616,6 +643,14 @@ class TradingLoop:
         if evaluation.token is None:
             return None, f"risk refused the flatten: {evaluation.refusal_summary}"
 
+        # The same ordering as an exit: approved first, then the stop withdrawn
+        # so the shares are free to sell, then the sell.
+        cleared, why = self._withdraw_protection(
+            ticker, at=at, reason="making way for flattening an unowned position"
+        )
+        if not cleared:
+            return None, f"flatten deferred: {why}"
+
         try:
             submission = self.submitter.submit(
                 evaluation.token,
@@ -627,6 +662,7 @@ class TradingLoop:
             self._halt(str(exc))
             raise  # pragma: no cover - _halt always raises
         except SubmissionError as exc:
+            self._reprotect(ticker, uid, at=at)
             return None, f"the broker rejected the flatten: {exc}"
         return submission.intent.intent_id, f"flattened {position.quantity} ({reason})"
 
@@ -659,26 +695,206 @@ class TradingLoop:
             run_id=self.run_id,
         )
 
+    # -- protection ----------------------------------------------------------
+
+    def _maintain_protection(
+        self,
+        *,
+        at: datetime,
+        skip: set[str],
+        refusals: list[tuple[str, str]],
+    ) -> list[str]:
+        """Make every held position's protection match what is actually held.
+
+        Driven by the position at the venue rather than by any response,
+        because the responses do not carry the facts: a market order's POST
+        answers before it fills, a partial fill changes the size, and a stop can
+        be cancelled by hand in the venue's app. Three corrections, per
+        instrument in the loop's universe:
+
+        * **held, no stop** — protect it. The case an asynchronous fill leaves.
+        * **held, stop for a different quantity** — withdraw and re-protect at
+          the size held. A stop for less leaves the difference unprotected; a
+          stop for more is a sell for shares nobody holds.
+        * **not held, stop working** — withdraw it. A stop left behind by a
+          closed position is a sell order waiting to close whatever position
+          comes next, at an old price.
+
+        Skipped while a non-protective sell is working for the instrument: an
+        exit or flatten is in flight, and re-protecting underneath it would
+        reserve the very shares it is selling.
+
+        Returns the protective intents placed.
+        """
+        placed: list[str] = []
+        held = {
+            position.ticker: position
+            for position in self.broker.get_positions()
+            if position.ticker in self.instruments and position.quantity > 0
+        }
+        open_orders = self.broker.get_open_orders()
+        for ticker, uid in sorted(self.instruments.items()):
+            if ticker in skip:
+                continue
+            mine = [order for order in open_orders if order.ticker == ticker]
+            if any(order.side is Side.SELL and not order.is_protective for order in mine):
+                continue
+            stops = [order for order in mine if order.is_protective]
+            position = held.get(ticker)
+            quantity = position.quantity if position is not None else Decimal(0)
+            covered = sum((order.quantity or Decimal(0) for order in stops), Decimal(0))
+
+            if quantity <= 0:
+                if stops:
+                    cleared, why = self._withdraw_protection(
+                        ticker, at=at, reason="the position it protected is no longer held"
+                    )
+                    if not cleared:
+                        refusals.append((ticker, f"stale stop not withdrawn: {why}"))
+                continue
+            if covered == quantity:
+                continue
+            if stops:
+                cleared, why = self._withdraw_protection(
+                    ticker,
+                    at=at,
+                    reason=f"the stop covers {covered} but {quantity} is held; re-protecting",
+                )
+                if not cleared:
+                    refusals.append((ticker, f"mis-sized stop not withdrawn: {why}"))
+                    continue
+            stop_id = self._reprotect(ticker, uid, at=at)
+            if stop_id is not None:
+                placed.append(stop_id)
+        return placed
+
+    def _withdraw_protection(self, ticker: str, *, at: datetime, reason: str) -> tuple[bool, str]:
+        """Withdraw every working protective stop on an instrument.
+
+        `(True, ...)` only when none is still working afterwards — the caller is
+        about to rely on the shares being free. Each withdrawal goes through the
+        risk engine like any other write to the venue: a cancel needs a token,
+        and the token is the one the engine issues for managing a protective
+        stop of that size, so a stop is never touched by a path the engine did
+        not approve.
+        """
+        stops = [
+            order
+            for order in self.broker.get_open_orders()
+            if order.ticker == ticker and order.is_protective
+        ]
+        if not stops:
+            return True, "no protective stop was working"
+        uid = self.instruments.get(ticker, "")
+        position = self._position(ticker, uid)
+        outcomes: list[str] = []
+        for order in stops:
+            quantity = order.quantity or Decimal(0)
+            reference = order.stop_price or self._reference_price(self._window(uid, at), uid)
+            if quantity <= 0 or reference is None or reference <= 0:
+                return False, (
+                    f"stop {order.broker_order_id} carries no usable quantity or price, so "
+                    "no withdrawal could be approved for it"
+                )
+            evaluation = self.risk.evaluate(
+                self._context(
+                    request=exit_request(
+                        t212_ticker=ticker,
+                        instrument_uid=uid,
+                        reference_price=reference,
+                        quantity=quantity,
+                        purpose=OrderPurpose.PROTECTIVE_STOP,
+                    ),
+                    at=at,
+                    position=position,
+                    regime=None,
+                    ticker=ticker,
+                    notional_ccy=None,
+                ),
+                run_id=self.run_id,
+            )
+            if evaluation.token is None:
+                return False, f"risk refused withdrawing the stop: {evaluation.refusal_summary}"
+            withdrawal = self.submitter.cancel(
+                evaluation.token,
+                broker_order_id=order.broker_order_id,
+                t212_ticker=ticker,
+                reason=reason,
+            )
+            if not withdrawal.withdrawn:
+                return False, (
+                    f"stop {order.broker_order_id} is still working: {withdrawal.detail}"
+                )
+            what = "filled before it could be withdrawn" if withdrawal.filled_first else "withdrawn"
+            outcomes.append(f"{order.broker_order_id} {what}")
+        if position.is_open:
+            self.submitter.record_protection(
+                t212_ticker=ticker,
+                quantity=position.quantity,
+                protected=False,
+                detail=f"stop withdrawn: {reason}",
+            )
+        return True, "; ".join(outcomes)
+
+    def _reprotect(self, ticker: str, uid: str, *, at: datetime) -> str | None:
+        """Protect whatever is held now, at the size held now.
+
+        Anchored on the position's average price when the venue reports one —
+        the stop's distance is the unprotected-gap assumption the sizing rules
+        used, measured from the entry — and on the newest close otherwise. The
+        owner's allocation rides along for the record; a protective stop is
+        risk-reducing, so no cap is applied to it.
+        """
+        position = self._position(ticker, uid)
+        if not position.is_open:
+            return None
+        anchor = position.entry_price or self._reference_price(self._window(uid, at), uid)
+        if anchor is None or anchor <= 0:
+            self.submitter.record_protection(
+                t212_ticker=ticker,
+                quantity=position.quantity,
+                protected=False,
+                detail="no entry price and no usable bar to place a stop from",
+            )
+            return None
+        owner = owner_of(self.ledger, t212_ticker=ticker)
+        funded = (
+            None
+            if owner is None
+            else next((f for f in self.book.funded if f.key == owner.key), None)
+        )
+        return self._protect(
+            notional_ccy=None if funded is None else funded.notional_ccy,
+            ticker=ticker,
+            uid=uid,
+            quantity=position.quantity,
+            entry_price=anchor,
+            at=at,
+            decision_id=None if owner is None else owner.decision_id,
+            parent_intent_id=None if owner is None else owner.intent_id,
+        )
+
     def _protect(
         self,
         *,
-        funded: FundedStrategy,
+        notional_ccy: Decimal | None,
         ticker: str,
         uid: str,
         quantity: Decimal,
         entry_price: Decimal,
         at: datetime,
-        decision_id: str,
-        parent_intent_id: str,
+        decision_id: str | None,
+        parent_intent_id: str | None,
     ) -> str | None:
-        """Place the protective stop, in the same cycle as the entry fill.
+        """Place a protective stop for `quantity`, `unprotected_gap` below `entry_price`.
 
-        The window between the fill and this order is unavoidable on a venue
-        with no bracket orders, but it is *bounded* by doing this here rather
-        than next cycle. A failure to protect is recorded loudly and the
-        position is left held: flattening on a failed stop would turn a data
-        problem into a realised loss, and `on_unprotected_position` in the
-        limits is where that policy is chosen rather than here.
+        Called in the same cycle as a synchronous entry fill, and by the
+        protection pass for everything else. The window between a fill and its
+        stop is unavoidable on a venue with no bracket orders, but it is
+        *bounded* — to one cycle at most. A failure to protect is recorded
+        loudly and the position is left held: flattening on a failed stop would
+        turn a data problem into a realised loss, and `on_unprotected_position`
+        in the limits is where that policy is chosen rather than here.
         """
         stop_price = stop_price_for(entry_price=entry_price, limits=self.pinned.limits)
         request = exit_request(
@@ -696,7 +912,7 @@ class TradingLoop:
                 position=PositionState(instrument_uid=uid, quantity=quantity, entry_at=at),
                 regime=None,
                 ticker=ticker,
-                notional_ccy=funded.notional_ccy,
+                notional_ccy=notional_ccy,
             ),
             run_id=self.run_id,
         )
