@@ -398,8 +398,16 @@ def _perturb_constant(tree: _Tree, rng: random.Random, bounds: ProposalBounds) -
     if not constants:
         return False
     target = rng.choice(constants)
-    current = Decimal(str(target["value"]))
-    moved = (current * Decimal(rng.choice(EDGE_STEPS))).quantize(Decimal("0.001"))
+    try:
+        current = Decimal(str(target["value"]))
+        moved = (current * Decimal(rng.choice(EDGE_STEPS))).quantize(Decimal("0.001"))
+    except ArithmeticError:
+        # A constant the decimal context cannot scale — the schema bounds them
+        # now, but a parent read from an older registry row may predate that.
+        # "Does not apply" rather than a raise: one unrepresentable parent must
+        # not take the whole search down, which is what M6's fuzzing found it
+        # doing.
+        return False
     if moved == current:
         return False
     target["value"] = str(moved)

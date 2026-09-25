@@ -34,7 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from tb.core.canonical import hash_payload
 from tb.core.errors import TbError
-from tb.features.pipeline import FEATURE_LIBRARY
+from tb.features.pipeline import FEATURE_LIBRARY, FEATURE_PLACES
 
 # A tree deeper than this is refused. Deep enough for anything meaningful,
 # shallow enough that recursive evaluation cannot approach Python's stack.
@@ -46,6 +46,10 @@ MAX_NODES = 64
 # below because a 0-bar lookback is meaningless.
 MIN_LOOKBACK = 1
 MAX_LOOKBACK = 400
+# The largest threshold a constant may state. Above the highest share price
+# any listed instrument trades at by several orders, and far below the point
+# where the decimal context overflows on a multiplication — see `Constant`.
+MAX_CONSTANT_MAGNITUDE = Decimal("1E+9")
 
 
 class SpecError(TbError):
@@ -98,6 +102,17 @@ class Constant(_Node):
     `Decimal` rather than float, and finite-checked. A spec carrying `NaN`
     would make every comparison against it false, producing a strategy that
     silently never trades and looks like a legitimate negative result.
+
+    **Bounded in magnitude and in precision**, and the bounds come from what a
+    constant is *for*: it is a threshold a feature is compared against, and
+    every feature in the library is a price, a percentage or a z-score. A
+    constant of `1E+999999999` is finite, so the finiteness check alone admitted
+    it — and the first arithmetic anything did on it raised `decimal.Overflow`.
+    M6's fuzzing found exactly that: a mutation perturbing such a constant took
+    the whole search down. Beyond `MAX_CONSTANT_MAGNITUDE`, or finer than the
+    `FEATURE_PLACES` every feature is rounded to, a constant is a threshold no
+    feature can cross, so it is refused as malformed rather than admitted as a
+    strategy that silently never fires.
     """
 
     kind: Literal["const"] = "const"
@@ -110,6 +125,18 @@ class Constant(_Node):
                 f"constant must be finite, got {self.value}. A NaN constant makes every "
                 "comparison against it false, which reads as a strategy that legitimately "
                 "declined to trade rather than as a malformed spec."
+            )
+        if abs(self.value) > MAX_CONSTANT_MAGNITUDE:
+            raise ValueError(
+                f"constant {self.value} is beyond {MAX_CONSTANT_MAGNITUDE}. Every feature in "
+                "the library is a price, a percentage or a z-score, so no feature can cross "
+                "this threshold — and arithmetic on it overflows the decimal context."
+            )
+        exponent = self.value.as_tuple().exponent
+        if isinstance(exponent, int) and exponent < -FEATURE_PLACES:
+            raise ValueError(
+                f"constant {self.value} has more decimal places than the {FEATURE_PLACES} "
+                "every feature is rounded to, so the comparison cannot resolve it."
             )
         return self
 
