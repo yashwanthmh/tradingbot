@@ -551,3 +551,156 @@ jobs:
             exit 1
           }
           echo "refused, remedies named in the right order"
+
+      - name: A dry-run research cycle produces its specs and a rejection report
+        env:
+          TB_VAR_DIR: var-m6
+        run: |
+          # The M6 check from the plan, end to end through the command line: a
+          # sealed vintage in, N specs and a rejection report out, every trial
+          # on the log, nothing registered. One driftless random walk, so there
+          # is no edge to find — this is about what a cycle produces and
+          # records, not about what it finds.
+          uv run tb init
+          uv run python - <<'PY'
+          import random
+          from datetime import UTC, datetime, timedelta
+          from decimal import Decimal
+          from pathlib import Path
+
+          from tb.data.barstore import BarStore
+          from tb.data.provider import Bar, BarBatch, Provenance, Resolution, Session
+          from tb.ledger.store import Ledger
+
+          BASE = datetime(2024, 1, 2, tzinfo=UTC)
+          UID = "isin:US0378331005"
+          with Ledger(Path("var-m6/ledger.db")) as ledger:
+              store = BarStore(ledger, root=Path("var-m6/bars"))
+              walk = random.Random(77)
+              price = Decimal("100.00")
+              bars = []
+              for day in range(500):
+                  opened = BASE + timedelta(days=day)
+                  price = max(price + Decimal(str(round(walk.gauss(0, 1.1), 4))), Decimal("1.00"))
+                  close = max(price + Decimal(str(round(walk.gauss(0, 0.7), 4))), Decimal("1.00"))
+                  bars.append(Bar(
+                      instrument_uid=UID, resolution=Resolution.DAILY,
+                      bar_open_utc=opened,
+                      available_at_utc=opened + timedelta(days=1),
+                      ingested_at_utc=opened + timedelta(days=1),
+                      provider="fixture", provenance=Provenance.BACKFILL,
+                      session=Session.REGULAR, open=price,
+                      high=max(price, close) + Decimal("0.5"),
+                      low=min(price, close) - Decimal("0.5"),
+                      close=close, volume=1_000_000,
+                  ))
+              store.ingest(BarBatch(
+                  bars=tuple(bars), provider="fixture", symbol=UID,
+                  resolution=Resolution.DAILY,
+                  requested_start=bars[0].bar_open_utc,
+                  requested_end=bars[-1].bar_open_utc,
+              ))
+              store.compact()
+              print("seeded one driftless random walk over 500 sessions")
+          PY
+          uv run tb data seal --resolution daily > /tmp/seal.txt 2>&1
+          VINTAGE=$(grep -o 'vint_[0-9A-Za-z_-]*' /tmp/seal.txt | head -1)
+          test -n "$VINTAGE" || { echo "::error::tb data seal named no vintage"; cat /tmp/seal.txt; exit 1; }
+          echo "$VINTAGE" > var-m6/vintage_id
+
+          uv run tb research cycle "$VINTAGE" --trials 24 --per-generation 12 --seed 7 \
+              --out /tmp/candidates.jsonl > /tmp/cycle.txt 2>&1 || {
+            echo "::error::tb research cycle failed on a sealed vintage"; cat /tmp/cycle.txt; exit 1; }
+          cat /tmp/cycle.txt
+          # "none" counts: the report must say what was refused even when
+          # nothing was, or its absence reads as a report never produced.
+          for EXPECTED in "refused before a backtest" "dry run: nothing registered" \
+                          "needs an out-of-sample Sharpe" "24 trial(s) recorded" \
+                          "wrote 24 candidate spec(s)"; do
+            grep -qF "$EXPECTED" /tmp/cycle.txt || {
+              echo "::error::the cycle report did not say: $EXPECTED"; cat /tmp/cycle.txt; exit 1; }
+          done
+          uv run python - <<'PY'
+          import json
+          from pathlib import Path
+
+          from tb.ledger.store import Ledger
+          from tb.strategy.dsl.schema import StrategySpec
+
+          lines = [json.loads(line) for line in Path("/tmp/candidates.jsonl").read_text().splitlines()]
+          with Ledger(Path("var-m6/ledger.db")) as ledger:
+              recorded = {row[0] for row in ledger.conn.execute("SELECT spec_hash FROM trials")}
+              n_trials = ledger.conn.execute("SELECT COUNT(*) FROM trials").fetchone()[0]
+              registered = ledger.conn.execute("SELECT COUNT(*) FROM strategy_specs").fetchone()[0]
+              completed = ledger.conn.execute(
+                  "SELECT payload_json FROM event_log WHERE event_type = 'search.completed'"
+              ).fetchone()
+          assert len(lines) == 24, f"{len(lines)} specs written for a 24-trial search"
+          assert n_trials == 24, f"{n_trials} trials recorded for a 24-trial search"
+          assert registered == 0, f"a dry run registered {registered} strategies"
+          assert completed is not None and json.loads(completed[0])["n_proposed"] == 24
+          for line in lines:
+              assert StrategySpec.parse(line["spec"]).spec_hash == line["spec_hash"], line["spec_hash"]
+              assert line["spec_hash"] in recorded, f"{line['spec_hash']} has no trial row"
+          print("24 specs produced, each one parseable and on the trial log; nothing registered")
+          PY
+          uv run tb ledger verify
+
+      - name: A failed model call records nothing, and a live key cannot reach a prompt
+        env:
+          TB_VAR_DIR: var-m6
+        run: |
+          # The optional LLM proposer, with no network and no key. Two refusals,
+          # both exit 2, both naming their cause — and neither may write to the
+          # ledger: a call that failed before anything was evaluated is a search
+          # that did not happen, and must leave no trials to deflate against.
+          VINTAGE=$(cat var-m6/vintage_id)
+          count_events() {
+            uv run python -c "
+          from pathlib import Path
+          from tb.ledger.store import Ledger
+          with Ledger(Path('var-m6/ledger.db')) as ledger:
+              print(ledger.conn.execute('SELECT COUNT(*) FROM event_log').fetchone()[0])
+          "
+          }
+          BEFORE=$(count_events)
+          # The one research component that sends text to a third party runs
+          # without the live broker key in its environment, or not at all.
+          if T212_LIVE_API_KEY=ci-placeholder-live-key-not-real \
+              uv run tb research cycle "$VINTAGE" --proposer llm > /tmp/llm-live.txt 2>&1; then
+            echo "::error::a model-backed search ran in a process holding the live broker key"
+            cat /tmp/llm-live.txt; exit 1
+          fi
+          grep -q "T212_LIVE_API_KEY" /tmp/llm-live.txt || {
+            echo "::error::the refusal did not name the live key"; cat /tmp/llm-live.txt; exit 1; }
+          if env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+              uv run tb research cycle "$VINTAGE" --proposer llm > /tmp/llm-nokey.txt 2>&1; then
+            echo "::error::a model-backed search reported success with no credential"
+            cat /tmp/llm-nokey.txt; exit 1
+          fi
+          grep -q "ANTHROPIC_API_KEY" /tmp/llm-nokey.txt || {
+            echo "::error::the refusal did not name the missing credential"; cat /tmp/llm-nokey.txt; exit 1; }
+          AFTER=$(count_events)
+          test "$BEFORE" = "$AFTER" || {
+            echo "::error::a failed model call wrote $((AFTER - BEFORE)) event(s) to the ledger"; exit 1; }
+          echo "both refused, both named their cause, and the ledger did not move"
+
+      - name: Generated specs never execute and never hang
+        run: |
+          # Deep nesting, huge exponents, NaN, homoglyphs, `__import__`, Python
+          # expressions — through the parser, the interpreter and the mutation
+          # operators, under a runtime audit hook that fails on any exec,
+          # compile or process spawn. A named step because it is a claim about
+          # the system: once specs are generated, the parser faces a generator.
+          set -o pipefail
+          uv run pytest tests/test_dsl_fuzz.py -q 2>&1 | tail -5
+
+      - name: A model is told nothing it could date, and what it returns is data
+        run: |
+          # Price-blind going out — the prompt builders take only abstract types,
+          # a tripwire refuses a rendered date, price, instrument or credential,
+          # and two vintages decades apart produce byte-identical prompts. And
+          # untrusted coming back: hostile replies are parsed as JSON, validated
+          # by the schema, and never executed or obeyed.
+          set -o pipefail
+          uv run pytest tests/test_llm_proposer.py -q 2>&1 | tail -5

@@ -170,6 +170,10 @@ class EventType(StrEnum):
     # events so "how big was the search that produced this" is answerable
     # without scanning every trial in it.
     SEARCH_COMPLETED = "search.completed"
+    # What a language model was asked and what it returned (M6). The one
+    # proposer that cannot be replayed from the search's seed, so the exchange
+    # itself is the record.
+    SPECS_PROPOSED = "search.specs_proposed"
     # The sealed holdout, evaluated once. A second evaluation of the same
     # version is refused by a uniqueness constraint, so this event appearing
     # twice for one version is impossible rather than merely unexpected.
@@ -1097,6 +1101,44 @@ class SearchCompletedPayload(EventPayload):
     detail: str = ""
 
 
+class SpecsProposedPayload(EventPayload):
+    """What a language model was asked for specs, and what came back.
+
+    Recorded because a model is the one proposer that cannot be replayed: the
+    random and mutation proposers regenerate every candidate from the search's
+    seed, and a model given the same prompt twice writes two different replies.
+    So the exchange is the record:
+
+    * **the exact prompts**, which is also how anyone can check after the fact
+      that the model was shown no date, price or instrument — the claim the
+      price-blind prompt builder makes, made auditable;
+    * **a hash of the reply** rather than the reply, since the reply is
+      untrusted text and everything in it that became a spec is below;
+    * **every accepted spec in full**, so a candidate that was never registered
+      can still be reconstructed from the hash on its trial row.
+    """
+
+    search_id: str
+    proposer: str
+    requested_model: str
+    served_model: str
+    fell_back: bool = False
+    stop_reason: str | None = None
+    n_requested: int
+    n_items: int
+    n_accepted: int
+    n_refused: int = 0
+    n_duplicates: int = 0
+    refused: list[str] = Field(default_factory=list)
+    ignored_keys: list[str] = Field(default_factory=list)
+    stopped: str = ""
+    system_prompt: str
+    user_prompt: str
+    reply_sha256: str
+    reply_chars: int
+    specs: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class HoldoutEvaluatedPayload(EventPayload):
     """The sealed holdout, evaluated — once.
 
@@ -1356,6 +1398,7 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.LOOP_CYCLE_COMPLETED: LoopCyclePayload,
     EventType.TRIAL_RECORDED: TrialPayload,
     EventType.SEARCH_COMPLETED: SearchCompletedPayload,
+    EventType.SPECS_PROPOSED: SpecsProposedPayload,
     EventType.HOLDOUT_EVALUATED: HoldoutEvaluatedPayload,
     EventType.HOLDOUT_VIOLATION_ATTEMPTED: HoldoutViolationPayload,
     EventType.PROMOTION_EVALUATED: PromotionPayload,
@@ -1437,6 +1480,7 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     # aggregate is for. Everything downstream of the gate is about a strategy.
     EventType.TRIAL_RECORDED: AggregateType.RUN,
     EventType.SEARCH_COMPLETED: AggregateType.RUN,
+    EventType.SPECS_PROPOSED: AggregateType.RUN,
     EventType.HOLDOUT_EVALUATED: AggregateType.STRATEGY,
     # Filed under SAFETY rather than STRATEGY: an attempt to read past the
     # seal is a fault in the process, and it is the kind of thing an operator

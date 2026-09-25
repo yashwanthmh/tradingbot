@@ -128,7 +128,7 @@ data*, then *can I reconcile broker state*, then *is there any edge after costs*
 | M3 | Cost model, non-cheating backtester, strategy DSL | **done** |
 | M4 | Risk engine, live loop, crash drills | **done** |
 | M5 | Registry, promotion gate, capital allocator | **done** |
-| M6 | Self-strategising search (LLM optional) | |
+| M6 | Self-strategising search (LLM optional) | **done** |
 | M7 | ML signal layer | |
 | M8 | Live at floor size, dashboard, daily journal | |
 | M9 | RL — interface stub only, deferred deliberately | |
@@ -397,6 +397,59 @@ produce an exit for what it left behind. An open position with no bracket order
 behind it and nothing managing it is the state this whole design exists to
 avoid, so the loop closes it itself and records which of the two causes it was:
 an owner that is no longer funded, or an entry that cannot be attributed at all.
+
+Where candidates come from — the search:
+
+```bash
+tb research cycle <vint>                        # dry run: search, record every trial
+tb research cycle <vint> --out specs.jsonl      # ...and write every spec it produced
+tb research cycle <vint> --apply                # register the survivors as candidates
+tb research cycle <vint> --from <id> --apply    # refine a registered strategy
+tb research cycle <vint> --proposer llm         # first generation from a Claude model
+```
+
+A cycle draws specs from the grammar (or mutates registered ones), refuses what
+cannot be evaluated or afforded before spending a backtest on it, backtests the
+rest on the training window only, and breeds the next generation from the best
+— one per feature signature, so a generation cannot collapse into twelve
+variants of one lookback. It registers candidates and nothing more: the holdout
+and the gate are separate commands, because a process that both chose a
+strategy and checked the choice would be marking its own homework.
+
+**The budget is the design, not a limit.** The report states the out-of-sample
+Sharpe a search of that size must show to clear the deflated-Sharpe gate —
+about 2.1 at ten trials, 3.8 at a thousand — so a thousand-spec sweep has
+already failed before it runs. Many small searches are cheaper than one large
+one, and they are not an evasion: a refinement stays in its parent's lineage,
+whose trial count accumulates across every search that touches it.
+
+**Every trial is recorded, dry runs included.** Refused, broken and evaluated
+alike, each stamped with the size of the whole batch it was selected from. A
+dry run that recorded nothing would let ten runs and a hand-registered winner
+pass as a search of one.
+
+**The optional model is told nothing it could date.** A model that has
+memorised market history is a lookahead channel no schema can catch — shown a
+date and a price, it knows what happened next. So `--proposer llm` builds its
+prompt from two abstract inputs only: the feature dictionary with units, and
+whether the index is above or below its long average, read through the sealed
+source. The types admit nothing else; a tripwire refuses any rendered prompt
+holding a date, a price, an instrument or a credential; and a test seals two
+vintages more than a decade apart, in different instruments at prices an order
+of magnitude apart, and asserts their prompts are byte-identical. What comes
+back is untrusted data: parsed as JSON with every number a `Decimal`, validated
+by the same schema as everything else, allowed to decide only the entry, the
+exit and the declared edge, and never executed. It meets the same validator,
+the same backtest and the same selection as a random draw — the model changes
+where a search starts and nothing about how its candidates are judged. A
+refusal or a failed call stops the cycle before anything is evaluated, rather
+than quietly becoming a random search under the model's name; and since a
+model cannot be replayed from a seed, every exchange is ledgered with its exact
+prompts and the full text of every spec it produced. Refusal fallbacks are on
+by default (`--no-fallback` turns them off), and the command will not run in a
+process holding `T212_LIVE_API_KEY`. It needs the optional extra
+(`uv sync --extra llm`) and `ANTHROPIC_API_KEY`; nothing else in the system
+does.
 
 ## Risk and honest limitations
 

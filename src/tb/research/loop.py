@@ -45,6 +45,14 @@ keeps the lineage it was registered under — otherwise a random draw that happe
 to rediscover a registered strategy would record its trials against a lineage
 nobody reads, and that strategy's lineage count, which is what its haircut is
 computed from, would stop growing.
+
+**A proposer is told the search's shape and nothing dated.** The first
+generation comes from a random draw unless a `ProposerFactory` is passed, and
+the factory receives a `ProposalContext`: the bounds, the budget, and the
+market's state as one of three words, read through the sealed source at the
+last training decision. No bar, no price and no date crosses into it, so a
+proposer backed by a model that has read market history has nothing to
+recognise the period by.
 """
 
 from __future__ import annotations
@@ -61,21 +69,37 @@ from tb.config.hard_limits import HardLimits
 from tb.core.clock import now_utc
 from tb.core.errors import TbError
 from tb.core.ids import new_id
-from tb.data.asof import BarSource
+from tb.data.asof import BarSource, HoldoutViolation
 from tb.data.provider import Resolution
+from tb.data.regime import RegimeGate
 from tb.data.snapshot import SnapshotStore
+from tb.ledger.events import Actor, EventType, SpecsProposedPayload
 from tb.ledger.store import Ledger
 from tb.registry.lineage import SpecRegistry, strategy_id_for
 from tb.registry.models import AuthorKind, RegisteredSpec, TrialOutcome
 from tb.research.holdout import (
     DEFAULT_HOLDOUT_FRACTION,
     HoldoutWindow,
+    SealedBarSource,
     decisions_between,
     holdout_boundary,
     training_reader,
 )
-from tb.research.mutate import MutationProposer, ProposalBounds, RandomProposer
-from tb.research.searcher import Candidate, SearchBudget, Searcher, SearchOutcome
+from tb.research.llm.adapter import LLMProposer
+from tb.research.llm.prompts import RegimeDescription
+from tb.research.mutate import (
+    MutationProposer,
+    ProposalBounds,
+    RandomProposer,
+    SpecProposer,
+)
+from tb.research.searcher import (
+    Candidate,
+    SearchBudget,
+    Searcher,
+    SearchOutcome,
+    required_sharpe,
+)
 from tb.research.trials import TrialLog
 from tb.research.validate import HISTORY_MARGIN_BARS, SpecValidator
 from tb.strategy.dsl.ops import DslStrategy, pipeline_from_spec
@@ -93,6 +117,26 @@ class CycleError(TbError):
 
 
 @dataclass(frozen=True, slots=True)
+class ProposalContext:
+    """Everything a proposer factory may know about the search it proposes for.
+
+    Short and abstract on purpose. The bounds come from the limits and the
+    training window's length; the budget and the Sharpe it implies come from
+    the caller's numbers alone; the regime is one of three words. None of it is
+    a bar, a price or a date, which is what lets a model-backed proposer be
+    handed all of it.
+    """
+
+    bounds: ProposalBounds
+    regime: RegimeDescription
+    n_trials: int
+    required_sharpe: float
+
+
+ProposerFactory = Callable[[ProposalContext], SpecProposer]
+
+
+@dataclass(frozen=True, slots=True)
 class CycleReport:
     """What one cycle did, in the shape an operator reads."""
 
@@ -105,9 +149,13 @@ class CycleReport:
     dry_run: bool
     duration_seconds: float
     lineage_of: Mapping[str, str]
+    proposer: str = "random"
+    proposer_notes: tuple[str, ...] = ()
 
     def explain(self) -> str:
-        lines = [self.window.summary(), self.outcome.explain()]
+        lines = [self.window.summary()]
+        lines.extend(f"{self.proposer}: {note}" for note in self.proposer_notes)
+        lines.append(self.outcome.explain())
         lines.append(f"{self.n_trials_recorded} trial(s) recorded under {self.search_id}")
         if self.dry_run:
             lines.append(
@@ -163,8 +211,16 @@ class ResearchCycle:
         register: bool = True,
         seed_strategy_ids: Sequence[str] = (),
         search_id: str | None = None,
+        proposer: ProposerFactory | None = None,
     ) -> CycleReport:
-        """Search, record every trial, register the survivors unless dry-running."""
+        """Search, record every trial, register the survivors unless dry-running.
+
+        `proposer` builds the first generation's source; a random draw when it
+        is `None`. It cannot be combined with seeds: a seeded search starts by
+        mutating the seeds, so a proposer passed alongside them would never be
+        asked, and a search that silently ignored the one it was given would be
+        recorded as something it was not.
+        """
         started = time.monotonic()
         moment = self._clock()
         search = search_id or new_id("srch", length=12)
@@ -173,6 +229,12 @@ class ResearchCycle:
             vintage_id, fraction=fraction
         )
         seeds = self._seeds(seed_strategy_ids)
+        if proposer is not None and seeds:
+            raise CycleError(
+                "a seeded search starts by mutating its seeds, so a proposer passed with "
+                "them would never be asked. Refine registered strategies with `--from`, or "
+                "start fresh ideas from a proposer — one search, one source."
+            )
 
         costs = CostModel(self._limits)
         meta = {uid: InstrumentMeta(uid, "USD", Jurisdiction.US) for uid in uids}
@@ -205,18 +267,39 @@ class ResearchCycle:
             max_lookback=max(1, n_training_bars - HISTORY_MARGIN_BARS),
             min_holding_minutes=DAILY_HOLD_MINUTES,
         )
+        min_deflated = self._limits.promotion.min_oos_deflated_sharpe
+        initial: SpecProposer = RandomProposer(bounds=bounds)
+        if proposer is not None:
+            initial = proposer(
+                ProposalContext(
+                    bounds=bounds,
+                    regime=training_regime(
+                        self._limits,
+                        source,
+                        sealed_from=window.sealed_from,
+                        as_of=schedule[-1],
+                    ),
+                    n_trials=budget.n_trials,
+                    required_sharpe=required_sharpe(
+                        n_trials=budget.n_trials, min_deflated_sharpe=min_deflated
+                    ),
+                )
+            )
         searcher = Searcher(
             evaluate=evaluate,
             validator=SpecValidator(limits=self._limits, n_training_bars=n_training_bars),
-            random_proposer=RandomProposer(bounds=bounds),
+            initial_proposer=initial,
             mutation_proposer=MutationProposer(bounds=bounds),
             budget=budget,
-            min_deflated_sharpe=self._limits.promotion.min_oos_deflated_sharpe,
+            min_deflated_sharpe=min_deflated,
             search_id=search,
             seed_parents=tuple(spec for _, spec in seeds),
         )
         outcome = searcher.run()
 
+        # The exchange first, then the trials it produced — the order in which
+        # they happened, and the order a reader of the log expects.
+        notes = self._record_exchanges(initial, search_id=search)
         lineage_of = self._lineages(outcome.candidates, seeds=seeds)
         registered = self._register(outcome.survivors, lineage_of=lineage_of) if register else ()
         n_recorded = self._record(
@@ -247,7 +330,52 @@ class ResearchCycle:
             dry_run=not register,
             duration_seconds=duration,
             lineage_of=lineage_of,
+            proposer="mutation" if seeds else initial.name,
+            proposer_notes=notes,
         )
+
+    # -- what a proposer told us -----------------------------------------------
+
+    def _record_exchanges(self, initial: SpecProposer, *, search_id: str) -> tuple[str, ...]:
+        """Ledger each model call, and return what the operator should read about it.
+
+        Only a model-backed proposer has anything to record: the random and
+        mutation proposers replay from the seed, so their exchanges are
+        reconstructible and recording them would be noise.
+        """
+        if not isinstance(initial, LLMProposer):
+            return ()
+        lines: list[str] = []
+        for report in initial.reports:
+            self._ledger.append(
+                EventType.SPECS_PROPOSED,
+                search_id,
+                SpecsProposedPayload(
+                    search_id=search_id,
+                    proposer=initial.name,
+                    requested_model=report.requested_model,
+                    served_model=report.served_model,
+                    fell_back=report.fell_back,
+                    stop_reason=report.stop_reason,
+                    n_requested=report.n_requested,
+                    n_items=report.n_items,
+                    n_accepted=len(report.accepted),
+                    n_refused=report.n_refused,
+                    n_duplicates=report.n_duplicates,
+                    refused=list(report.refused),
+                    ignored_keys=list(report.ignored_keys),
+                    stopped=report.stopped,
+                    system_prompt=report.system_prompt,
+                    user_prompt=report.user_prompt,
+                    reply_sha256=report.reply_sha256,
+                    reply_chars=report.reply_chars,
+                    specs=[proposal.spec.model_dump(mode="json") for proposal in report.accepted],
+                ),
+                actor=Actor.LLM,
+                run_id=self._run_id,
+            )
+            lines.extend(report.lines())
+        return tuple(lines)
 
     # -- the data the search may see ----------------------------------------
 
@@ -442,6 +570,38 @@ class ResearchCycle:
                 selected_from_lineage=lineage_totals[lineage_of[candidate.spec_hash]],
             )
         return len(candidates)
+
+
+def training_regime(
+    limits: HardLimits,
+    source: BarSource,
+    *,
+    sealed_from: datetime,
+    as_of: datetime,
+) -> RegimeDescription:
+    """The market's state at a training instant, reduced to one word.
+
+    Two defences, the same pair the training reader has. An instant at or past
+    the boundary raises: it is a caller's mistake, and describing "the market
+    now" from a point inside the holdout is exactly the leak the seal exists to
+    prevent. And the bars are read through a `SealedBarSource`, so even a
+    correct instant sees nothing from after the boundary if a later edit to
+    `visible_bars` widens what it asks its source for.
+
+    A vintage without the reference series reads as `unknown` — the regime
+    gate's own fail-closed answer — rather than as a guess.
+    """
+    if as_of >= sealed_from:
+        raise HoldoutViolation(
+            f"a regime reading for a proposer was asked for at {as_of.isoformat()}, at or "
+            f"past the holdout boundary {sealed_from.isoformat()}. What a proposer is told "
+            "must come from the training window like everything else the search sees."
+        )
+    reading = RegimeGate(limits).read(
+        SealedBarSource(inner=source, sealed_from=sealed_from),
+        as_of=as_of,
+    )
+    return RegimeDescription.from_reading(reading)
 
 
 def _lookback_for(spec: StrategySpec) -> timedelta:

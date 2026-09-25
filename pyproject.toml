@@ -25,6 +25,9 @@ data = [
     "pyarrow>=17.0",
     "pandas-market-calendars>=4.4",
 ]
+llm = [
+    "anthropic>=1.8.0",
+]
 
 [project.scripts]
 tb = "tb.cli:app"

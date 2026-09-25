@@ -40,7 +40,7 @@ from math import ceil
 from tb.backtest.engine import BacktestResult
 from tb.core.errors import TbError
 from tb.registry.models import TrialOutcome
-from tb.research.mutate import MutationProposer, Proposal, RandomProposer, SpecProposer
+from tb.research.mutate import MutationProposer, Proposal, SpecProposer
 from tb.research.selection import expected_max_sharpe
 from tb.research.trials import FALLBACK_SHARPE_DISPERSION
 from tb.research.validate import Rejection, SpecValidator
@@ -255,6 +255,13 @@ class Searcher:
     hand it a `training_reader`. A searcher that built its own reader could build
     one that sees past the seal, and no amount of care in this module would
     catch it.
+
+    `initial_proposer` fills the first generation of an unseeded search — a
+    random draw by default, a language model when one is configured. Every
+    later generation mutates the survivors. So the choice of proposer decides
+    where a search *starts*, and nothing about how its candidates are judged:
+    they meet the same validator, the same evaluator and the same selection
+    whichever source wrote them.
     """
 
     def __init__(
@@ -262,7 +269,7 @@ class Searcher:
         *,
         evaluate: Callable[[StrategySpec], BacktestResult],
         validator: SpecValidator,
-        random_proposer: RandomProposer,
+        initial_proposer: SpecProposer,
         mutation_proposer: MutationProposer,
         budget: SearchBudget,
         min_deflated_sharpe: float,
@@ -271,7 +278,7 @@ class Searcher:
     ) -> None:
         self._evaluate = evaluate
         self._validator = validator
-        self._random = random_proposer
+        self._initial = initial_proposer
         self._mutation = mutation_proposer
         self._budget = budget
         self._min_deflated = min_deflated_sharpe
@@ -297,11 +304,11 @@ class Searcher:
             batch = min(self._budget.n_per_generation, remaining)
             remaining -= batch
             if generation == 1:
-                # Seeded: mutate the parents handed in. Unseeded: draw from the
-                # grammar. The mutation proposer falls back to a random draw on
-                # its own when it has no parents, so this is a choice of source
-                # rather than two code paths.
-                proposer: SpecProposer = self._mutation if self._seed_parents else self._random
+                # Seeded: mutate the parents handed in. Unseeded: ask the
+                # initial proposer. The mutation proposer falls back to a random
+                # draw on its own when it has no parents, so this is a choice of
+                # source rather than two code paths.
+                proposer: SpecProposer = self._mutation if self._seed_parents else self._initial
                 parents: tuple[StrategySpec, ...] = self._seed_parents
             else:
                 proposer = self._mutation

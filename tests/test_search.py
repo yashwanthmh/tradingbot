@@ -515,7 +515,7 @@ def _searcher(
     return Searcher(
         evaluate=cast(Callable[[StrategySpec], BacktestResult], evaluate),
         validator=SpecValidator(limits=LIMITS, n_training_bars=n_training_bars),
-        random_proposer=RandomProposer(bounds=BOUNDS),
+        initial_proposer=RandomProposer(bounds=BOUNDS),
         mutation_proposer=MutationProposer(bounds=BOUNDS),
         budget=budget,
         min_deflated_sharpe=LIMITS.promotion.min_oos_deflated_sharpe,

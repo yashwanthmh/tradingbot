@@ -18,7 +18,7 @@ cycle *records*, and the properties that matter are all about the record.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -33,35 +33,8 @@ from tb.ledger.store import Ledger
 from tb.registry.models import StrategyStatus
 from tb.research.holdout import DECISION_OFFSET, decisions_between
 from tb.research.trials import TrialLog
+from tb.strategy.dsl.schema import StrategySpec
 from tests.test_cli_registry import _init, _out, _run, seed_bars
-
-
-@pytest.fixture
-def cli_env(tmp_path: Path, write_limits: Callable[[dict[str, Any]], Path]) -> dict[str, Any]:
-    """A ledger, a bar store and a limits file, addressed the way the CLI takes them."""
-    run_dir = tmp_path / "run"
-    run_dir.mkdir(exist_ok=True)
-    limits = write_limits(
-        {
-            "safety": {
-                "kill_switch_path": str(run_dir / "KILL"),
-                "heartbeat_path": str(run_dir / "heartbeat"),
-            }
-        }
-    )
-    return {
-        "limits": limits,
-        "db": tmp_path / "ledger.db",
-        "bars": tmp_path / "bars",
-        "bar_args": [
-            "--limits",
-            str(limits),
-            "--db",
-            str(tmp_path / "ledger.db"),
-            "--bars",
-            str(tmp_path / "bars"),
-        ],
-    }
 
 
 def _ledger(env: dict[str, Any]) -> Ledger:
@@ -327,6 +300,49 @@ def test_the_report_names_the_sharpe_the_search_size_requires(
     result = _cycle(cli_env, vintage_id)
     assert result.exit_code == 0, _out(result)
     assert "needs an out-of-sample Sharpe" in _out(result)
+
+
+def test_the_rejection_report_is_printed_even_when_empty(cli_env: dict[str, Any]) -> None:
+    """An absent table reads the same as a report that was never produced.
+
+    The deterministic proposers are built so their draws rarely fail validation —
+    a search whose rejections were all procedural would have measured nothing —
+    so "none" is the common case and has to be said.
+    """
+    vintage_id = _sealed_vintage(cli_env)
+    result = _cycle(cli_env, vintage_id)
+    assert result.exit_code == 0, _out(result)
+    output = _out(result)
+    assert "refused before a backtest" in output
+
+
+def test_a_dry_run_can_write_every_spec_it_produced(
+    cli_env: dict[str, Any], tmp_path: Path
+) -> None:
+    """**The plan's check: a dry run produces N specs plus a rejection report.**
+
+    The trial log keeps hashes; `--out` keeps the trees. Every line must be a
+    spec the schema accepts with the hash its trial row carries, so the file is
+    evidence about the search rather than a second, drifting copy of it.
+    """
+    vintage_id = _sealed_vintage(cli_env)
+    target = tmp_path / "candidates.jsonl"
+    result = _cycle(cli_env, vintage_id, "--out", str(target))
+    assert result.exit_code == 0, _out(result)
+    assert "wrote 16 candidate spec(s)" in _out(result)
+
+    lines = [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == 16
+    with _ledger(cli_env) as ledger:
+        recorded = {
+            str(row["spec_hash"])
+            for row in ledger.conn.execute("SELECT spec_hash FROM trials").fetchall()
+        }
+    for line in lines:
+        assert StrategySpec.parse(line["spec"]).spec_hash == line["spec_hash"]
+        assert line["spec_hash"] in recorded
+        assert line["outcome"] in {"evaluated", "rejected", "errored"}
+        assert (line["rejection"] is None) == (line["outcome"] != "rejected")
 
 
 # --------------------------------------------------------------------------

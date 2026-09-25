@@ -18,11 +18,13 @@ all.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import timedelta
+from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from rich.console import Console
@@ -48,9 +50,14 @@ from tb.research.holdout import (
     evaluation_reader,
     holdout_boundary,
 )
+from tb.research.llm.adapter import DEFAULT_MODEL, LLMError
 from tb.research.null_gate import measure_false_promotion_rate
 from tb.research.trials import TrialLog
 from tb.strategy.dsl.ops import DslStrategy, pipeline_from_spec
+
+if TYPE_CHECKING:
+    from tb.research.loop import CycleReport, ProposalContext, ProposerFactory
+    from tb.research.mutate import SpecProposer
 
 research_app = typer.Typer(
     help="Trials, multiplicity and the sealed holdout.", no_args_is_help=True
@@ -97,6 +104,13 @@ def _ledger(db: Path | None, pinned: PinnedLimits) -> Ledger:
 # --------------------------------------------------------------------------
 
 
+class ProposerChoice(StrEnum):
+    """Where a search's first generation comes from."""
+
+    RANDOM = "random"
+    LLM = "llm"
+
+
 @research_app.command("cycle")
 def cycle(
     vintage_id: Annotated[str, typer.Argument(help="The sealed vintage to search over.")],
@@ -135,6 +149,34 @@ def cycle(
             help="Register the survivors. Every trial is recorded either way.",
         ),
     ] = False,
+    proposer: Annotated[
+        ProposerChoice,
+        typer.Option(
+            "--proposer",
+            help=(
+                "Where the first generation comes from: `random` needs nothing; `llm` asks "
+                "a Claude model (the llm extra and ANTHROPIC_API_KEY)."
+            ),
+        ),
+    ] = ProposerChoice.RANDOM,
+    model: Annotated[
+        str, typer.Option("--model", help="The Claude model `--proposer llm` asks.")
+    ] = DEFAULT_MODEL,
+    fallback: Annotated[
+        bool,
+        typer.Option(
+            "--fallback/--no-fallback",
+            help="Let the API re-run a request its model declines on a recommended fallback.",
+        ),
+    ] = True,
+    out: Annotated[
+        Path | None,
+        typer.Option(
+            "--out",
+            help="Write every candidate spec, with its outcome, as JSON lines.",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """Search a sealed vintage for strategies, recording every trial.
 
@@ -150,6 +192,18 @@ def cycle(
     The budget is the whole search. The output reports the out-of-sample Sharpe a
     search of that size must show to clear the deflated-Sharpe gate — about 2.1
     at ten trials and 3.8 at a thousand — which is the reason to keep it small.
+
+    The report always says what was refused before a backtest and why, "none"
+    included. `--out FILE` writes every candidate's full spec with its outcome
+    as JSON lines — the trial log keeps only hashes, so this is how a dry run's
+    specs can be read.
+
+    `--proposer llm` changes where the first generation comes from and nothing
+    else: the model is shown the feature dictionary, the constraints and whether
+    the index is above or below its long average — never a date, a price or an
+    instrument — and what it returns meets the same validator, backtest and
+    selection as a random draw. Every exchange is recorded in the ledger, since
+    unlike a seeded draw it cannot be replayed.
     """
     from tb.research.loop import CycleError, ResearchCycle
     from tb.research.searcher import SearchBudget, SearchError
@@ -165,6 +219,17 @@ def cycle(
     except SearchError as exc:
         err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
         raise typer.Exit(2) from exc
+
+    factory: ProposerFactory | None = None
+    if proposer is ProposerChoice.LLM:
+        if parents:
+            err_console.print(
+                f"{BAD} `--from` refines registered strategies by mutation, so a search "
+                "seeded with it never asks the model. Run one or the other.",
+                soft_wrap=True,
+            )
+            raise typer.Exit(2)
+        factory = _llm_factory(model=model, fallback=fallback)
 
     with _ledger(db, pinned) as ledger:
         store = BarStore(
@@ -182,7 +247,18 @@ def cycle(
                 fraction=fraction,
                 register=apply,
                 seed_strategy_ids=tuple(parents or ()),
+                proposer=factory,
             )
+        except LLMError as exc:
+            # The model is asked for the first generation only, so a failed call
+            # always precedes the first evaluation — worth saying, because the
+            # operator's next question is whether the failure cost trials.
+            err_console.print(
+                f"{BAD} {escape(str(exc))}\n  No trial was recorded: the model is asked "
+                "before anything is evaluated, so this search did not happen.",
+                soft_wrap=True,
+            )
+            raise typer.Exit(2) from exc
         except (CycleError, TbError) as exc:
             err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
             raise typer.Exit(2) from exc
@@ -195,6 +271,18 @@ def cycle(
         for code, count in sorted(outcome.rejections_by_code.items(), key=lambda item: -item[1]):
             table.add_row(code, str(count))
         console.print(table)
+    else:
+        # Said rather than left out. An absent table reads the same as a report
+        # that was never produced, and "nothing was refused" is a finding: it
+        # means every proposal cost a backtest.
+        console.print("  refused before a backtest: none")
+    if out is not None:
+        _write_candidates(out, report)
+        console.print(
+            f"  wrote {outcome.n_proposed} candidate spec(s), with what became of each, "
+            f"to {escape(str(out))}",
+            soft_wrap=True,
+        )
 
     ranked = sorted(
         (c for c in outcome.candidates if c.fitness is not None),
@@ -229,6 +317,72 @@ def cycle(
         f"{report.duration_seconds:.1f}s. `tb research trials --search {report.search_id}` "
         "shows every one."
     )
+
+
+def _write_candidates(path: Path, report: CycleReport) -> None:
+    """Every candidate of a search as a JSON line: the spec, and what became of it.
+
+    What a dry run produces. The trial log keeps each candidate's hash and
+    numbers but not its tree, so without this a dry run's specs exist only as
+    hashes; with it, each one can be read, compared or registered by hand —
+    and a hand registration still carries the search's trial count, because the
+    trials were recorded when the search ran.
+    """
+    with path.open("w", encoding="utf-8") as handle:
+        for candidate in report.outcome.candidates:
+            rejection = candidate.rejection
+            line = {
+                "spec_hash": candidate.spec_hash,
+                "generation": candidate.generation,
+                "operator": candidate.proposal.operator,
+                "author_kind": candidate.proposal.author_kind.value,
+                "lineage_id": report.lineage_of.get(candidate.spec_hash),
+                "outcome": candidate.outcome.value,
+                "rejection": None
+                if rejection is None
+                else {
+                    "code": rejection.code,
+                    "reason": rejection.reason,
+                    "observed": rejection.observed,
+                    "threshold": rejection.threshold,
+                },
+                "error": candidate.error or None,
+                "net_sharpe": candidate.net_sharpe,
+                "n_trades": candidate.n_trades,
+                "spec": candidate.spec.model_dump(mode="json"),
+            }
+            handle.write(json.dumps(line, sort_keys=True) + "\n")
+
+
+def _llm_factory(*, model: str, fallback: bool) -> ProposerFactory:
+    """The model-backed proposer, with its client built before any data loads.
+
+    Built here rather than inside the cycle so a missing SDK, a missing key or a
+    live broker key in the environment fails in the first second, not after the
+    vintage has been read and the training window laid out.
+    """
+    from tb.research.llm.adapter import AnthropicClient, LLMProposer, LLMUnavailable
+
+    try:
+        client = AnthropicClient(model=model, fallbacks=fallback)
+    except LLMUnavailable as exc:
+        err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+        raise typer.Exit(2) from exc
+    console.print(
+        f"  first generation from {escape(model)}, refusal fallbacks "
+        + ("on" if fallback else "off")
+    )
+
+    def build(context: ProposalContext) -> SpecProposer:
+        return LLMProposer(
+            client=client,
+            bounds=context.bounds,
+            regime=context.regime,
+            required_sharpe=context.required_sharpe,
+            n_trials=context.n_trials,
+        )
+
+    return build
 
 
 # --------------------------------------------------------------------------

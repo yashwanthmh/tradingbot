@@ -110,6 +110,38 @@ def env(tmp_path: Path, write_limits: Callable[[dict[str, Any]], Path]) -> dict[
 
 
 @pytest.fixture
+def cli_env(tmp_path: Path, write_limits: Callable[[dict[str, Any]], Path]) -> dict[str, Any]:
+    """A ledger, a bar store and a limits file, addressed the way the CLI takes them.
+
+    Shared by the research-cycle suites, deterministic and model-backed alike,
+    so both drive the cycle through the same directory layout.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(exist_ok=True)
+    limits = write_limits(
+        {
+            "safety": {
+                "kill_switch_path": str(run_dir / "KILL"),
+                "heartbeat_path": str(run_dir / "heartbeat"),
+            }
+        }
+    )
+    return {
+        "limits": limits,
+        "db": tmp_path / "ledger.db",
+        "bars": tmp_path / "bars",
+        "bar_args": [
+            "--limits",
+            str(limits),
+            "--db",
+            str(tmp_path / "ledger.db"),
+            "--bars",
+            str(tmp_path / "bars"),
+        ],
+    }
+
+
+@pytest.fixture
 def ledger_path(tmp_path: Path) -> Path:
     return tmp_path / "ledger.db"
 
