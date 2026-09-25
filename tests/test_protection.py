@@ -216,6 +216,30 @@ def test_an_exit_the_venue_refuses_is_re_protected_in_the_same_cycle(
         assert refused.stops_placed
 
 
+def test_a_refused_exit_is_re_protected_at_the_level_its_stop_had(env: dict[str, Any]) -> None:
+    """The same case at a venue that fills at the close the entry was sized
+    from, as the paper venue does and the real one nearly does. The stop goes
+    back at exactly its old level, size and decision — every field its
+    withdrawn predecessor had — and was refused as a duplicate of it, leaving
+    the position with no stop. The previous test passed only because its fill
+    price differed from the bar."""
+    _seed(env, _rising_bars(days=140))
+    broker = _broker(price=Decimal("119.0"))  # the newest close visible at AS_OF
+    book = _book(env, ["enter", "exit"])
+    with Ledger(env["db"], config_hash=env["pinned"].config_hash) as ledger:
+        _cycle(env, ledger, broker, book, at=AS_OF, run_id="run_a")
+        held = _held(broker)
+        (original,) = broker.protective_orders_for(TICKER)
+        broker.reject_once[TICKER] = ("MarketClosed", "the venue refused the exit")
+
+        refused = _cycle(env, ledger, broker, book, at=LATER, run_id="run_b")
+        assert refused.stops_placed, refused.refusals
+        (restored,) = broker.protective_orders_for(TICKER)
+        assert restored.quantity == held
+        assert restored.stop_price == original.stop_price
+        assert restored.broker_order_id != original.broker_order_id
+
+
 def test_an_exit_in_flight_is_not_re_protected_underneath(env: dict[str, Any]) -> None:
     """While an exit is working at the venue, placing a stop would reserve the
     very shares it is selling. The protection pass leaves the instrument alone

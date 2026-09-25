@@ -427,6 +427,36 @@ def test_post_fill_pre_stop_leaves_the_position_naked_and_says_so(
     assert len(broker.protective_orders_for(TICKER)) == 1, "the window is closed"
 
 
+def test_a_stop_gone_from_the_venue_is_not_handed_back_as_its_replacement(
+    db: Path, broker: SimulatedBroker
+) -> None:
+    """A stop cancelled in the venue's app — or one that fired — leaves its
+    intent acknowledged until settlement reads what became of it. A replacement
+    at the same level has the same id, and handing the acknowledged one back
+    reported protection that was not there. It is refused instead, sending
+    nothing, until settlement says whether the old stop sold the shares."""
+    with _process(db, broker, run_id="run_1") as submitter:
+        submitter.submit(_token(), order_type=OrderType.MARKET, purpose=OrderPurpose.ENTRY)
+        position = broker.get_position(TICKER)
+        assert position is not None
+        stop_token = _token(purpose=OrderPurpose.PROTECTIVE_STOP, held=position.quantity)
+        stop = {
+            "order_type": OrderType.STOP,
+            "purpose": OrderPurpose.PROTECTIVE_STOP,
+            "stop_price": stop_price_for(entry_price=Decimal("100.00"), limits=LIMITS),
+            "time_validity": TimeValidity.GOOD_TILL_CANCEL,
+        }
+        placed = submitter.submit(stop_token, **stop)  # type: ignore[arg-type]
+        broker.cancel_order(stop_token, broker_order_id=placed.broker_order_id)  # in the app
+        posts = len(broker.posts)
+
+        with pytest.raises(SubmissionError, match="not yet settled"):
+            submitter.submit(stop_token, **stop)  # type: ignore[arg-type]
+
+    assert len(broker.posts) == posts, "the refused replacement sent nothing"
+    assert broker.protective_orders_for(TICKER) == ()
+
+
 def test_the_unprotected_window_is_recorded_with_its_duration(
     db: Path, broker: SimulatedBroker
 ) -> None:

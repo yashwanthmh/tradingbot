@@ -239,6 +239,52 @@ def test_re_committing_returns_the_same_row(log: IntentLog) -> None:
     assert len(log.for_ticker(TICKER)) == 1
 
 
+@pytest.mark.parametrize(
+    ("purpose", "decision_id"),
+    [(OrderPurpose.PROTECTIVE_STOP, "dec_1"), (OrderPurpose.FLATTEN, None)],
+)
+def test_a_settled_stop_or_flatten_is_placed_again_under_a_new_id(
+    log: IntentLog, purpose: OrderPurpose, decision_id: str | None
+) -> None:
+    """**Not a retry: a replacement.** A stop withdrawn for an exit the venue
+    then refuses goes back at the same level, same size, same entry decision;
+    every flatten of one size has no decision at all. Each field matches the
+    settled predecessor, and handing that predecessor back refused the
+    replacement as a duplicate — leaving the position unprotected, or the
+    orphan unflattened. A predecessor still live is handed back as before."""
+    token = _token(side=Side.SELL, purpose=purpose, decision_id=decision_id)
+    order_type = OrderType.STOP if purpose is OrderPurpose.PROTECTIVE_STOP else OrderType.MARKET
+    stop = Decimal("85.00") if purpose is OrderPurpose.PROTECTIVE_STOP else None
+
+    def commit() -> str:
+        return log.commit(token=token, order_type=order_type, stop_price=stop, at=AS_OF).intent_id
+
+    first = commit()
+    assert commit() == first, "a live predecessor is the retry, and is handed back"
+    log.resolve(first, state=IntentState.RESOLVED_CANCELLED, resolved_by="test", at=AS_OF)
+
+    second = commit()
+    assert second != first
+    assert commit() == second
+    log.mark_rejected(second, detail="refused", at=AS_OF)
+
+    third = commit()
+    assert third not in (first, second)
+    assert len(log.for_ticker(TICKER)) == 3
+
+
+def test_a_settled_entry_is_never_placed_again(log: IntentLog) -> None:
+    """The other side of the rule: an entry answers exactly one decision, so
+    the same decision committed again after it filled is still the filled
+    intent — and the submitter refuses to send it a second time."""
+    token = _token()
+    first = log.commit(token=token, order_type=OrderType.MARKET, at=AS_OF)
+    log.resolve(first.intent_id, state=IntentState.RESOLVED_FILLED, resolved_by="test", at=AS_OF)
+    again = log.commit(token=token, order_type=OrderType.MARKET, at=AS_OF)
+    assert again.intent_id == first.intent_id
+    assert again.state is IntentState.RESOLVED_FILLED
+
+
 def test_an_intent_cannot_describe_an_unapproved_order(log: IntentLog) -> None:
     """The intent is derived from the token, not from loose parameters.
 

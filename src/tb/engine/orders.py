@@ -171,6 +171,17 @@ class OrderSubmitter:
         # it is a duplicate call. Returning its outcome is right; sending
         # again is not.
         if intent.state is IntentState.ACKNOWLEDGED and intent.broker_order_id:
+            if intent.is_replaceable and not self._still_working(intent.broker_order_id):
+                # A stop re-placed while its predecessor is gone from the venue
+                # but not yet settled. Handing the predecessor back would record
+                # protection that is not there; sending now could stack a stop on
+                # shares the predecessor already sold, if it fired. Settlement
+                # says which, and the replacement goes out after it.
+                raise SubmissionError(
+                    f"{intent.intent_id} would reuse order {intent.broker_order_id}, which is "
+                    "no longer working at the venue and not yet settled. The replacement waits "
+                    "for settlement to say whether it filled."
+                )
             return Submission(intent, intent.broker_order_id, OrderStatus.WORKING)
         if intent.state.is_terminal:
             raise SubmissionError(
@@ -258,6 +269,14 @@ class OrderSubmitter:
             detail=f"venue status {placed.raw_status or placed.status.value}",
         )
         return Submission(intent, placed.broker_order_id, placed.status)
+
+    def _still_working(self, broker_order_id: str) -> bool:
+        """Whether the venue still lists this order as live. Unreadable is not live."""
+        try:
+            order = self.broker.get_order(broker_order_id)
+        except (TransportError, BrokerHttpError):
+            return False
+        return order is not None and order.status.is_open
 
     # -- withdrawal --------------------------------------------------------
 

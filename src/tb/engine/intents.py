@@ -177,6 +177,10 @@ class OrderIntent:
     def is_unknown(self) -> bool:
         return self.state.is_unknown
 
+    @property
+    def is_replaceable(self) -> bool:
+        return self.purpose in REPLACEABLE_PURPOSES
+
     def fingerprint(self) -> tuple[str, str, str, Decimal]:
         """What an order at the broker must match to be *this* intent.
 
@@ -245,6 +249,32 @@ def compute_intent_id(
     )
 
 
+# Orders the engine places to keep a state true rather than to answer one
+# decision, so the same order legitimately recurs with every field identical:
+# a protective stop withdrawn for an exit the venue then refuses is put back at
+# the same level, for the same quantity, under the same entry decision; and
+# every flatten of the same size has no decision at all. Entries and exits are
+# not here: each answers exactly one decision, and a second submission for the
+# same decision is a bug the id must keep catching.
+REPLACEABLE_PURPOSES: frozenset[OrderPurpose] = frozenset(
+    {OrderPurpose.PROTECTIVE_STOP, OrderPurpose.FLATTEN}
+)
+
+
+def replacement_id(base_intent_id: str, generation: int) -> str:
+    """The id of the `generation`-th placement of one replaceable order.
+
+    Generation 0 is the base id itself, so every intent committed before
+    replacements existed keeps its id. Later generations are as deterministic
+    as the base — derived from it and the count — so a crash while placing a
+    replacement recomputes the same id on restart and finds the same row,
+    which is the property the base id exists for.
+    """
+    if generation == 0:
+        return base_intent_id
+    return deterministic_id("int", parts={"base": base_intent_id, "generation": str(generation)})
+
+
 class IntentLog:
     """The write-ahead log. Commits before the wire, resolves by looking.
 
@@ -284,6 +314,14 @@ class IntentLog:
         A re-commit is not an error — it is what a retry of the same logical
         order looks like, and the correct response is to hand back the row
         that already exists rather than to create a second one.
+
+        Except for a replaceable order (`REPLACEABLE_PURPOSES`) whose
+        predecessor is settled. That is not a retry: the predecessor was
+        withdrawn, filled or refused, and handing it back would either refuse
+        the replacement as a duplicate or — for a stop re-placed at its old
+        level — report protection that is no longer there. So the next
+        generation is committed instead. A predecessor still in flight or at
+        the venue is handed back as before.
         """
         moment = at or now_utc()
         token.authorises(
@@ -304,7 +342,7 @@ class IntentLog:
                 "is not protection."
             )
 
-        intent_id = compute_intent_id(
+        base_id = compute_intent_id(
             t212_ticker=token.t212_ticker,
             side=token.side,
             order_type=order_type,
@@ -313,7 +351,14 @@ class IntentLog:
             decision_id=token.decision_id,
             stop_price=stop_price,
         )
+        intent_id = base_id
         existing = self.get(intent_id)
+        if token.purpose in REPLACEABLE_PURPOSES:
+            generation = 0
+            while existing is not None and existing.state.is_terminal:
+                generation += 1
+                intent_id = replacement_id(base_id, generation)
+                existing = self.get(intent_id)
         if existing is not None:
             return existing
 
