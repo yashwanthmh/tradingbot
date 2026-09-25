@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Callable
 from contextlib import suppress
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
@@ -34,6 +36,7 @@ from tb.config.loader import PinnedLimits, load_hard_limits
 from tb.core.errors import TbError
 from tb.core.ids import new_run_id
 from tb.data.barstore import BarStore
+from tb.data.calendar import TradingCalendar
 from tb.engine.funding import (
     Book,
     explicit_book,
@@ -243,6 +246,15 @@ def run(
             self_check=self_check,
             lock=lock,
             equity=EquityCurve(ledger, run_id=run_id),
+            # The promoted book is reviewed, re-rung, re-allocated and rebuilt
+            # once a session. The drill book is not: nothing funds it.
+            on_new_session=(
+                None
+                if strategy is not None
+                else _session_refresh(
+                    ledger, pinned, broker=broker, universe=universe, run_id=run_id
+                )
+            ),
         )
         _price_paper_venue(broker, store=store, universe=universe, resolution=loop.resolution)
 
@@ -425,6 +437,57 @@ def _broker(mode: str, pinned: PinnedLimits, *, equity: Decimal) -> Broker:
     except TbError as exc:
         err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
         raise typer.Exit(2) from exc
+
+
+def _session_refresh(
+    ledger: Ledger,
+    pinned: PinnedLimits,
+    *,
+    broker: Broker,
+    universe: dict[str, str],
+    run_id: str,
+) -> Callable[[datetime], Book | None]:
+    """The loop's once-a-session hook: the portfolio pass, then a fresh book.
+
+    The pass reviews, re-rungs and re-allocates (`tb.portfolio.session`); the
+    book is then rebuilt from the registry, so a loop left running trades the
+    rungs and allocations of today — and picks up a promotion, or a retirement
+    applied with `tb review --apply`, at the next session rather than at the
+    next restart. A session already reviewed keeps the book it has.
+    """
+    from tb.engine.funding import owner_of
+    from tb.portfolio.correlation import Holding
+    from tb.portfolio.session import run_session_pass
+
+    def refresh(at: datetime) -> Book | None:
+        equity = broker.get_cash().equity
+        session = TradingCalendar().day_of(at).day
+        holdings: list[Holding] = []
+        for position in broker.get_positions():
+            owner = owner_of(ledger, t212_ticker=position.ticker)
+            if position.quantity > 0 and position.ticker in universe and owner is not None:
+                holdings.append(
+                    Holding(
+                        strategy_id=owner.strategy_id,
+                        instrument_uid=universe[position.ticker],
+                        session_date=session,
+                    )
+                )
+        passed = run_session_pass(
+            ledger,
+            limits=pinned.limits,
+            equity_ccy=equity,
+            at=at,
+            holdings=holdings,
+            run_id=run_id,
+        )
+        if passed.skipped:
+            return None
+        book = funded_book(ledger, limits=pinned.limits, equity_ccy=equity, run_id=run_id, at=at)
+        record_book(ledger, book, run_id=run_id)
+        return book
+
+    return refresh
 
 
 def _price_paper_venue(

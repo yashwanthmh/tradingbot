@@ -67,7 +67,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from tb.broker.port import Broker, OrderPurpose, OrderType, Side, TimeValidity
@@ -171,7 +171,16 @@ class TradingLoop:
     risk: RiskEngine = field(default_factory=RiskEngine)
     clock: Callable[[], datetime] = now_utc
     resolution: str = "daily"
+    # Called at the first cycle of each trading session, before its first
+    # decision, with the cycle's instant; returns the book to trade from then
+    # on, or `None` to keep the current one. `tb run` passes the per-session
+    # portfolio pass and a rebuild of the promoted book, so a loop left running
+    # for weeks trades the rungs and allocations of today rather than those of
+    # the day it started. A test, or `--strategy trivial`, passes nothing and
+    # the book it was given stands.
+    on_new_session: Callable[[datetime], Book | None] | None = None
     _cycle: int = field(default=0, init=False)
+    _session: date | None = field(default=None, init=False)
 
     # -- one pass ----------------------------------------------------------
 
@@ -183,6 +192,7 @@ class TradingLoop:
 
         self._preflight(at)
         fills, settlement_note = self._settle(at)
+        self._begin_session(at)
         regime = self._read_regime(at)
 
         decisions: list[Decision] = []
@@ -412,6 +422,24 @@ class TradingLoop:
             at=at,
         )
         return fills, note
+
+    def _begin_session(self, at: datetime) -> None:
+        """Once a trading session, before its first decision: refresh the book.
+
+        After settlement, so the session's review and rungs see every trade
+        closed so far. Only on trading days: a weekend has no session to size.
+        """
+        if self.on_new_session is None:
+            return
+        from tb.data.calendar import TradingCalendar
+
+        day = TradingCalendar().day_of(at)
+        if not day.is_trading_day or day.day == self._session:
+            return
+        self._session = day.day
+        refreshed = self.on_new_session(at)
+        if refreshed is not None:
+            self.book = refreshed
 
     # -- one instrument ----------------------------------------------------
 

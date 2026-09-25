@@ -195,6 +195,10 @@ class EventType(StrEnum):
     LADDER_MOVED = "ladder.moved"
     ALLOCATION_DECIDED = "allocation.decided"
     STRATEGY_REVIEWED = "strategy.reviewed"
+    # The once-per-session portfolio pass: the review's verdicts, the ladder's
+    # moves and the allocation round, for one session. Also the marker that
+    # keeps the pass to once a session however often `tb run` is started.
+    SESSION_REVIEWED = "session.reviewed"
 
     # --- funding the live loop (M5b) ---
     #
@@ -1321,6 +1325,18 @@ class StrategyReviewedPayload(EventPayload):
     reasons: list[str] = Field(default_factory=list)
 
 
+class SessionReviewedPayload(EventPayload):
+    """One session's portfolio pass, summarised; the detail is in its own events."""
+
+    session_date: str
+    n_strategies: int
+    run_id: str | None = None
+    verdicts: dict[str, str] = Field(default_factory=dict)
+    rung_moves: dict[str, str] = Field(default_factory=dict)
+    allocation_id: str | None = None
+    detail: str = ""
+
+
 # --------------------------------------------------------------------------
 # Funding the live loop
 # --------------------------------------------------------------------------
@@ -1439,6 +1455,7 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.LADDER_MOVED: LadderMovePayload,
     EventType.ALLOCATION_DECIDED: AllocationPayload,
     EventType.STRATEGY_REVIEWED: StrategyReviewedPayload,
+    EventType.SESSION_REVIEWED: SessionReviewedPayload,
     # M5b
     EventType.BOOK_FUNDED: BookFundedPayload,
     EventType.POSITION_ORPHANED: PositionOrphanedPayload,
@@ -1526,6 +1543,7 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     EventType.LADDER_MOVED: AggregateType.STRATEGY,
     EventType.ALLOCATION_DECIDED: AggregateType.RUN,
     EventType.STRATEGY_REVIEWED: AggregateType.STRATEGY,
+    EventType.SESSION_REVIEWED: AggregateType.RUN,
     # M5b. The book is a fact about the run: the same strategies funded under a
     # different allocation are a different run's book, and filing it under one
     # of the strategies would hide the ones that were excluded.

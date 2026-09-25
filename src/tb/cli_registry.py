@@ -666,8 +666,8 @@ def explain(
         rows = allocator.history_for(strategy_id) if strategy_id is not None else allocator.latest()
     if not rows:
         console.print(
-            f"{WARN} no allocations recorded yet. The allocator runs once the first "
-            "strategy is promoted."
+            f"{WARN} no allocations recorded yet. `tb run` allocates at the first cycle "
+            "of each trading session, once a strategy is promoted."
         )
         return
 

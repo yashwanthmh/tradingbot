@@ -381,6 +381,15 @@ decision placed it, at average cost from the recorded fills: the realised record
 that `tb review`, the allocator and the lineage loss budgets read. A result that
 depends on a fill with no reported price is recorded and charged to nobody.
 
+And the first cycle of each trading session reviews the portfolio before it
+decides anything: every promoted strategy gets a KEEP / KILL / ITERATE / SCALE
+verdict on its realised record, its rung moves on the evidence of that rung —
+up only on the ladder's slow terms, down two at once on a KILL or ITERATE — and
+the allocator shrinks each prior toward its realised edge. The loop then trades
+a book rebuilt from all of it, so a run left going for weeks sizes by today's
+evidence. Once a session, however often `tb run` is started; retiring a
+strategy stays a human's `tb review --apply`.
+
 The loop reads `registry.promoted()`, loads each spec, builds **each strategy's
 own pipeline from its own spec**, and sizes every order at
 `min(allocation, rung notional)` — which reaches the order path as a risk
