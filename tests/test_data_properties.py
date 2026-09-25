@@ -40,6 +40,7 @@ from tb.data.provider import (
     TimestampConvention,
     classify_us_session,
     normalise_bar_open,
+    provider_preference,
 )
 from tb.data.snapshot import SnapshotStore
 from tb.ledger.store import Ledger
@@ -188,10 +189,11 @@ def test_a_duplicate_needs_the_same_provider_to_count() -> None:
     ingest_order=st.permutations(list(range(8))),
     revise=st.integers(min_value=0, max_value=7),
     as_of_day=st.integers(min_value=0, max_value=20),
+    backfilled=st.booleans(),
 )
 @settings(max_examples=150, deadline=None)
 def test_visible_bars_are_monotonic_in_as_of(
-    ingest_order: list[int], revise: int, as_of_day: int
+    ingest_order: list[int], revise: int, as_of_day: int, backfilled: bool
 ) -> None:
     """For `t1 < t2`, `visible_bars(t1)` is a subset of `visible_bars(t2)`.
 
@@ -199,17 +201,17 @@ def test_visible_bars_are_monotonic_in_as_of(
     order-dependent: a read path that collapsed vintages before filtering on
     knowledge time would return the restated value at an as-of instant before
     the restatement existed, and only some ingest orders would show it.
+
+    And over both ways history arrives: bar by bar as each closed, or all at
+    once by a backfill stamped with the day it was fetched, which is after
+    every bar in it.
     """
     base = date(2026, 3, 2)
-    bars = [daily(base + timedelta(days=index)) for index in range(8)]
+    fetched = datetime(2026, 5, 1, tzinfo=UTC) if backfilled else None
+    bars = [daily(base + timedelta(days=index), ingested=fetched) for index in range(8)]
     # One bar restated much later, ingested out of band.
-    bars.append(
-        daily(
-            base + timedelta(days=revise),
-            close="999.00",
-            ingested=datetime(2026, 6, 1, tzinfo=UTC),
-        )
-    )
+    restated_at = datetime(2026, 6, 1, tzinfo=UTC)
+    bars.append(daily(base + timedelta(days=revise), close="999.00", ingested=restated_at))
     source = InMemoryBarSource(bars=[bars[i] for i in ingest_order] + [bars[-1]])
 
     earlier = datetime(2026, 3, 1, tzinfo=UTC) + timedelta(days=as_of_day)
@@ -221,7 +223,12 @@ def test_visible_bars_are_monotonic_in_as_of(
     assert {bar.bar_open_utc for bar in first} <= {bar.bar_open_utc for bar in second}
     for bar in first:
         assert bar.available_at_utc <= earlier
-        assert bar.ingested_at_utc <= earlier
+        # Every visible bar is either the first vintage of its period, which
+        # stands for that period from its close, or was ingested by `as_of`.
+        # The restatement is neither until it has happened.
+        assert bar.ingested_at_utc != restated_at
+    # Every period that had closed is there, however late it was fetched.
+    assert len(first) == sum(1 for bar in bars[:8] if bar.available_at_utc <= earlier)
 
 
 @given(as_of_day=st.integers(min_value=0, max_value=40))
@@ -242,6 +249,81 @@ def test_a_revision_is_invisible_before_it_was_ingested(as_of_day: int) -> None:
     assert len(visible) == 1
     expected = Decimal("999.00") if as_of >= datetime(2026, 4, 1, tzinfo=UTC) else Decimal("100.00")
     assert visible[0].close == expected
+
+
+def test_backfilled_history_is_visible_from_each_bars_close() -> None:
+    """A regression, and the one that made every backtest on real data empty.
+
+    Both real feeds stamp a backfill with the moment it was fetched, which is
+    after every bar in it, and the read path required every vintage to have
+    been ingested by `as_of`. So a backtest over last year, run today, saw no
+    bars at all — every decision dropped, nothing ever traded, nothing could
+    ever be promoted. The fixtures hid it by stamping each bar as ingested the
+    moment it closed, which no real backfill does.
+
+    The first vintage of a period stands for it from its close; a restatement
+    fetched later stays invisible until then, in both directions.
+    """
+    fetched = datetime(2026, 9, 25, 9, tzinfo=UTC)
+    days = sessions(date(2025, 3, 3), date(2025, 3, 7))
+    original = [daily(day, ingested=fetched) for day in days]
+    restated = daily(days[2], close="777.00", ingested=datetime(2026, 10, 1, tzinfo=UTC))
+    source = InMemoryBarSource(bars=[*original, restated])
+
+    a_year_ago = visible_bars(source, UID, Resolution.DAILY, as_of=datetime(2025, 3, 8, tzinfo=UTC))
+    before_the_restatement = visible_bars(
+        source, UID, Resolution.DAILY, as_of=datetime(2026, 9, 30, tzinfo=UTC)
+    )
+    after_it = visible_bars(source, UID, Resolution.DAILY, as_of=datetime(2026, 10, 2, tzinfo=UTC))
+
+    assert [bar.session_date for bar in a_year_ago] == days
+    assert {bar.close for bar in a_year_ago} == {Decimal("100.00")}
+    assert {bar.close for bar in before_the_restatement} == {Decimal("100.00")}
+    assert after_it[2].close == Decimal("777.00")
+
+
+def test_two_feeds_read_as_one_bar_per_period_from_the_primary() -> None:
+    """A regression. The store keeps every feed's bars, and the read path used
+    to return all of them: a symbol fetched from Alpaca and Yahoo came back as
+    two bars a session, interleaved, so a 50-bar average spanned 25 days and a
+    "return" ran from one feed's close to the other's. Now the primary's bar
+    wins a period, and the fallback fills only a period the primary lacks."""
+    days = sessions(date(2026, 3, 2), date(2026, 3, 6))
+    alpaca = [daily(day, close="100.00") for day in days if day != days[2]]
+    yahoo = [daily(day, close="25.00", provider="yahoo") for day in days]
+    source = InMemoryBarSource(bars=[*yahoo, *alpaca])
+
+    seen = visible_bars(source, UID, Resolution.DAILY, as_of=datetime(2026, 3, 9, tzinfo=UTC))
+
+    assert [bar.session_date for bar in seen] == days
+    assert [bar.provider for bar in seen] == ["alpaca", "alpaca", "yahoo", "alpaca", "alpaca"]
+
+
+@given(
+    held=st.lists(
+        st.sets(st.sampled_from(["alpaca", "csv_fixture", "yahoo"])), min_size=1, max_size=8
+    ),
+    reverse=st.booleans(),
+)
+@settings(max_examples=100, deadline=None)
+def test_each_period_is_read_from_the_most_preferred_feed_that_has_it(
+    held: list[set[str]], reverse: bool
+) -> None:
+    """Whatever mix of feeds holds whichever days, in whatever order they are
+    read: one bar per period, and it is the preferred feed's."""
+    base = date(2026, 3, 2)
+    bars = [
+        daily(base + timedelta(days=index), provider=name)
+        for index, names in enumerate(held)
+        for name in sorted(names)
+    ]
+    source = InMemoryBarSource(bars=bars[::-1] if reverse else bars)
+
+    seen = visible_bars(source, UID, Resolution.DAILY, as_of=datetime(2026, 4, 1, tzinfo=UTC))
+
+    assert len({bar.bar_open_utc for bar in seen}) == len(seen)
+    expected = [min(names, key=provider_preference) for names in held if names]
+    assert [bar.provider for bar in seen] == expected
 
 
 def test_a_revision_that_deletes_a_bar_stays_deleted_only_after_it_is_known(

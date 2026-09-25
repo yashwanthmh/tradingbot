@@ -13,6 +13,7 @@ property behind it, asserted directly rather than only statistically.
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -135,6 +136,33 @@ def test_a_fill_never_uses_a_price_the_decision_could_see(cost_model: CostModel)
         # it — which is the only way the decision could not have used it.
         assert entry_bar.available_at_utc > trade.entry_at - timedelta(hours=1)
         assert trade.entry_price == entry_bar.open
+
+
+def test_a_backtest_over_a_real_backfill_sees_its_history(cost_model: CostModel) -> None:
+    """A regression. A real backfill is stamped with the moment it was fetched,
+    after every bar in it, and the read path used to hide a bar until it had
+    been ingested — so a backtest over real history had nothing to fill
+    against: every decision dropped, no trade, no promotion, ever. Every fixture
+    here stamps a bar as ingested when it closed, which is why none showed it.
+    The same history must backtest the same way however late it was fetched."""
+    fetched = datetime(2026, 9, 25, 9, tzinfo=UTC)
+    as_closed = random_walk(UID, days=60, seed=3)
+    as_fetched = [replace(bar, ingested_at_utc=fetched) for bar in as_closed]
+
+    results = [
+        build(cost_model, [UID]).run(
+            strategy=AlternatingStrategy(),
+            reader=reader_over(bars, [UID]),
+            decision_times=decision_times(60),
+        )
+        for bars in (as_closed, as_fetched)
+    ]
+
+    assert results[0].trades
+    assert results[1].n_dropped_no_next_bar == 0
+    assert [trade.net_pnl_ccy for trade in results[1].trades] == [
+        trade.net_pnl_ccy for trade in results[0].trades
+    ]
 
 
 def test_a_decision_on_the_last_bar_is_dropped_not_filled(cost_model: CostModel) -> None:

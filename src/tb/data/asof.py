@@ -32,7 +32,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
-from tb.data.provider import Bar, DataError, Resolution, Session, dedupe_latest
+from tb.data.provider import Bar, DataError, Resolution, Session, provider_preference
 
 
 class LookaheadError(DataError):
@@ -274,30 +274,66 @@ def visible_bars(
     lookback: timedelta | None = None,
     include_extended: bool = False,
 ) -> tuple[Bar, ...]:
-    """Every bar that was knowable at `as_of`, oldest first.
+    """Every bar that was knowable at `as_of`, oldest first, one per period.
 
     The one visibility function. Filters on `available_at <= as_of` — not on
     bar open, not on bar close — and collapses revisions to the version that
     had been ingested by then, so an as-of query returns the data as it stood,
     not as it has since been restated.
+
+    **A bar's first vintage is visible from its knowledge time; a revision only
+    from when it was ingested.** Backfilled history is stamped with the moment
+    it was fetched, which is after every bar in it. Requiring *every* vintage to
+    have been ingested by `as_of` therefore hid all of it from any instant
+    before the fetch: a backtest over ten years of real history saw no bars at
+    all, and nothing could ever pass the gate. The fixtures never showed it,
+    because they are stamped as if every bar had been ingested the moment it
+    closed. The first vintage is what we have for that period, and its values
+    are the vendor's current view — which a vintage's `pit_completeness_flag`
+    records rather than hides. What must stay invisible is a *restatement* made
+    after `as_of`, and it does.
+
+    **One bar per period, from the preferred feed.** The store holds every
+    feed's bars, and a symbol fetched from both Alpaca and Yahoo used to come
+    back as two bars per session, interleaved: a 50-bar average over 25 days,
+    and a return from one feed's close to the other's. Now each period takes the
+    newest visible vintage from the feed `provider_preference` ranks first, and
+    another feed fills only a period the preferred one has no bar for — the
+    plan's primary-and-fallback, with the seam between them at a period
+    boundary rather than inside one.
     """
     if as_of.tzinfo is None:
         raise DataError("as_of must be timezone-aware")
 
     start = None if lookback is None else as_of - lookback
-    candidates = [
-        bar
-        for bar in source.bars_for(instrument_uid, resolution, start=start)
-        # Three conditions, none redundant: the bar must have been knowable
-        # by `as_of`, the *revision* must also have been ingested by then (or an
-        # as-of query would return a restatement that had not happened yet), and
-        # extended-hours prints are excluded unless asked for, because comparing
-        # a post-market print against a regular-hours close is not a comparison.
-        if bar.is_visible_at(as_of)
-        and bar.ingested_at_utc <= as_of
-        and (include_extended or bar.session is not Session.EXTENDED)
-    ]
-    return dedupe_latest(candidates)
+    vintages: dict[tuple[str, Resolution, datetime, str], list[Bar]] = {}
+    for bar in source.bars_for(instrument_uid, resolution, start=start):
+        # Extended-hours prints are excluded unless asked for, because
+        # comparing a post-market print against a regular-hours close is not a
+        # comparison.
+        if include_extended or bar.session is not Session.EXTENDED:
+            vintages.setdefault(bar.identity, []).append(bar)
+
+    chosen: dict[datetime, Bar] = {}
+    for observed in vintages.values():
+        first_ingested = min(bar.ingested_at_utc for bar in observed)
+        newest: Bar | None = None
+        for bar in observed:
+            if not bar.is_visible_at(as_of):
+                continue
+            if bar.ingested_at_utc > as_of and bar.ingested_at_utc != first_ingested:
+                # A restatement that had not happened yet.
+                continue
+            if newest is None or bar.ingested_at_utc >= newest.ingested_at_utc:
+                newest = bar
+        if newest is None:
+            continue
+        held = chosen.get(newest.bar_open_utc)
+        if held is None or provider_preference(newest.provider) < provider_preference(
+            held.provider
+        ):
+            chosen[newest.bar_open_utc] = newest
+    return tuple(sorted(chosen.values(), key=lambda bar: bar.bar_open_utc))
 
 
 @dataclass(slots=True)

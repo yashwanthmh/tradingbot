@@ -26,7 +26,9 @@ from tb.core.errors import TransportError
 from tb.core.http import HttpResponse, RecordingTransport, json_response
 from tb.data.pacing import PacingSpec, ProviderPacer
 from tb.data.provider import (
+    PRIMARY_PROVIDER,
     US_EASTERN,
+    VENDOR_ADJUSTED_PROVIDERS,
     AmbiguousTimestampError,
     Bar,
     DataError,
@@ -263,6 +265,20 @@ def test_capabilities_are_self_consistent(provider: MarketDataProvider) -> None:
             f"{caps.name} serves {resolution.value} but declares no delay for it, so "
             "live_capable would silently refuse it for the wrong reason"
         )
+
+
+def test_the_read_path_knows_which_feeds_rewrite_their_history(
+    provider: MarketDataProvider,
+) -> None:
+    """`VENDOR_ADJUSTED_PROVIDERS` is keyed by name, because a stored bar
+    carries only its provider's name. It must say what each provider's own
+    capabilities say, or the read path would prefer a rewritten history over a
+    raw one — and the primary must be a feed that returns what the venue
+    printed."""
+    caps = provider.capabilities
+    assert (caps.name in VENDOR_ADJUSTED_PROVIDERS) is (not caps.returns_raw_prices)
+    if caps.name == PRIMARY_PROVIDER:
+        assert caps.returns_raw_prices
 
 
 def test_fetched_bars_are_ordered_and_in_window(provider: MarketDataProvider) -> None:

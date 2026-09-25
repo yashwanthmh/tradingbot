@@ -686,12 +686,45 @@ class MarketDataProvider(Protocol):
     def close(self) -> None: ...
 
 
+# --------------------------------------------------------------------------
+# Which feed a period is read from
+# --------------------------------------------------------------------------
+
+# The primary feed, preferred wherever it has a bar. Its history is what the
+# venue printed (`returns_raw_prices=True`), so a split does not rewrite it.
+PRIMARY_PROVIDER = "alpaca"
+
+# Feeds whose stored history is the vendor's split-adjusted view as of the
+# moment it was fetched, not what the venue printed. Named by `Provider.name`
+# because a stored bar carries only that name; a test pins this set against
+# each provider's `capabilities.returns_raw_prices`, which is what stops the
+# two drifting apart.
+VENDOR_ADJUSTED_PROVIDERS: frozenset[str] = frozenset({"yahoo"})
+
+
+def provider_preference(provider: str) -> tuple[int, str]:
+    """Sort key for choosing between two feeds' bars for the same period.
+
+    The primary first; then any other feed that returns raw prices (a fixture,
+    a CSV import); a vendor-adjusted feed last, because every split since the
+    bar printed has rewritten its history. The name breaks ties, so the choice
+    never depends on the order bars happened to be read in.
+    """
+    if provider == PRIMARY_PROVIDER:
+        return (0, provider)
+    if provider in VENDOR_ADJUSTED_PROVIDERS:
+        return (2, provider)
+    return (1, provider)
+
+
 def dedupe_latest(bars: Iterable[Bar]) -> tuple[Bar, ...]:
     """Collapse to one bar per identity, keeping the most recently ingested.
 
-    This is the **read-side** collapse, applied only after visibility filtering
-    — `visible_bars` calls it once it has already discarded anything ingested
-    after the as-of instant, so "latest" means latest *as of then*.
+    This is the **read-side** collapse, for a caller that wants every feed's
+    newest view of each bar (the audit reads each feed's series this way).
+    `visible_bars` does its own collapse, because it must also filter on
+    knowledge time first — so "latest" there means latest *as of then* — and
+    then keep one feed per period.
 
     It must never be used on the write path. Collapsing vintages before storage
     discards the pre-revision value, which is precisely the value an as-of query
