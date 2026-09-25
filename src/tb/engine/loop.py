@@ -207,6 +207,7 @@ class TradingLoop:
         # Instruments outer, strategies inner: the position and its owner are
         # facts about the instrument, so resolving them once per instrument is
         # what keeps two strategies from both acting on one holding.
+        acted: set[str] = set()
         for risk_reducing in (True, False):
             for ticker, uid in sorted(self.instruments.items()):
                 if ticker in stood_down:
@@ -215,6 +216,13 @@ class TradingLoop:
                     # a flatten that has not settled would net against the
                     # entry unpredictably, and one that was refused means the
                     # unattributed holding is still there.
+                    continue
+                if not risk_reducing and ticker in acted:
+                    # Exited in the first pass. Once that exit has filled the
+                    # instrument is flat, and offering it for entry on the
+                    # same bar would buy back what was just sold — a round
+                    # trip's costs for no change in view. It is offered again
+                    # next cycle, against a new bar.
                     continue
                 outcomes = self._consider_instrument(
                     ticker=ticker,
@@ -228,6 +236,7 @@ class TradingLoop:
                         decisions.append(decision)
                     if intent_id is not None:
                         submitted.append(intent_id)
+                        acted.add(ticker)
                     if refusal is not None:
                         refusals.append(refusal)
                     if stop_id is not None:
@@ -461,6 +470,12 @@ class TradingLoop:
 
         if not decision.wants_to_trade:
             return decision, None, None, None
+        if decision.action is Action.EXIT and not position.is_open:
+            # Nothing to sell. No shipped strategy says EXIT about a flat
+            # instrument, but the interface does not forbid it, and an exit
+            # sized at zero is not an order: sent on, it raised out of the
+            # risk request and took the whole loop down with it.
+            return decision, None, (ticker, "exit decided with nothing held"), None
 
         reference = self._reference_price(window, uid)
         if reference is None:
@@ -1027,8 +1042,17 @@ class TradingLoop:
         mapping = symbols.get(ticker)
 
         total, for_symbol = self.log.counts_today(day=at, t212_ticker=ticker)
-        since_open, until_close = self._session_position(at)
+        since_open, until_close, session_note = self._session_position(at)
         instrument = next((i for i in self.broker.get_instruments() if i.ticker == ticker), None)
+        # Read per order, not per cycle. The preflight refuses to start a pass
+        # while anything forbids trading, but a pass over a full universe
+        # against a rate-limited venue takes minutes — and a kill switch thrown,
+        # or `tb halt` run, during it must stop the next entry rather than the
+        # next cycle. Every gate the state machine knows is consulted (run
+        # state, kill switch, open halts, the limits file), and the halt rule
+        # still passes risk-reducing orders, so a halt mid-pass never strands a
+        # position whose exit or stop was already on its way.
+        permission = self.state.check_trading_permission()
         return RiskContext(
             as_of=at,
             limits=self.pinned.limits,
@@ -1051,6 +1075,9 @@ class TradingLoop:
             bar_period_seconds=_period_seconds(self.resolution),
             minutes_since_open=since_open,
             minutes_until_close=until_close,
+            session_note=session_note,
+            halted=not permission.allowed,
+            halt_reason="; ".join(permission.reasons),
             min_trade_quantity=instrument.min_trade_quantity if instrument else None,
             max_open_quantity=instrument.max_open_quantity if instrument else None,
             # What the ladder and the allocator gave this strategy. Passed
@@ -1172,30 +1199,41 @@ class TradingLoop:
         # bound exists to catch.
         return (at - rows[-1].available_at_utc).total_seconds()
 
-    def _session_position(self, at: datetime) -> tuple[int | None, int | None]:
-        """Minutes since the open and until the close, or `(None, None)`.
+    def _session_position(self, at: datetime) -> tuple[int | None, int | None, str]:
+        """Minutes since the open and until the close, or `None`s and why.
 
         Both `None` when the market is closed or the day is outside the
-        calendar's range — which the session-window rule reads as "unknown"
-        and blocks on. That is the right answer: an entry outside a session
-        cannot fill, and one in an unclassifiable day cannot be sized against
-        a close that is not known.
+        calendar's range, and the session-window rule blocks an entry on
+        either. That is the right answer: an entry outside a session cannot
+        fill until the next open, and one in an unclassifiable day cannot be
+        sized against a close that is not known. The third value says which,
+        so the refusal names it.
 
-        Derived from `classify` rather than from a helper on the calendar,
-        because the calendar's own gate (`may_enter_now`) answers a *different*
-        question — whether to enter at all — and the risk rule needs the two
-        numbers so it can record how close to the boundary it was.
+        Derived from the day's bounds rather than from the calendar's own gate,
+        because `may_enter_now` answers a *different* question — whether to
+        enter at all — and the risk rule needs the two numbers so it can
+        record how close to the boundary it was.
         """
-        from tb.data.calendar import TradingCalendar
+        from tb.data.calendar import DayKind, TradingCalendar
 
-        day = TradingCalendar().classify(at.date())
+        day = TradingCalendar().day_of(at)
+        if day.kind is DayKind.UNKNOWN:
+            note = (
+                f"{day.day} is past the trading calendar's range, so it is treated as "
+                "closed; extend the holiday lists or fetch the broker's schedule"
+            )
+            return None, None, note
         if not day.is_trading_day or day.open_utc is None or day.close_utc is None:
-            return None, None
+            return None, None, f"the market is closed on {day.day}, a {day.kind.value}"
         if not day.contains(at):
-            return None, None
+            note = (
+                f"the market is closed at {at.isoformat()}; {day.day}'s session runs "
+                f"{day.open_utc.isoformat()} to {day.close_utc.isoformat()}"
+            )
+            return None, None, note
         since = int((at - day.open_utc).total_seconds() // 60)
         until = int((day.close_utc - at).total_seconds() // 60)
-        return since, until
+        return since, until, ""
 
     # -- recording ---------------------------------------------------------
 

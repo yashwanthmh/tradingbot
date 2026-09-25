@@ -228,8 +228,17 @@ class TradingCalendar:
             close_utc=_eastern(day, HALF_DAY_CLOSE if half else REGULAR_CLOSE),
         )
 
+    def day_of(self, moment: datetime) -> TradingDay:
+        """The session day `moment` falls in, by the exchange's own date.
+
+        Eastern rather than UTC: 01:00 UTC on a Tuesday is Monday evening in
+        New York, and naming Tuesday's session for it would say the wrong day
+        was closed.
+        """
+        return self.classify(_eastern_date(moment))
+
     def is_open_at(self, moment: datetime) -> bool:
-        return self.classify(_eastern_date(moment)).contains(moment)
+        return self.day_of(moment).contains(moment)
 
     def sessions_between(self, start: date, end: date) -> tuple[TradingDay, ...]:
         """Every trading day in `[start, end]`, inclusive.

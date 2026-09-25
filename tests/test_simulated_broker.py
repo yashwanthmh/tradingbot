@@ -532,3 +532,137 @@ def test_the_simulator_never_reports_a_short_position(broker: SimulatedBroker) -
     token = _token(purpose=OrderPurpose.EXIT, held=Decimal("1"), quantity=Decimal("1"))
     broker.place_order(token, order_type=OrderType.MARKET, purpose=OrderPurpose.EXIT)
     assert all(p.quantity >= 0 for p in broker.get_positions())
+
+
+# --------------------------------------------------------------------------
+# Marked to market: the paper venue
+# --------------------------------------------------------------------------
+
+
+def _marked(
+    *, price: Decimal = Decimal("100.00"), free_cash: Decimal = Decimal("10000.00")
+) -> tuple[SimulatedBroker, dict[str, Decimal]]:
+    """A simulator whose account follows a market the test moves by hand.
+
+    The market is a dict behind `price_source`, so a test changes the price the
+    way time would and every call into the venue afterwards sees it.
+    """
+    market = {TICKER: price}
+    broker = SimulatedBroker(
+        clock=lambda: AS_OF,
+        free_cash=free_cash,
+        mark_to_market=True,
+        price_source=market.get,
+    )
+    return broker, market
+
+
+def _protect(broker: SimulatedBroker, *, level: Decimal) -> str:
+    held = broker.get_position(TICKER)
+    assert held is not None
+    placed = broker.place_order(
+        _token(purpose=OrderPurpose.PROTECTIVE_STOP, held=held.quantity, quantity=held.quantity),
+        order_type=OrderType.STOP,
+        purpose=OrderPurpose.PROTECTIVE_STOP,
+        stop_price=level,
+        time_validity=TimeValidity.GOOD_TILL_CANCEL,
+    )
+    return placed.broker_order_id
+
+
+def test_marked_to_market_cash_moves_with_the_fill_and_equity_with_the_mark() -> None:
+    """**The number the loss breakers read.** A static-equity simulator
+    reported the same total whatever happened, so in a paper run no breaker
+    could ever fire. Here cash pays for the fill, and equity is cash plus the
+    holding at its mark."""
+    broker, market = _marked()
+    broker.place_order(_token(), order_type=OrderType.MARKET, purpose=OrderPurpose.ENTRY)
+    held = broker.get_position(TICKER)
+    assert held is not None and held.average_price == Decimal("100.00")
+    quantity = held.quantity
+
+    bought = broker.get_cash()
+    assert bought.free == Decimal("10000.00") - quantity * Decimal("100.00")
+    assert bought.total == Decimal("10000.00"), "marked at its own fill, nothing has moved"
+
+    market[TICKER] = Decimal("90.00")
+    fallen = broker.get_cash()
+    assert fallen.total == Decimal("10000.00") - quantity * Decimal("10.00")
+    assert fallen.ppl == -quantity * Decimal("10.00")
+    position = broker.get_position(TICKER)
+    assert position is not None
+    assert position.current_price == Decimal("90.00")
+    assert position.ppl == -quantity * Decimal("10.00")
+
+
+def test_a_stop_the_market_gaps_through_fills_at_the_market_not_the_stop() -> None:
+    """A stop is a trigger, not a price. Above the level it waits; once the
+    mark reaches it, it sells at the mark — here five below the level, which is
+    the gap the unprotected-window sizing is there to survive."""
+    broker, market = _marked()
+    broker.place_order(_token(), order_type=OrderType.MARKET, purpose=OrderPurpose.ENTRY)
+    held = broker.get_position(TICKER)
+    assert held is not None
+    stop_id = _protect(broker, level=Decimal("85.00"))
+
+    market[TICKER] = Decimal("86.00")
+    assert [o.broker_order_id for o in broker.get_open_orders()] == [stop_id]
+
+    market[TICKER] = Decimal("80.00")
+    assert broker.get_position(TICKER) is None, "the stop did not sell the position"
+    stop = broker.get_order(stop_id)
+    assert stop is not None and stop.status is OrderStatus.FILLED
+    cash = broker.get_cash()
+    assert cash.total == cash.free == Decimal("10000.00") - held.quantity * Decimal("20.00")
+
+
+def test_a_cancel_that_loses_the_race_to_the_market_finds_the_stop_filled() -> None:
+    """What `OrderSubmitter.cancel` reads back for: the stop fired before the
+    cancel arrived, so the venue refuses the cancel and the order is FILLED."""
+    broker, market = _marked()
+    broker.place_order(_token(), order_type=OrderType.MARKET, purpose=OrderPurpose.ENTRY)
+    held = broker.get_position(TICKER)
+    assert held is not None
+    stop_id = _protect(broker, level=Decimal("85.00"))
+
+    market[TICKER] = Decimal("84.00")
+    withdraw = _token(purpose=OrderPurpose.PROTECTIVE_STOP, held=held.quantity)
+    with pytest.raises(SimulatedRejection) as caught:
+        broker.cancel_order(withdraw, broker_order_id=stop_id)
+    assert caught.value.code == "OrderNotCancellable"
+    stop = broker.get_order(stop_id)
+    assert stop is not None and stop.status is OrderStatus.FILLED
+
+
+def test_a_triggered_stop_with_the_shares_gone_is_refused_rather_than_going_short() -> None:
+    broker, market = _marked()
+    broker.place_order(_token(), order_type=OrderType.MARKET, purpose=OrderPurpose.ENTRY)
+    stop_id = _protect(broker, level=Decimal("85.00"))
+    broker._positions.pop(TICKER)  # sold outside the bot
+
+    market[TICKER] = Decimal("80.00")
+    stop = broker.get_order(stop_id)
+    assert stop is not None and stop.status is OrderStatus.REJECTED
+    assert broker.get_positions() == ()
+
+
+def test_a_market_order_with_no_price_is_refused_before_it_exists() -> None:
+    """Rather than filled at the 100.00 a drill's fill defaults to, which in
+    a paper account would put a price nothing saw into equity."""
+    broker, market = _marked()
+    market.clear()
+    with pytest.raises(SimulatedRejection) as caught:
+        broker.place_order(_token(), order_type=OrderType.MARKET, purpose=OrderPurpose.ENTRY)
+    assert caught.value.code == "NoPrice"
+    assert broker.posts == [] and broker.get_open_orders() == ()
+
+
+def test_a_buy_the_cash_cannot_cover_is_refused() -> None:
+    """A cash account cannot borrow. Without this the paper account would be
+    trading on a margin the venue does not offer."""
+    broker, _ = _marked(free_cash=Decimal("50.00"))
+    with pytest.raises(SimulatedRejection) as caught:
+        broker.place_order(_token(), order_type=OrderType.MARKET, purpose=OrderPurpose.ENTRY)
+    assert caught.value.code == "InsufficientFunds"
+    assert broker.get_positions() == ()
+    assert broker.get_cash().free == Decimal("50.00")

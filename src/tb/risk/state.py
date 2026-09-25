@@ -226,6 +226,11 @@ class RiskContext:
     # From the calendar: minutes since the session opened and until it closes.
     minutes_since_open: int | None = None
     minutes_until_close: int | None = None
+    # Why both are `None`, when they are: the market is closed for the night,
+    # it is a weekend or a holiday, or the date is past the calendar's range.
+    # Carried so the refusal names the actual reason — "closed overnight" and
+    # "the calendar has run out" call for very different responses.
+    session_note: str = ""
     # Set when the run is halted or the kill switch is engaged. Carried in the
     # context so the refusal is recorded as a verdict like any other, rather
     # than as an exception that leaves no row.

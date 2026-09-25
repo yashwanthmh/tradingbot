@@ -367,6 +367,12 @@ tb run --mode paper                   # every promoted strategy, at its funded s
 tb run --mode paper --strategy trivial  # the hand-written one, for drilling the loop
 ```
 
+`--mode paper` is the simulated venue, marked to the newest close the loop can
+see: a fill is at the price the order was sized from, equity moves with the
+market so the loss breakers are live, and a stop fires — at the market, gap
+included — once the price reaches it. The account lives in the process, so each
+paper run starts flat.
+
 The loop reads `registry.promoted()`, loads each spec, builds **each strategy's
 own pipeline from its own spec**, and sizes every order at
 `min(allocation, rung notional)` — which reaches the order path as a risk

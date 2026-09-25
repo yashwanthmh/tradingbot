@@ -244,6 +244,7 @@ def run(
             lock=lock,
             equity=EquityCurve(ledger, run_id=run_id),
         )
+        _price_paper_venue(broker, store=store, universe=universe, resolution=loop.resolution)
 
         console.print(
             f"run [bold]{run_id}[/bold] in [bold]{mode}[/bold] mode over "
@@ -397,11 +398,17 @@ def _broker(mode: str, pinned: PinnedLimits, *, equity: Decimal) -> Broker:
     if mode == "paper":
         from tb.broker.simulated import SimulatedBroker
 
+        # Marked to market, so the paper account moves: fills at the price the
+        # loop decided on, equity that the loss breakers can read, and stops
+        # that fire. Priced once the bar store is open — see
+        # `_price_paper_venue`. Until then it holds only cash, which needs no
+        # price, and it refuses any market order rather than invent one.
         return SimulatedBroker(
             environment="paper",
             currency=pinned.limits.currency,
             equity=equity,
             free_cash=equity,
+            mark_to_market=True,
         )
 
     from tb.broker.t212.client import T212Client
@@ -418,6 +425,32 @@ def _broker(mode: str, pinned: PinnedLimits, *, equity: Decimal) -> Broker:
     except TbError as exc:
         err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
         raise typer.Exit(2) from exc
+
+
+def _price_paper_venue(
+    broker: Broker, *, store: BarStore, universe: dict[str, str], resolution: str
+) -> None:
+    """Give the paper venue its prices: the newest close the loop can see.
+
+    Before this existed the paper broker had no prices at all, so every paper
+    fill was at its 100.00 stand-in, every position was marked at its own
+    fill, equity never moved and no stop ever fired — an overnight paper run
+    exercised the order path but none of the numbers the risk rules read. The
+    demo broker is left alone: Trading 212 prices its own fills.
+    """
+    from tb.broker.simulated import BarMarks, SimulatedBroker
+    from tb.data.provider import Resolution
+
+    if isinstance(broker, SimulatedBroker):
+        venue = broker
+        broker.price_source = BarMarks(
+            bars=store,
+            instruments=universe,
+            resolution=Resolution(resolution),
+            # Through the venue's clock rather than a copy of it, so a mark is
+            # always read at the instant the venue is being asked.
+            clock=lambda: venue.clock(),
+        )
 
 
 def _report(results: tuple[object, ...]) -> None:

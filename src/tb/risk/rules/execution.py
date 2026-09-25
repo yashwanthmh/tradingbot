@@ -223,15 +223,21 @@ class SessionWindowRule:
         since_open = ctx.minutes_since_open
         until_close = ctx.minutes_until_close
         if since_open is None or until_close is None:
+            # Almost always because the market is shut — overnight, a weekend,
+            # a holiday — and said so, since that refusal is routine. An order
+            # sent now would queue for the next open and fill at a price this
+            # decision never saw. The note also carries the rarer case, a date
+            # past the calendar's range, which needs a human.
             return RuleVerdict(
                 self.name,
                 Verdict.BLOCK,
                 detail=(
-                    "the session position is unknown, so neither window can be checked. "
-                    "Blocked: without a calendar we cannot tell an open auction from a "
-                    "quiet midday, and one of them is much more expensive."
+                    f"no regular session is open: "
+                    f"{ctx.session_note or 'the calendar could not place this instant'}. "
+                    "An entry now would wait for the next open and fill at a price this "
+                    "decision never saw."
                 ),
-                observed_value="unknown",
+                observed_value="closed",
                 limit_value=f"{first}/{last}",
             )
         if since_open < first:

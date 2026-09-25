@@ -36,11 +36,20 @@ intent_id", which is the property the drills exist to assert. It counts
 attempts that *reached the venue*, so a crash before the send does not
 increment it and a crash after does — which is exactly the distinction the
 drills are about.
+
+**A market, when the paper loop needs one.** A drill pins its prices and sets
+equity by hand, because it is testing what the engine does with a number. The
+paper loop is testing the engine against something that moves, so with
+`mark_to_market` the account follows `price_source`: fills are priced from it,
+cash moves with every fill, equity is cash plus each holding at its mark, and a
+working stop fires once the mark reaches it. `BarMarks` is that source for
+`tb run --mode paper` — the newest close the loop itself can see, and never a
+later one.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
@@ -65,6 +74,8 @@ from tb.broker.port import (
 from tb.core.clock import now_utc
 from tb.core.errors import TbError
 from tb.core.ids import new_id
+from tb.data.asof import BarSource, visible_bars
+from tb.data.provider import Resolution
 from tb.risk.token import RiskToken
 
 
@@ -155,11 +166,12 @@ class PostRecord:
 class SimulatedBroker:
     """Implements the whole port, deterministically.
 
-    Takes its clock as a field and holds no randomness at all: a fill either
-    happens because the simulator was told to fill, or it does not. A
-    simulator that filled probabilistically — or that read the wall clock —
-    would make a failing drill impossible to reproduce, which is the one thing
-    a drill needs.
+    Takes its clock as a field and holds no randomness at all: a fill happens
+    because the simulator was told to fill, or — with `mark_to_market` —
+    because the mark reached a stop, and never by chance. A simulator that
+    filled probabilistically — or that read the wall clock — would make a
+    failing drill impossible to reproduce, which is the one thing a drill
+    needs.
     """
 
     environment: str = "demo"
@@ -179,6 +191,19 @@ class SimulatedBroker:
     # A price per ticker, used for fills and for `currentPrice` on held
     # positions. Not a feed — the simulator is not a data provider.
     prices: dict[str, Decimal] = field(default_factory=dict)
+    # Where prices come from instead, when set: a ticker in, the venue's price
+    # now out, or `None` when it has none. The paper loop passes `BarMarks`, so
+    # a paper fill is at the close the loop decided on rather than at the
+    # 100.00 a drill's fill defaults to.
+    price_source: Callable[[str], Decimal | None] | None = None
+    # The account follows the market: cash moves with every fill, equity is
+    # cash plus each holding at its mark, and a working stop fires when the
+    # mark reaches it. Off by default, because the drills and the loop suite
+    # set `equity` by hand to drive the loss breakers. The paper loop turns it
+    # on: a paper account whose equity never moves can never trip a breaker,
+    # and a paper stop that never fires is protection nothing has exercised.
+    # Cash starts at `free_cash`, and `equity` is not read in this mode.
+    mark_to_market: bool = False
     # Fill immediately on accept. False models a working order that has not
     # traded, which is what a limit order usually is — and what a Trading 212
     # market order is too, since the venue fills asynchronously and a market
@@ -199,10 +224,14 @@ class SimulatedBroker:
     _orders: dict[str, BrokerOrder] = field(default_factory=dict, init=False)
     posts: list[PostRecord] = field(default_factory=list, init=False)
     _closed: bool = field(default=False, init=False)
+    _cash: Decimal = field(default=Decimal(0), init=False)
 
     # Trading 212's documented ceiling. Exhausting it is how a protective stop
     # gets rejected for a reason that has nothing to do with the stop.
     MAX_PENDING_PER_TICKER = 50
+
+    def __post_init__(self) -> None:
+        self._cash = self.free_cash
 
     # -- the write half ----------------------------------------------------
 
@@ -234,6 +263,10 @@ class SimulatedBroker:
                 f"the token authorises {token.purpose.value} but this order is "
                 f"{purpose.value}. A token is bound to the order the engine evaluated."
             )
+        # The market moves before the order arrives, not after: a stop the mark
+        # has already reached has sold its shares, and a sell sent now finds
+        # them gone.
+        self._trigger_stops()
         self._check_order_shape(order_type, limit_price, stop_price)
 
         # Before the send. A crash here leaves nothing at the venue, which is
@@ -250,6 +283,8 @@ class SimulatedBroker:
         self._check_pending_ceiling(ticker, purpose=purpose)
         if token.side is Side.SELL:
             self._check_free_to_sell(ticker, quantity, purpose=purpose)
+        if self.mark_to_market and order_type is OrderType.MARKET:
+            self._check_marketable(ticker, quantity, side=token.side)
 
         rejection = self.reject_once.pop(ticker, None)
         if rejection is not None:
@@ -342,6 +377,9 @@ class SimulatedBroker:
             purpose=token.purpose,
             at=self.clock(),
         )
+        # A cancel races the market. A stop the mark has already reached filled
+        # before the cancel arrived, and the refusal below says so.
+        self._trigger_stops()
         order = self._orders.get(broker_order_id)
         if order is None:
             raise SimulatedRejection(f"no order {broker_order_id}", code="OrderNotFound")
@@ -443,6 +481,29 @@ class SimulatedBroker:
                 code="InsufficientFreeQuantity",
             )
 
+    def _check_marketable(self, ticker: str, quantity: Decimal, *, side: Side) -> None:
+        """A market order needs a price to fill at, and a buy needs the cash.
+
+        Only in `mark_to_market`, where the account's cash is real to the
+        simulation. Refused before the order exists, as the venue refuses an
+        order the account cannot pay for — a cash account cannot borrow, and a
+        simulator that let cash go negative would be paper-trading on margin.
+        A missing price is refused rather than filled at a stand-in: a paper
+        fill at a price nothing saw would put a made-up number into equity.
+        """
+        price = self._price(ticker)
+        if price is None or price <= 0:
+            raise SimulatedRejection(
+                f"no price for {ticker}, so a market order has nothing to fill at",
+                code="NoPrice",
+            )
+        if side is Side.BUY and quantity * price > self._cash:
+            raise SimulatedRejection(
+                f"buying {quantity} of {ticker} at {price} costs {quantity * price}, "
+                f"and {self._cash} is free",
+                code="InsufficientFunds",
+            )
+
     def _check_pending_ceiling(self, ticker: str, *, purpose: OrderPurpose) -> None:
         pending = sum(
             1 for order in self._orders.values() if order.ticker == ticker and order.status.is_open
@@ -464,7 +525,16 @@ class SimulatedBroker:
     def _fill(self, broker_order_id: str, *, price: Decimal | None = None) -> None:
         order = self._orders[broker_order_id]
         quantity = order.quantity or Decimal(0)
-        fill_price = price or self.prices.get(order.ticker) or Decimal("100.00")
+        fill_price = price if price is not None else self._price(order.ticker)
+        if fill_price is None:
+            if self.mark_to_market:
+                # Unreachable through `place_order`, which refuses an unpriced
+                # market order. Raised rather than filled at a stand-in, because
+                # a stand-in here would become the account's equity.
+                raise SimulatedBrokerError(f"no price for {order.ticker} to fill at")
+            # A drill that pinned no price: the fill is about the order's path,
+            # not its value, so any positive number serves.
+            fill_price = Decimal("100.00")
 
         held = self._positions.get(order.ticker)
         # Annotated, because a sell keeps whatever basis the position had —
@@ -490,6 +560,10 @@ class SimulatedBroker:
                     code="InsufficientQuantity",
                 )
             average = held.average_price if held else None
+
+        if self.mark_to_market:
+            notional = fill_price * quantity
+            self._cash += notional if order.side is Side.SELL else -notional
 
         if new_quantity > 0:
             self._positions[order.ticker] = Position(
@@ -521,26 +595,85 @@ class SimulatedBroker:
         """Fill a working order. For a drill that needs an explicit fill."""
         self._fill(broker_order_id, price=price)
 
+    # -- the market ----------------------------------------------------------
+
+    def _price(self, ticker: str) -> Decimal | None:
+        """The venue's price for `ticker` now: the source if one is set, else `prices`."""
+        if self.price_source is not None:
+            return self.price_source(ticker)
+        return self.prices.get(ticker)
+
+    def _trigger_stops(self) -> None:
+        """Fill every working sell stop the mark has reached, at the mark.
+
+        A stop becomes a market order once the price trades at or through its
+        level, so it fills at the mark — below the stop when the price gapped
+        through it, which is the overnight exposure the sizing rules budget
+        for, and the reason a stop is not a guaranteed exit price. Evaluated on
+        every call into the venue, since that is when time has passed.
+
+        Only in `mark_to_market`: a drill fills a stop explicitly, or not at all.
+        """
+        if not self.mark_to_market:
+            return
+        for order in list(self._orders.values()):
+            if (
+                not order.status.is_open
+                or order.order_type is not OrderType.STOP
+                or order.side is not Side.SELL
+                or order.stop_price is None
+            ):
+                continue
+            mark = self._price(order.ticker)
+            if mark is None or mark > order.stop_price:
+                continue
+            held = self._positions.get(order.ticker)
+            if held is None or held.quantity < (order.quantity or Decimal(0)):
+                # Triggered with the shares gone: a cash account cannot sell
+                # what it does not hold, so the venue refuses the sell.
+                self._orders[order.broker_order_id] = _with_status(order, OrderStatus.REJECTED)
+                continue
+            self._fill(order.broker_order_id, price=mark)
+
     # -- the read half -----------------------------------------------------
 
     def get_account_info(self) -> AccountInfo:
         return AccountInfo(account_id=1, currency_code=self.currency)
 
     def get_cash(self) -> CashBalance:
+        self._trigger_stops()
         invested = sum(
             (p.quantity * (p.average_price or Decimal(0)) for p in self._positions.values()),
             Decimal(0),
         )
+        if not self.mark_to_market:
+            return CashBalance(
+                currency=self.currency,
+                free=self.free_cash - invested,
+                total=self.equity,
+                invested=invested,
+                blocked=Decimal(0),
+            )
+        # Every holding at its mark, so equity moves with the market and the
+        # loss breakers read a real number. A holding with no mark is carried
+        # at its last known price rather than at zero or at cost, either of
+        # which would invent a move that did not happen.
+        marked = sum(
+            (p.market_value or Decimal(0) for p in self.get_positions()),
+            Decimal(0),
+        )
         return CashBalance(
             currency=self.currency,
-            free=self.free_cash - invested,
-            total=self.equity,
+            free=self._cash,
+            total=self._cash + marked,
             invested=invested,
+            ppl=marked - invested,
             blocked=Decimal(0),
         )
 
     def get_positions(self) -> tuple[Position, ...]:
-        return tuple(self._with_max_sell(position) for position in self._positions.values())
+        self._trigger_stops()
+        return tuple(self._as_reported(position) for position in self._positions.values())
 
     def get_position(self, ticker: str) -> Position | None:
         """Only a held position has a `currentPrice`.
@@ -549,17 +682,35 @@ class SimulatedBroker:
         cannot speak for a first entry — which is what the two-tier symbol
         verification exists to work around.
         """
+        self._trigger_stops()
         position = self._positions.get(ticker)
-        return None if position is None else self._with_max_sell(position)
+        return None if position is None else self._as_reported(position)
 
-    def _with_max_sell(self, position: Position) -> Position:
-        """`maxSell` as the venue reports it: what no pending sell has committed."""
-        return replace(position, max_sell=self._free_to_sell(position.ticker))
+    def _as_reported(self, position: Position) -> Position:
+        """A holding as the venue reports it.
+
+        `maxSell` is what no pending sell has committed. In `mark_to_market`
+        the price is the mark and `ppl` follows it; otherwise the price is the
+        one the position was filled or seeded at, as a drill expects.
+        """
+        position = replace(position, max_sell=self._free_to_sell(position.ticker))
+        if not self.mark_to_market:
+            return position
+        mark = self._price(position.ticker)
+        current = mark if mark is not None else position.current_price
+        ppl = (
+            None
+            if current is None or position.average_price is None
+            else (current - position.average_price) * position.quantity
+        )
+        return replace(position, current_price=current, ppl=ppl)
 
     def get_open_orders(self) -> tuple[BrokerOrder, ...]:
+        self._trigger_stops()
         return tuple(o for o in self._orders.values() if o.status.is_open)
 
     def get_order(self, broker_order_id: str) -> BrokerOrder | None:
+        self._trigger_stops()
         return self._orders.get(broker_order_id)
 
     def get_instruments(self) -> tuple[Instrument, ...]:
@@ -597,6 +748,7 @@ class SimulatedBroker:
         return tuple(p for p in self.posts if p.ticker == ticker)
 
     def live_orders_for(self, ticker: str) -> tuple[BrokerOrder, ...]:
+        self._trigger_stops()
         return tuple(o for o in self._orders.values() if o.ticker == ticker and o.status.is_open)
 
     def protective_orders_for(self, ticker: str) -> tuple[BrokerOrder, ...]:
@@ -623,6 +775,47 @@ class SimulatedBroker:
     def clear_crash(self) -> None:
         """Stop injecting. What a restarted process looks like."""
         self.fail_at = None
+
+
+@dataclass
+class BarMarks:
+    """The paper venue's price: the newest close the loop itself can see.
+
+    `visible_bars` at the broker's clock, so a paper fill is priced from what
+    the deciding cycle saw and never from a bar that becomes knowable later —
+    which would be a lookahead dressed up as a fill. It is the same raw close
+    the loop sizes from, so a paper fill carries no slippage against the
+    decision: the cost gate's estimate is the only cost the paper account
+    pays, and a paper run tests the engine rather than the edge.
+
+    Memoised per ticker within a clock minute, because the loop reads the venue
+    many times a cycle and each read would otherwise be a store query. A memo
+    is only returned at or after the instant it was read, so it can be staler
+    than a fresh read but never newer.
+    """
+
+    bars: BarSource
+    instruments: Mapping[str, str]
+    resolution: Resolution
+    clock: Callable[[], datetime] = now_utc
+    _memo: dict[str, tuple[datetime, Decimal | None]] = field(default_factory=dict, init=False)
+
+    def __call__(self, ticker: str) -> Decimal | None:
+        uid = self.instruments.get(ticker)
+        if uid is None:
+            return None
+        now = self.clock()
+        memo = self._memo.get(ticker)
+        if memo is not None and memo[0] <= now and _same_minute(memo[0], now):
+            return memo[1]
+        rows = visible_bars(self.bars, uid, self.resolution, as_of=now)
+        close = rows[-1].close if rows else None
+        self._memo[ticker] = (now, close)
+        return close
+
+
+def _same_minute(a: datetime, b: datetime) -> bool:
+    return a.replace(second=0, microsecond=0) == b.replace(second=0, microsecond=0)
 
 
 def _with_status(order: BrokerOrder, status: OrderStatus) -> BrokerOrder:
