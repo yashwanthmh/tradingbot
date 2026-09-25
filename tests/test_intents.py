@@ -16,6 +16,7 @@ resolve.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -580,6 +581,23 @@ def test_order_counts_come_from_intents_not_the_broker(log: IntentLog) -> None:
     total, for_symbol = log.counts_today(day=AS_OF, t212_ticker=TICKER)
     assert total == 2
     assert for_symbol == 2
+
+
+def test_order_counts_do_not_depend_on_the_host_s_time_zone(
+    log: IntentLog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Commit times are stored in UTC and the day was read in the host's local
+    zone. On a host fourteen hours ahead, the 14:30 UTC orders fell on a
+    different date from the day asked about, counted zero, and the daily order
+    cap and the anomaly breaker saw an idle account."""
+    log.commit(token=_token(), order_type=OrderType.MARKET, at=AS_OF)
+    monkeypatch.setenv("TZ", "Pacific/Kiritimati")
+    time.tzset()
+    try:
+        assert log.counts_today(day=AS_OF, t212_ticker=TICKER) == (1, 1)
+    finally:
+        monkeypatch.undo()
+        time.tzset()
 
 
 def test_protective_lookup_ignores_terminal_stops(log: IntentLog) -> None:

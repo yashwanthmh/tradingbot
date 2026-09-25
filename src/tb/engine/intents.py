@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 
@@ -763,8 +763,13 @@ class IntentLog:
         behind — and an order we sent but never got a response for still
         counts against a runaway-loop budget, which is exactly what the
         broker's list omits.
+
+        The day is the UTC date, because commit times are stored in UTC and
+        matched here as text. Reading it in the host's zone counted a day that
+        began and ended at the wrong hours — and on a host far enough from UTC,
+        the orders just placed fell on another date and counted zero.
         """
-        prefix = day.astimezone().strftime("%Y-%m-%d")
+        prefix = day.astimezone(UTC).strftime("%Y-%m-%d")
         total = self._ledger.conn.execute(
             "SELECT COUNT(*) AS n FROM order_intents WHERE wal_committed_at LIKE ?",
             (f"{prefix}%",),
