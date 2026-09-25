@@ -27,9 +27,10 @@ than in the loop.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from tb.broker.port import (
@@ -42,7 +43,7 @@ from tb.broker.port import (
     TimeValidity,
 )
 from tb.broker.t212.errors import BrokerHttpError
-from tb.core.clock import now_utc
+from tb.core.clock import now_utc, to_iso
 from tb.core.errors import TbError, TransportError
 from tb.core.ids import new_id
 from tb.engine.intents import IntentLog, IntentState, OrderIntent
@@ -97,6 +98,28 @@ class Submission:
     @property
     def filled(self) -> bool:
         return self.status is OrderStatus.FILLED
+
+
+@dataclass(frozen=True, slots=True)
+class Settlement:
+    """What one settlement pass found.
+
+    `filled` pairs each resolved intent with the fill recorded for it;
+    `closed` are orders that finished with nothing traded; `pending` left the
+    venue's open list but are not in its history yet, and are read again next
+    pass.
+    """
+
+    filled: tuple[tuple[OrderIntent, str], ...] = ()
+    closed: tuple[OrderIntent, ...] = ()
+    pending: tuple[OrderIntent, ...] = ()
+
+
+# How far back settlement looks for acknowledged orders. Five days spans a
+# weekend and a holiday, so an order placed on a Thursday before a long weekend
+# is still read when history reports it on the Tuesday; older than this is
+# reconciliation's, which reads the whole account.
+SETTLEMENT_LOOKBACK = timedelta(days=5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +289,7 @@ class OrderSubmitter:
         intent = self.log.mark_acknowledged(
             intent.intent_id,
             broker_order_id=placed.broker_order_id,
+            status=placed.status,
             detail=f"venue status {placed.raw_status or placed.status.value}",
         )
         return Submission(intent, placed.broker_order_id, placed.status)
@@ -296,10 +320,12 @@ class OrderSubmitter:
         earlier. So afterwards the order is fetched and:
 
         * `CANCELLED` — withdrawn, and its intent (if we placed it) is resolved so;
-        * `FILLED` — it traded first, resolved as filled, and the caller must not
-          act as though the shares are still held;
+        * `FILLED` — it traded first, and the caller must not act as though the
+          shares are still held. The intent is left for settlement, which reads
+          the fill's price from history: resolving it here would record a fill
+          with no price, and settle nothing it could be charged to;
         * absent from the venue's active orders — withdrawn one way or the other.
-          The intent is left for the fill sweep, which reads history, to settle;
+          The intent is left for settlement to read from history;
         * still working (the venue reports `CANCELLING` as working) — not
           withdrawn yet. Nothing is resolved, and the caller must not assume the
           shares are free.
@@ -353,23 +379,19 @@ class OrderSubmitter:
                 actor=Actor.RISK,
                 run_id=self.run_id,
             )
-        if intent is not None and not intent.state.is_terminal:
-            if status is OrderStatus.CANCELLED:
-                self.log.resolve(
-                    intent.intent_id,
-                    state=IntentState.RESOLVED_CANCELLED,
-                    resolved_by="withdrawn_by_engine",
-                    detail=detail,
-                    at=moment,
-                )
-            elif status is OrderStatus.FILLED:
-                self.log.resolve(
-                    intent.intent_id,
-                    state=IntentState.RESOLVED_FILLED,
-                    resolved_by="discovered_filled_at_withdrawal",
-                    detail=detail,
-                    at=moment,
-                )
+        if (
+            intent is not None
+            and not intent.state.is_terminal
+            and status is OrderStatus.CANCELLED
+            and not (order is not None and (order.filled_quantity or Decimal(0)) > 0)
+        ):
+            self.log.resolve(
+                intent.intent_id,
+                state=IntentState.RESOLVED_CANCELLED,
+                resolved_by="withdrawn_by_engine",
+                detail=detail,
+                at=moment,
+            )
         return Withdrawal(broker_order_id, status, withdrawn=withdrawn, detail=detail)
 
     # -- recovery ----------------------------------------------------------
@@ -399,6 +421,94 @@ class OrderSubmitter:
 
         return tuple(resolved), self.log.blocking_unknowns(broker_orders=broker_orders)
 
+    # -- settlement ----------------------------------------------------------
+
+    def settle(self, *, lookback: timedelta = SETTLEMENT_LOOKBACK) -> Settlement:
+        """Record what became of every acknowledged order that has finished.
+
+        Acknowledged is not settled. On this venue a market order's response
+        precedes its fill, a stop fills whenever the market reaches it, and a
+        cancel can lose the race — so until something reads the outcome, a
+        filled order has no fill row, its intent stays acknowledged, and no
+        realised result can be computed from it. This is that read: for each
+        acknowledged order no longer among the venue's open orders, history
+        says how much traded and at what price.
+
+        * traded — the fill is recorded from history, priced and admissible
+          (or unpriced and not, if the venue gave no price), and the intent
+          resolved as filled; a partial fill is a fill of what traded;
+        * nothing traded — resolved as cancelled, the venue's own status named;
+        * not in history yet — left as it is and read again next pass. History
+          trails fills and is rationed, and a missing entry is not evidence of
+          anything.
+
+        One open-orders read, and one history read only when an order has left
+        the open list — the venue allows six history calls a minute, so this
+        costs at most one per cycle and usually none.
+        """
+        moment = self._now()
+        waiting = self.log.awaiting_settlement(since=moment - lookback)
+        if not waiting:
+            return Settlement()
+        working = {order.broker_order_id for order in self.broker.get_open_orders()}
+        finished = [intent for intent in waiting if intent.broker_order_id not in working]
+        if not finished:
+            return Settlement()
+
+        history = {
+            execution.broker_order_id: execution for execution in self.broker.get_executions()
+        }
+        filled: list[tuple[OrderIntent, str]] = []
+        closed: list[OrderIntent] = []
+        pending: list[OrderIntent] = []
+        for intent in finished:
+            execution = history.get(intent.broker_order_id or "")
+            if execution is None or not execution.status.is_terminal:
+                pending.append(intent)
+                continue
+            if execution.filled:
+                # A pass that crashed between recording the fill and resolving
+                # its intent left the fill behind. Recording it again would
+                # double the trade in every number built on fills.
+                fill_id = self._recorded_fill(intent.intent_id) or self.record_fill(
+                    intent=intent,
+                    quantity=execution.filled_quantity,
+                    price=execution.fill_price,
+                    source=FillSource.API_HISTORY,
+                    filled_at=execution.executed_at or moment,
+                    fees=dict(execution.fees),
+                )
+                price = "no price" if execution.fill_price is None else str(execution.fill_price)
+                settled = self.log.resolve(
+                    intent.intent_id,
+                    state=IntentState.RESOLVED_FILLED,
+                    resolved_by="order_history",
+                    detail=(
+                        f"{execution.filled_quantity} of {intent.quantity} at {price}, "
+                        f"venue status {execution.status.value}"
+                    ),
+                    at=moment,
+                )
+                filled.append((settled, fill_id))
+            else:
+                closed.append(
+                    self.log.resolve(
+                        intent.intent_id,
+                        state=IntentState.RESOLVED_CANCELLED,
+                        resolved_by="order_history",
+                        detail=f"nothing traded; venue status {execution.status.value}",
+                        at=moment,
+                    )
+                )
+        return Settlement(filled=tuple(filled), closed=tuple(closed), pending=tuple(pending))
+
+    def _recorded_fill(self, intent_id: str) -> str | None:
+        row = self.ledger.conn.execute(
+            "SELECT fill_id FROM fills WHERE intent_id = ? ORDER BY recording_event_seq LIMIT 1",
+            (intent_id,),
+        ).fetchone()
+        return None if row is None else str(row["fill_id"])
+
     # -- fills -------------------------------------------------------------
 
     def record_fill(
@@ -424,6 +534,9 @@ class OrderSubmitter:
         admissible = source == FillSource.API_HISTORY and price is not None
         fill_id = new_id("fill")
         moment = filled_at or self._now()
+        # As strings, so the amounts survive both the event's canonical JSON and
+        # the column exactly as the venue reported them.
+        charges = {str(name): str(amount) for name, amount in (fees or {}).items()}
 
         with self.ledger.transaction() as tx:
             event = tx.append(
@@ -442,8 +555,8 @@ class OrderSubmitter:
                     broker_order_id=intent.broker_order_id,
                     instrument_uid=instrument_uid or intent.instrument_uid,
                     price=price,
-                    filled_at=moment.isoformat(),
-                    fees=dict(fees or {}),
+                    filled_at=to_iso(moment),
+                    fees=charges,
                     fx_rate=fx_rate,
                 ),
                 actor=Actor.BROKER,
@@ -463,8 +576,10 @@ class OrderSubmitter:
                     intent.side.value,
                     str(quantity),
                     str(price) if price is not None else None,
-                    moment.isoformat(),
-                    None if not fees else repr(dict(fees)),
+                    # Canonical, as the equity curve compares it against
+                    # `to_iso` instants as text.
+                    to_iso(moment),
+                    json.dumps(charges, sort_keys=True) if charges else None,
                     str(fx_rate) if fx_rate is not None else None,
                     source,
                     "observed" if admissible else "inferred",

@@ -71,9 +71,10 @@ from datetime import datetime
 from decimal import Decimal
 
 from tb.broker.port import Broker, OrderPurpose, OrderType, Side, TimeValidity
+from tb.broker.t212.errors import BrokerHttpError, RateLimited
 from tb.config.loader import PinnedLimits, load_hard_limits
 from tb.core.clock import now_utc
-from tb.core.errors import TbError
+from tb.core.errors import TbError, TransportError
 from tb.core.ids import new_id
 from tb.data.asof import BarSource, BarWindow, visible_bars
 from tb.data.regime import RegimeGate, RegimeReading
@@ -94,7 +95,9 @@ from tb.ledger.events import (
 from tb.ledger.store import Ledger
 from tb.ops.state import RunState, StateMachine
 from tb.ops.watchdog import InstanceLock, InstanceLockRefused, SelfCheck, WatchdogError
+from tb.portfolio.attribution import attribute_closed_trades
 from tb.portfolio.pnl import EquityCurve
+from tb.registry.lineage import SpecRegistry
 from tb.risk.engine import Evaluation, RiskEngine, entry_request, exit_request, stop_price_for
 from tb.risk.state import AccountState, RiskContext
 from tb.strategy.base import Action, Decision, PositionState
@@ -127,6 +130,8 @@ class CycleResult:
     # operator should see immediately: a position nothing in the book will close
     # is unmanaged exposure, whether or not the flattening order got through.
     unowned: tuple[tuple[str, str], ...] = ()
+    # Fills settlement read from the venue's history this cycle.
+    fills_recorded: tuple[str, ...] = ()
     duration_ms: float = 0.0
     halted: bool = False
     detail: str = ""
@@ -177,6 +182,7 @@ class TradingLoop:
         at = self.clock()
 
         self._preflight(at)
+        fills, settlement_note = self._settle(at)
         regime = self._read_regime(at)
 
         decisions: list[Decision] = []
@@ -253,7 +259,9 @@ class TradingLoop:
             stops_placed=tuple(stops),
             regime=regime,
             unowned=tuple((ticker, reason) for ticker, _, reason in unowned),
+            fills_recorded=fills,
             duration_ms=duration,
+            detail=settlement_note,
         )
         self._record_cycle(result)
         return result
@@ -367,6 +375,43 @@ class TradingLoop:
         by different factors would not be a coherent portfolio.
         """
         return RegimeGate(limits=self.pinned.limits).read(self.bars, as_of=at)
+
+    def _settle(self, at: datetime) -> tuple[tuple[str, ...], str]:
+        """Read what finished since the last cycle, and charge what it realised.
+
+        Before anything is decided, so the protection pass sees what actually
+        traded — a stop that fired leaves no position, not an unprotected one —
+        and a closed trade reaches its strategy's record, and its lineage's
+        budget, in the cycle it settles. Without this every fill stayed
+        unrecorded and every strategy showed zero trades forever.
+
+        A venue that cannot be read this cycle is read next cycle: settlement is
+        bookkeeping, a missed pass loses nothing, and halting over it would
+        also stop the protection pass that follows. Drift in what the venue
+        returns is not caught here — that still halts, as everywhere else.
+        Attribution runs either way, since it reads only the ledger and picks up
+        any fill a previous pass recorded but did not charge.
+
+        Returns the fills recorded and a note when settlement was deferred.
+        """
+        fills: tuple[str, ...] = ()
+        note = ""
+        try:
+            settlement = self.submitter.settle()
+            fills = tuple(fill_id for _, fill_id in settlement.filled)
+        except (TransportError, BrokerHttpError, RateLimited) as exc:
+            note = f"settlement deferred to the next cycle: {exc}"
+        attribute_closed_trades(
+            self.ledger,
+            registry=SpecRegistry(
+                self.ledger,
+                per_lineage_budget_ccy=self.pinned.limits.loss.per_lineage_budget_ccy,
+                run_id=self.run_id,
+            ),
+            run_id=self.run_id,
+            at=at,
+        )
+        return fills, note
 
     # -- one instrument ----------------------------------------------------
 
@@ -1367,6 +1412,7 @@ class TradingLoop:
                 duration_ms=result.duration_ms,
                 halted=result.halted,
                 detail=result.detail,
+                n_fills_recorded=len(result.fills_recorded),
             ),
             actor=Actor.SYSTEM,
             run_id=self.run_id,

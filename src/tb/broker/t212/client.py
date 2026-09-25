@@ -31,6 +31,7 @@ from tb.broker.port import (
     AccountSnapshot,
     BrokerOrder,
     CashBalance,
+    Execution,
     Instrument,
     OrderPurpose,
     OrderType,
@@ -58,6 +59,7 @@ from tb.broker.t212.models import (
     OrderResponse,
     PlacedOrderResponse,
     PositionResponse,
+    executions_from_history,
     parse_many,
     parse_one,
 )
@@ -527,6 +529,15 @@ class T212Client:
         # The endpoint is paginated: `{items: [...], nextPagePath: ...}`.
         items = body.get("items", []) if isinstance(body, dict) else body
         return self._parse_many(HistoricalOrderResponse, items, Endpoint.HISTORY_ORDERS, msg_id)
+
+    def get_executions(self, *, limit: int = 50) -> tuple[Execution, ...]:
+        """The most recent finished orders, one per order id, newest first.
+
+        One page of order history — one of the six calls a minute that
+        endpoint allows. Fifty covers more than a day's `max_orders_per_day`,
+        so settling each cycle's finished orders never needs a second page.
+        """
+        return executions_from_history(self.get_order_history(limit=limit))
 
     def get_dividends(
         self, *, limit: int = 50, cursor: int | None = None

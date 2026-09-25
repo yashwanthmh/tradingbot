@@ -27,7 +27,7 @@ from pathlib import Path
 
 from tb.core.canonical import GENESIS_HASH
 
-LEDGER_SCHEMA_VERSION = 8
+LEDGER_SCHEMA_VERSION = 9
 
 # --------------------------------------------------------------------------
 # Tables
@@ -717,6 +717,27 @@ _TABLES: tuple[str, ...] = (
         confidence        TEXT    NOT NULL,
         admissible_for_pnl INTEGER NOT NULL DEFAULT 0,
         recorded_at       TEXT    NOT NULL,
+        recording_event_seq INTEGER NOT NULL
+    )
+    """,
+    # One row per closing fill: what it realised and whose record it went to.
+    # A projection of `trade.closed`. Keyed by the fill, so a fill is
+    # attributed once however many times the sweep that attributes it runs —
+    # and a fill with no row here is one that sweep has yet to reach.
+    """
+    CREATE TABLE IF NOT EXISTS round_trips (
+        closing_fill_id   TEXT    PRIMARY KEY,
+        t212_ticker       TEXT    NOT NULL,
+        strategy_id       TEXT,
+        strategy_version  INTEGER,
+        quantity          TEXT    NOT NULL,
+        exit_price        TEXT,
+        cost_basis        TEXT,
+        pnl_ccy           TEXT,
+        admissible        INTEGER NOT NULL,
+        charged           INTEGER NOT NULL,
+        detail            TEXT,
+        closed_at         TEXT,
         recording_event_seq INTEGER NOT NULL
     )
     """,

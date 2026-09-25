@@ -462,6 +462,7 @@ def _report(results: tuple[object, ...]) -> None:
     table.add_column("decisions", justify="right")
     table.add_column("orders", justify="right")
     table.add_column("stops", justify="right")
+    table.add_column("fills", justify="right")
     table.add_column("refused", justify="right")
     table.add_column("ms", justify="right")
 
@@ -473,6 +474,7 @@ def _report(results: tuple[object, ...]) -> None:
             str(len(result.decisions)),
             str(len(result.submitted)),
             str(len(result.stops_placed)),
+            str(len(result.fills_recorded)),
             f"[yellow]{len(result.refusals)}[/yellow]" if result.refusals else "0",
             f"{result.duration_ms:.0f}",
         )
@@ -489,6 +491,9 @@ def _report(results: tuple[object, ...]) -> None:
             if line not in seen:
                 seen.add(line)
                 console.print(f"  {WARN} {escape(line)}", soft_wrap=True)
+        if result.detail and result.detail not in seen:
+            seen.add(result.detail)
+            console.print(f"  {WARN} cycle {result.cycle}: {escape(result.detail)}", soft_wrap=True)
 
     total_orders = sum(len(r.submitted) for r in results if isinstance(r, CycleResult))
     console.print(

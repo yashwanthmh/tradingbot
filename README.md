@@ -373,6 +373,14 @@ market so the loss breakers are live, and a stop fires — at the market, gap
 included — once the price reaches it. The account lives in the process, so each
 paper run starts flat.
 
+Each cycle opens by settling what finished since the last. Every order that has
+left the venue's open list is read from order history — one rationed call, and
+none when nothing has finished — its fill recorded at the venue's price and its
+intent resolved. Every closing fill is then charged to the strategy whose
+decision placed it, at average cost from the recorded fills: the realised record
+that `tb review`, the allocator and the lineage loss budgets read. A result that
+depends on a fill with no reported price is recorded and charged to nobody.
+
 The loop reads `registry.promoted()`, loads each spec, builds **each strategy's
 own pipeline from its own spec**, and sizes every order at
 `min(allocation, rung notional)` — which reaches the order path as a risk

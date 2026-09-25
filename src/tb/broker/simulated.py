@@ -60,6 +60,7 @@ from tb.broker.port import (
     AccountSnapshot,
     BrokerOrder,
     CashBalance,
+    Execution,
     Instrument,
     OrderOutcomeUnknown,
     OrderPurpose,
@@ -219,12 +220,19 @@ class SimulatedBroker:
     # Rejections the drill wants, keyed by ticker. Each fires once, so a
     # retry after a rejection can be shown to succeed.
     reject_once: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # Whether order history shows finished orders yet. The venue's history is
+    # rationed and can trail the fill, so an order can leave the open list
+    # before history says what became of it; a drill of that gap sets this
+    # False.
+    publish_history: bool = True
 
     _positions: dict[str, Position] = field(default_factory=dict, init=False)
     _orders: dict[str, BrokerOrder] = field(default_factory=dict, init=False)
     posts: list[PostRecord] = field(default_factory=list, init=False)
     _closed: bool = field(default=False, init=False)
     _cash: Decimal = field(default=Decimal(0), init=False)
+    # Price and time of each fill, which history reports and an order does not.
+    _executed: dict[str, tuple[Decimal, datetime]] = field(default_factory=dict, init=False)
 
     # Trading 212's documented ceiling. Exhausting it is how a protective stop
     # gets rejected for a reason that has nothing to do with the stop.
@@ -564,6 +572,7 @@ class SimulatedBroker:
         if self.mark_to_market:
             notional = fill_price * quantity
             self._cash += notional if order.side is Side.SELL else -notional
+        self._executed[broker_order_id] = (fill_price, self.clock())
 
         if new_quantity > 0:
             self._positions[order.ticker] = Position(
@@ -712,6 +721,27 @@ class SimulatedBroker:
     def get_order(self, broker_order_id: str) -> BrokerOrder | None:
         self._trigger_stops()
         return self._orders.get(broker_order_id)
+
+    def get_executions(self, *, limit: int = 50) -> tuple[Execution, ...]:
+        """Finished orders, most recently placed first, as history reports them."""
+        self._trigger_stops()
+        if not self.publish_history:
+            return ()
+        finished = [order for order in self._orders.values() if order.status.is_terminal]
+        out: list[Execution] = []
+        for order in reversed(finished[-limit:] if limit > 0 else []):
+            price, at = self._executed.get(order.broker_order_id, (None, None))
+            out.append(
+                Execution(
+                    broker_order_id=order.broker_order_id,
+                    ticker=order.ticker,
+                    status=order.status,
+                    filled_quantity=order.filled_quantity or Decimal(0),
+                    fill_price=price,
+                    executed_at=at,
+                )
+            )
+        return tuple(out)
 
     def get_instruments(self) -> tuple[Instrument, ...]:
         return tuple(

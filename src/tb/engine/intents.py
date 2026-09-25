@@ -476,9 +476,15 @@ class IntentLog:
         intent_id: str,
         *,
         broker_order_id: str,
+        status: OrderStatus = OrderStatus.WORKING,
         detail: str = "",
     ) -> OrderIntent:
         """The broker returned an order id. The intent is no longer unknown.
+
+        `status` is what the venue said in that response — `FILLED` from a
+        venue that fills on accept, usually `WORKING` from this one — and is
+        recorded as said. Acknowledged is not settled either way: the fill,
+        with its price, is recorded when settlement reads it from history.
 
         Takes no `at`, unlike its neighbours: there is no `acknowledged_at`
         column, so a timestamp passed here would be silently discarded. The
@@ -495,7 +501,7 @@ class IntentLog:
                     run_id=self._run_id,
                     t212_ticker=intent.t212_ticker,
                     broker_order_id=broker_order_id,
-                    status=OrderStatus.WORKING.value,
+                    status=status.value,
                     detail=detail,
                 ),
                 actor=Actor.BROKER,
@@ -719,6 +725,21 @@ class IntentLog:
             (broker_order_id,),
         ).fetchone()
         return None if row is None else _from_row(row)
+
+    def awaiting_settlement(self, *, since: datetime) -> tuple[OrderIntent, ...]:
+        """Acknowledged intents committed since `since`: at the venue, outcome unread.
+
+        Settlement's work list, in commit order so an entry's fill is recorded
+        before the exit that closes it. Bounded in time so an order the venue's
+        history never reports stops costing a rationed history call every
+        cycle; anything older is `tb reconcile`'s, which reads the whole account.
+        """
+        rows = self._ledger.conn.execute(
+            "SELECT * FROM order_intents WHERE state = ? AND broker_order_id IS NOT NULL"
+            " AND wal_committed_at >= ? ORDER BY committing_event_seq",
+            (IntentState.ACKNOWLEDGED.value, to_iso(since)),
+        ).fetchall()
+        return tuple(_from_row(row) for row in rows)
 
     def protective_for(self, t212_ticker: str) -> tuple[OrderIntent, ...]:
         """Live protective stops for a ticker.

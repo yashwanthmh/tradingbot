@@ -32,6 +32,7 @@ from tb.broker.t212.models import (
     InstrumentResponse,
     OrderResponse,
     PositionResponse,
+    executions_from_history,
     map_status,
     parse_many,
     parse_one,
@@ -388,6 +389,71 @@ class TestHistory:
         parsed = parse_one(HistoricalOrderResponse, body, endpoint="history_orders")
         assert parsed.fill_price == Decimal("155.25")
         assert parsed.taxes[0]["name"] == "STAMP_DUTY"
+
+    @staticmethod
+    def _history(*bodies: dict[str, Any]) -> list[HistoricalOrderResponse]:
+        return parse_many(HistoricalOrderResponse, list(bodies), endpoint="history_orders")
+
+    def test_history_becomes_one_execution_per_order(self) -> None:
+        """What settlement reads. A sell's quantity is signed negative by the
+        venue and read unsigned; charges are summed by name and unsigned; the
+        executed time keeps its offset."""
+        (execution,) = executions_from_history(
+            self._history(
+                {
+                    "id": 7,
+                    "ticker": "AAPL_US_EQ",
+                    "filledQuantity": -2.0,
+                    "fillPrice": 150.0,
+                    "status": "FILLED",
+                    "dateExecuted": "2026-01-15T14:31:00.000+00:00",
+                    "taxes": [
+                        {"name": "CURRENCY_CONVERSION_FEE", "quantity": -0.45},
+                        {"name": "STAMP_DUTY", "quantity": "unreadable"},
+                    ],
+                }
+            )
+        )
+        assert execution.broker_order_id == "7"
+        assert execution.status is OrderStatus.FILLED
+        assert execution.filled and execution.filled_quantity == Decimal("2")
+        assert execution.fill_price == Decimal("150")
+        assert execution.fees == (("CURRENCY_CONVERSION_FEE", Decimal("0.45")),)
+        assert execution.executed_at is not None
+        assert execution.executed_at.isoformat() == "2026-01-15T14:31:00+00:00"
+
+    def test_an_order_filled_in_parts_is_combined(self) -> None:
+        """Newest first, as the venue returns them; parts combined, the price
+        volume-weighted, and an entry with no id skipped."""
+        executions = executions_from_history(
+            self._history(
+                {"id": 9, "ticker": "X", "filledQuantity": 1, "fillPrice": 10, "status": "FILLED"},
+                {"id": 8, "ticker": "X", "filledQuantity": 1, "fillPrice": 100, "status": "FILLED"},
+                {"id": 8, "ticker": "X", "filledQuantity": 3, "fillPrice": 104, "status": "FILLED"},
+                {"ticker": "X", "filledQuantity": 1, "fillPrice": 1, "status": "FILLED"},
+            )
+        )
+        assert [e.broker_order_id for e in executions] == ["9", "8"]
+        assert executions[1].filled_quantity == Decimal("4")
+        assert executions[1].fill_price == Decimal("103")
+
+    def test_a_fill_the_venue_did_not_price_stays_unpriced(self) -> None:
+        """Traded, at a price unknown — not zero, and not an average over the
+        parts that happen to carry one."""
+        (execution,) = executions_from_history(
+            self._history(
+                {"id": 3, "ticker": "X", "filledQuantity": 1, "fillPrice": 10, "status": "FILLED"},
+                {"id": 3, "ticker": "X", "filledQuantity": 1, "status": "FILLED"},
+            )
+        )
+        assert execution.filled and execution.fill_price is None
+
+    def test_a_cancelled_order_is_finished_with_nothing_traded(self) -> None:
+        (execution,) = executions_from_history(
+            self._history({"id": 4, "ticker": "X", "filledQuantity": 0, "status": "CANCELLED"})
+        )
+        assert execution.status.is_terminal and not execution.filled
+        assert execution.executed_at is None
 
 
 class TestRealWorldJson:

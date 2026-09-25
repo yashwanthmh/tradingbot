@@ -26,6 +26,8 @@ design:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, TypeVar
 
@@ -35,6 +37,7 @@ from tb.broker.port import (
     AccountInfo,
     BrokerOrder,
     CashBalance,
+    Execution,
     Instrument,
     OrderStatus,
     OrderType,
@@ -471,6 +474,83 @@ class HistoricalOrderResponse(T212Model):
     date_executed: str | None = Field(default=None, alias="dateExecuted")
     fill_type: str | None = Field(default=None, alias="fillType")
     taxes: list[dict[str, Any]] = Field(default_factory=list)
+
+
+def executions_from_history(entries: Iterable[HistoricalOrderResponse]) -> tuple[Execution, ...]:
+    """History entries as executions: one per order id, newest first.
+
+    An order that filled in parts can appear once per fill, and is combined —
+    quantities summed, the price volume-weighted, the charges added — because a
+    caller placed one order and settles one order. Quantities are unsigned: the
+    venue signs a sell's quantity negative, and the side is already known from
+    the order that was placed.
+
+    An entry with no id is skipped, since nothing we placed can be matched to
+    it. A filled part with no price leaves the whole order's price `None`: the
+    shares traded, and a volume-weighted average over the parts that happen to
+    carry a price would be a number the venue never reported.
+    """
+    grouped: dict[str, list[HistoricalOrderResponse]] = {}
+    for entry in entries:
+        if entry.order_id is not None:
+            grouped.setdefault(str(entry.order_id), []).append(entry)
+    return tuple(_combine(order_id, parts) for order_id, parts in grouped.items())
+
+
+def _combine(order_id: str, parts: list[HistoricalOrderResponse]) -> Execution:
+    filled = Decimal(0)
+    value = Decimal(0)
+    priced = True
+    fees: dict[str, Decimal] = {}
+    executed: datetime | None = None
+    for part in parts:
+        quantity = abs(part.filled_quantity) if part.filled_quantity is not None else Decimal(0)
+        if quantity > 0:
+            if part.fill_price is None:
+                priced = False
+            else:
+                value += quantity * part.fill_price
+            filled += quantity
+        for tax in part.taxes:
+            charged = _charge(tax)
+            if charged is not None:
+                name, amount = charged
+                fees[name] = fees.get(name, Decimal(0)) + amount
+        moment = _executed_at(part.date_executed)
+        if moment is not None and (executed is None or moment > executed):
+            executed = moment
+    first = parts[0]
+    return Execution(
+        broker_order_id=order_id,
+        ticker=first.ticker or "",
+        status=map_status(first.status),
+        filled_quantity=filled,
+        fill_price=(value / filled) if filled > 0 and priced else None,
+        executed_at=executed,
+        fees=tuple(sorted(fees.items())),
+    )
+
+
+def _charge(tax: dict[str, Any]) -> tuple[str, Decimal] | None:
+    """One itemised charge, unsigned. `None` for one whose amount is unreadable."""
+    try:
+        amount = Decimal(str(tax.get("quantity")))
+    except (InvalidOperation, ValueError):
+        return None
+    if not amount.is_finite():
+        return None
+    return str(tax.get("name") or "UNNAMED"), abs(amount)
+
+
+def _executed_at(raw: str | None) -> datetime | None:
+    """When a part filled. A timestamp without an offset is unknown, not UTC."""
+    if not raw:
+        return None
+    try:
+        moment = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return None if moment.tzinfo is None else moment.astimezone(UTC)
 
 
 # --------------------------------------------------------------------------

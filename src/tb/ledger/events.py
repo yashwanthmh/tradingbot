@@ -144,6 +144,11 @@ class EventType(StrEnum):
     # conflating the two would lose the fact that we never saw the ack.
     INTENT_RESOLVED = "intent.resolved"
     FILL_RECORDED = "fill.recorded"
+    # A sell fill closed some or all of a position: its realised result, the
+    # strategy it belongs to, and whether it was charged to that strategy's
+    # record. The realised series the review, the allocator and the lineage
+    # budgets read is rebuildable from these alone.
+    TRADE_CLOSED = "trade.closed"
     # The protective stop landing behind an entry closes the unprotected
     # window. Its own event because the window's duration is a number worth
     # being able to query, not just a state worth checking.
@@ -893,6 +898,31 @@ class FillPayload(EventPayload):
     fx_rate: Decimal | None = None
 
 
+class TradeClosedPayload(EventPayload):
+    """The realised result of one closing fill, and who it belongs to.
+
+    `admissible` is false when any fill the result depends on has no reported
+    price — the basis or the exit would be a guess — and then nothing is
+    charged: an inferred number must not teach the allocator an edge, nor spend
+    a lineage's budget on a loss nobody measured. `charged` says whether it
+    reached the strategy's record, and `detail` why not when it did not.
+    """
+
+    closing_fill_id: str
+    run_id: str
+    t212_ticker: str
+    quantity: Decimal
+    admissible: bool
+    charged: bool
+    strategy_id: str | None = None
+    strategy_version: int | None = None
+    exit_price: Decimal | None = None
+    cost_basis: Decimal | None = None
+    pnl_ccy: Decimal | None = None
+    closed_at: str | None = None
+    detail: str = ""
+
+
 class ProtectionPayload(EventPayload):
     """A position gained or lost its protective stop.
 
@@ -962,6 +992,7 @@ class LoopCyclePayload(EventPayload):
     duration_ms: float
     halted: bool = False
     detail: str = ""
+    n_fills_recorded: int = 0
 
 
 class StrategySpecPayload(EventPayload):
@@ -1388,6 +1419,7 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.ORDER_CANCELLED: OrderOutcomePayload,
     EventType.INTENT_RESOLVED: IntentResolvedPayload,
     EventType.FILL_RECORDED: FillPayload,
+    EventType.TRADE_CLOSED: TradeClosedPayload,
     EventType.POSITION_PROTECTED: ProtectionPayload,
     EventType.POSITION_UNPROTECTED: ProtectionPayload,
     EventType.WATCHDOG_TRIPPED: WatchdogPayload,
@@ -1466,6 +1498,7 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     EventType.ORDER_CANCELLED: AggregateType.ORDER,
     EventType.INTENT_RESOLVED: AggregateType.ORDER,
     EventType.FILL_RECORDED: AggregateType.POSITION,
+    EventType.TRADE_CLOSED: AggregateType.STRATEGY,
     EventType.POSITION_PROTECTED: AggregateType.POSITION,
     EventType.POSITION_UNPROTECTED: AggregateType.POSITION,
     EventType.WATCHDOG_TRIPPED: AggregateType.SAFETY,

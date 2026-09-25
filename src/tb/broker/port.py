@@ -243,6 +243,40 @@ class BrokerOrder:
 
 
 @dataclass(frozen=True, slots=True)
+class Execution:
+    """A finished order as the venue's order history records it.
+
+    The record the open-orders list cannot give: an order that filled leaves
+    that list exactly as a cancelled or rejected one does, so an order's
+    absence says nothing about whether it traded. History does — how much
+    filled, at what price, when, and what the venue charged for it — and it is
+    the only source of a fill price that may enter realised P&L.
+
+    `fees` are the venue's itemised charges (currency conversion, stamp duty)
+    by the venue's own names, in the account currency, as positive amounts.
+    A `fill_price` of `None` on a filled order means the venue did not say:
+    the shares traded, and the price is unknown rather than zero.
+    """
+
+    broker_order_id: str
+    ticker: str
+    status: OrderStatus
+    filled_quantity: Decimal = Decimal(0)
+    fill_price: Decimal | None = None
+    executed_at: datetime | None = None
+    fees: tuple[tuple[str, Decimal], ...] = ()
+
+    @property
+    def filled(self) -> bool:
+        """Whether anything traded — priced or not."""
+        return self.filled_quantity > 0
+
+    @property
+    def total_fees(self) -> Decimal:
+        return sum((amount for _, amount in self.fees), Decimal(0))
+
+
+@dataclass(frozen=True, slots=True)
 class AccountSnapshot:
     """Everything the broker will tell us at one moment.
 
@@ -298,6 +332,15 @@ class ReadOnlyBroker(Protocol):
     def get_open_orders(self) -> tuple[BrokerOrder, ...]: ...
 
     def get_order(self, broker_order_id: str) -> BrokerOrder | None: ...
+
+    def get_executions(self, *, limit: int = 50) -> tuple[Execution, ...]:
+        """The most recent finished orders, newest first, one per order.
+
+        Rate-limited hard on the venue (six calls a minute), so a caller asks
+        once per cycle at most, and only when an order it placed has left the
+        open-orders list.
+        """
+        ...
 
     def get_instruments(self) -> tuple[Instrument, ...]: ...
 
