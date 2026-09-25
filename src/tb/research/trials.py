@@ -214,6 +214,8 @@ class TrialLog:
         returns: Sequence[Decimal] | Sequence[float] = (),
         at: datetime | None = None,
         emit_event: bool = True,
+        selected_from_search: int | None = None,
+        selected_from_lineage: int | None = None,
     ) -> Trial:
         """Record one trial, stamping the multiplicity as it stands now.
 
@@ -223,6 +225,15 @@ class TrialLog:
         the count is what the gate divides by, and it is never optional. Only
         the per-trial *event* is suppressible, and the search summary event
         still records the totals.
+
+        `selected_from_search` and `selected_from_lineage` are for a **batch**
+        search, which selects only after every candidate has run. The running
+        count is right for a search that decides as it goes, but in a batch the
+        tenth trial recorded was still chosen from all fifty — so stamping it
+        with ten would deflate a selected survivor against a fifth of the search
+        that actually produced it. The caller passes the batch's totals and the
+        stamp is the larger of the two. They can only ever *raise* a count, so
+        neither can be used to shrink a haircut.
         """
         moment = at or now_utc()
         if outcome is TrialOutcome.REJECTED and not rejection_reason:
@@ -234,9 +245,11 @@ class TrialLog:
             )
 
         # Counts *before* this row, plus one for this row: the multiplicity this
-        # candidate was drawn against includes itself.
-        in_lineage = self.count_in_lineage(lineage_id) + 1
-        in_search = self.count_in_search(search_id) + 1
+        # candidate was drawn against includes itself. A batch search raises
+        # them to the batch's totals — see the docstring — and `max` is what
+        # makes that a floor rather than an override.
+        in_lineage = max(self.count_in_lineage(lineage_id) + 1, selected_from_lineage or 0)
+        in_search = max(self.count_in_search(search_id) + 1, selected_from_search or 0)
 
         trial = Trial(
             trial_id=new_id("trial", length=12),

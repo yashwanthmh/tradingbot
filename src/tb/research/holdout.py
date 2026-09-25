@@ -240,6 +240,46 @@ class SealedBarSource:
         )
 
 
+# A decision is taken this long after the bar it acts on became knowable. The
+# same offset the null population uses, so a candidate's training statistics and
+# its holdout statistics are computed on schedules with the same shape.
+DECISION_OFFSET = timedelta(hours=1)
+
+
+def decisions_between(
+    bars: Iterable[Bar],
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> list[datetime]:
+    """One decision per distinct knowable instant, in `[start, end)`.
+
+    Used by both the search cycle and the single holdout evaluation, so the
+    statistics a candidate was selected on and the ones it is judged on come
+    from schedules built the same way. Two properties matter:
+
+    **Filtered on the decision time, not on the bar time.** A daily bar opened
+    the day before the boundary is knowable the day after it, so filtering
+    training decisions by `bar_open < sealed_from` produces a last decision
+    *past* the seal — which the sealed reader refuses, correctly, and the whole
+    search dies on its final bar. Filtering on the decision itself partitions
+    time cleanly: every training decision is strictly before the seal and every
+    holdout decision is at or after it, with no gap between them.
+
+    **Deduplicated.** A vintage of twenty-five instruments has twenty-five bars
+    per session, all knowable at the same instant, and an undeduplicated
+    schedule decides twenty-five times at each — an equity curve with twenty-four
+    zero returns per day, which deflates measured volatility and inflates every
+    Sharpe read from it.
+    """
+    instants = {bar.available_at_utc + DECISION_OFFSET for bar in bars}
+    return sorted(
+        instant
+        for instant in instants
+        if (start is None or instant >= start) and (end is None or instant < end)
+    )
+
+
 def training_reader(
     source: BarSource,
     *,

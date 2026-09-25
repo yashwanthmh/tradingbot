@@ -181,6 +181,19 @@ class SearchOutcome:
     def n_measurable(self) -> int:
         return sum(1 for c in self.candidates if c.fitness is not None)
 
+    def errored_examples(self, limit: int = 3) -> tuple[tuple[str, str], ...]:
+        """A few of the candidates the evaluator could not run, with why.
+
+        Shown rather than only counted. An errored candidate is either a spec the
+        grammar admits and the pipeline cannot evaluate — a bug in one of them —
+        or a data problem in the vintage, and a count of twelve says neither.
+        """
+        return tuple(
+            (candidate.spec_hash, candidate.error)
+            for candidate in self.candidates
+            if candidate.outcome is TrialOutcome.ERRORED
+        )[:limit]
+
     @property
     def best(self) -> Candidate | None:
         ranked = [c for c in self.candidates if c.fitness is not None]
@@ -254,6 +267,7 @@ class Searcher:
         budget: SearchBudget,
         min_deflated_sharpe: float,
         search_id: str,
+        seed_parents: Sequence[StrategySpec] = (),
     ) -> None:
         self._evaluate = evaluate
         self._validator = validator
@@ -262,6 +276,12 @@ class Searcher:
         self._budget = budget
         self._min_deflated = min_deflated_sharpe
         self._search_id = search_id
+        # Specs from an earlier search for generation one to mutate, instead of
+        # a random draw. This is what makes "many small searches" a way to
+        # refine an idea rather than only to start new ones — and it does not
+        # make refinement cheaper: a mutation stays in its parent's lineage, and
+        # the lineage count accumulates across every search that touches it.
+        self._seed_parents = tuple(seed_parents)
 
     def run(self) -> SearchOutcome:
         """Propose, validate, evaluate, select — `n_generations` times."""
@@ -276,8 +296,16 @@ class Searcher:
             generation += 1
             batch = min(self._budget.n_per_generation, remaining)
             remaining -= batch
-            proposer: SpecProposer = self._random if generation == 1 else self._mutation
-            parents = tuple(candidate.spec for candidate in survivors)
+            if generation == 1:
+                # Seeded: mutate the parents handed in. Unseeded: draw from the
+                # grammar. The mutation proposer falls back to a random draw on
+                # its own when it has no parents, so this is a choice of source
+                # rather than two code paths.
+                proposer: SpecProposer = self._mutation if self._seed_parents else self._random
+                parents: tuple[StrategySpec, ...] = self._seed_parents
+            else:
+                proposer = self._mutation
+                parents = tuple(candidate.spec for candidate in survivors)
             for proposal in proposer.propose(n=batch, rng=rng, parents=parents):
                 candidate = self._consider(proposal, generation=generation, seen=seen)
                 seen.add(candidate.spec_hash)

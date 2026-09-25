@@ -133,7 +133,7 @@ class SpecRegistry:
             derived_lineage = lineage_id or new_id("lin")
             generation = 0
 
-        strategy_id = deterministic_id("stg", parts={"spec_hash": spec_hash}, length=12)
+        strategy_id = strategy_id_for(spec_hash)
         version = 1
 
         registered = RegisteredSpec(
@@ -574,6 +574,17 @@ class SpecRegistry:
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+
+def strategy_id_for(spec_hash: str) -> str:
+    """The id a spec is registered under, derived from its content.
+
+    Public so a search can label a backtest with the id the spec *will* have if
+    it survives. Two derivations of the same id — one here, one in the searcher
+    — would be the first thing to drift, and the symptom would be a trial whose
+    `strategy_id` names no registered strategy.
+    """
+    return deterministic_id("stg", parts={"spec_hash": spec_hash}, length=12)
 
 
 def _actor_for(author_kind: AuthorKind) -> Actor:

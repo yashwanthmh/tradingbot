@@ -1,5 +1,6 @@
-"""`tb research ...` — the trial log and the single holdout evaluation.
+"""`tb research ...` — the search, the trial log and the single holdout evaluation.
 
+    tb research cycle      search a sealed vintage; record every trial
     tb research trials     the trial log, and the multiplicity it implies
     tb research holdout    spend a strategy's one holdout evaluation
     tb research null-gate  measure the gate's false-promotion rate
@@ -43,6 +44,7 @@ from tb.research.holdout import (
     DEFAULT_HOLDOUT_FRACTION,
     HoldoutAlreadyEvaluated,
     HoldoutRegistry,
+    decisions_between,
     evaluation_reader,
     holdout_boundary,
 )
@@ -88,6 +90,145 @@ def _ledger(db: Path | None, pinned: PinnedLimits) -> Ledger:
         err_console.print(f"{BAD} no ledger at {path}. Run `tb init` first.", soft_wrap=True)
         raise typer.Exit(2)
     return Ledger(path, config_hash=pinned.config_hash).open()
+
+
+# --------------------------------------------------------------------------
+# tb research cycle
+# --------------------------------------------------------------------------
+
+
+@research_app.command("cycle")
+def cycle(
+    vintage_id: Annotated[str, typer.Argument(help="The sealed vintage to search over.")],
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+    bars: RootOpt = None,
+    trials: Annotated[
+        int,
+        typer.Option(
+            "--trials",
+            help="The whole search's budget. The haircut is computed from this total.",
+        ),
+    ] = 50,
+    per_generation: Annotated[
+        int, typer.Option("--per-generation", help="Proposals per generation.")
+    ] = 25,
+    survivors: Annotated[
+        int, typer.Option("--survivors", help="Parents carried into each next generation.")
+    ] = 4,
+    seed: Annotated[int, typer.Option("--seed", help="Seed, so the search reproduces.")] = 0,
+    fraction: Annotated[
+        float, typer.Option("--fraction", help="Share of the window held back.")
+    ] = DEFAULT_HOLDOUT_FRACTION,
+    parents: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--from",
+            help="A registered strategy to refine instead of drawing at random. Repeatable.",
+            show_default=False,
+        ),
+    ] = None,
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply/--dry-run",
+            help="Register the survivors. Every trial is recorded either way.",
+        ),
+    ] = False,
+) -> None:
+    """Search a sealed vintage for strategies, recording every trial.
+
+    Proposes, validates and backtests on the training window only — the reader
+    it builds cannot reach past the holdout boundary — then registers the
+    survivors as candidates. It promotes nothing and evaluates no holdout; those
+    are `tb research holdout` and `tb promote evaluate`.
+
+    `--dry-run` by default, and a dry run still **records every trial**. The
+    search happened, and a search whose size went unrecorded would let its best
+    result be registered by hand with no multiplicity haircut at all.
+
+    The budget is the whole search. The output reports the out-of-sample Sharpe a
+    search of that size must show to clear the deflated-Sharpe gate — about 2.1
+    at ten trials and 3.8 at a thousand — which is the reason to keep it small.
+    """
+    from tb.research.loop import CycleError, ResearchCycle
+    from tb.research.searcher import SearchBudget, SearchError
+
+    pinned = _load(limits)
+    try:
+        budget = SearchBudget(
+            n_trials=trials,
+            n_per_generation=per_generation,
+            n_survivors=survivors,
+            seed=seed,
+        )
+    except SearchError as exc:
+        err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+        raise typer.Exit(2) from exc
+
+    with _ledger(db, pinned) as ledger:
+        store = BarStore(
+            ledger,
+            root=bars or (Path(ledger.path).parent / "bars"),
+            scale=pinned.limits.data.price_scale,
+        )
+        console.print(f"  searching {vintage_id} with a budget of {trials} trial(s)…")
+        try:
+            report = ResearchCycle(
+                ledger, limits=pinned.limits, snapshots=SnapshotStore(ledger, store)
+            ).run(
+                vintage_id=vintage_id,
+                budget=budget,
+                fraction=fraction,
+                register=apply,
+                seed_strategy_ids=tuple(parents or ()),
+            )
+        except (CycleError, TbError) as exc:
+            err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+            raise typer.Exit(2) from exc
+
+    outcome = report.outcome
+    if outcome.rejections_by_code:
+        table = Table(show_header=True, title="refused before a backtest")
+        table.add_column("reason")
+        table.add_column("count", justify="right")
+        for code, count in sorted(outcome.rejections_by_code.items(), key=lambda item: -item[1]):
+            table.add_row(code, str(count))
+        console.print(table)
+
+    ranked = sorted(
+        (c for c in outcome.candidates if c.fitness is not None),
+        key=lambda c: (-(c.fitness or 0.0), c.spec_hash),
+    )[:10]
+    if ranked:
+        table = Table(show_header=True, title="best by training Sharpe")
+        table.add_column("spec")
+        table.add_column("gen", justify="right")
+        table.add_column("how")
+        table.add_column("train Sharpe", justify="right")
+        table.add_column("trades", justify="right")
+        table.add_column("lineage")
+        for candidate in ranked:
+            table.add_row(
+                candidate.spec_hash[:12],
+                str(candidate.generation),
+                candidate.proposal.operator,
+                f"{candidate.fitness:.2f}",
+                str(candidate.n_trades),
+                report.lineage_of.get(candidate.spec_hash, "—"),
+            )
+        console.print(table)
+
+    for line in report.explain().splitlines():
+        console.print(f"  {escape(line)}", soft_wrap=True)
+    if outcome.errored_examples():
+        for spec_hash, error in outcome.errored_examples():
+            console.print(f"  {WARN} {spec_hash[:12]} errored: {escape(error)}", soft_wrap=True)
+    console.print(
+        f"{OK} {report.search_id}: {outcome.n_proposed} trial(s) in "
+        f"{report.duration_seconds:.1f}s. `tb research trials --search {report.search_id}` "
+        "shows every one."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -273,13 +414,11 @@ def holdout(
             instrument_uids=uids,
             lookback=timedelta(days=max(400, spec.max_lookback * 2)),
         )
-        schedule = [
-            bar.available_at_utc + timedelta(hours=1)
-            for bar in sorted(
-                (b for b in snapshots.bars_of(vintage_id) if b.bar_open_utc >= window.sealed_from),
-                key=lambda b: b.bar_open_utc,
-            )
-        ]
+        # The same schedule builder the search cycle uses for training, so the
+        # statistics a candidate was selected on and the ones it is judged on
+        # come from schedules built identically — deduplicated across
+        # instruments, and split on the decision time itself.
+        schedule = decisions_between(snapshots.bars_of(vintage_id), start=window.sealed_from)
         if len(schedule) < 2:
             err_console.print(f"{BAD} the holdout window holds fewer than two bars")
             raise typer.Exit(2)
