@@ -20,6 +20,7 @@ loop suite's own fixture, and read the answer off the simulated venue.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -138,6 +139,13 @@ def test_an_exit_withdraws_its_stop_before_it_sells(env: dict[str, Any]) -> None
             "SELECT COUNT(*) FROM event_log WHERE event_type = 'order.cancelled'"
         ).fetchone()[0]
         assert cancelled == 1
+
+        # Withdrawn on purpose, and said so: the session record reads `cause`
+        # to tell this from a stop that failed to land, which is a fault.
+        (unprotected,) = ledger.conn.execute(
+            "SELECT payload_json FROM event_log WHERE event_type = 'position.unprotected'"
+        ).fetchall()
+        assert json.loads(unprotected["payload_json"])["cause"] == "withdrawn"
 
 
 def test_a_stop_with_no_position_behind_it_is_withdrawn(env: dict[str, Any]) -> None:

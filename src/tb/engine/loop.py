@@ -950,6 +950,7 @@ class TradingLoop:
                 t212_ticker=ticker,
                 quantity=position.quantity,
                 protected=False,
+                cause="withdrawn",
                 detail=f"stop withdrawn: {reason}",
             )
         return True, "; ".join(outcomes)
@@ -972,6 +973,7 @@ class TradingLoop:
                 t212_ticker=ticker,
                 quantity=position.quantity,
                 protected=False,
+                cause="no_price",
                 detail="no entry price and no usable bar to place a stop from",
             )
             return None
@@ -1039,6 +1041,7 @@ class TradingLoop:
                 t212_ticker=ticker,
                 quantity=quantity,
                 protected=False,
+                cause="risk_refused",
                 detail=f"risk refused the protective stop: {evaluation.refusal_summary}",
             )
             return None
@@ -1061,6 +1064,7 @@ class TradingLoop:
                 t212_ticker=ticker,
                 quantity=quantity,
                 protected=False,
+                cause="placement_failed",
                 detail=f"the protective stop could not be placed: {exc}",
             )
             return None

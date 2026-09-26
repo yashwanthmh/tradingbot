@@ -602,6 +602,7 @@ class OrderSubmitter:
         stop_price: Decimal | None = None,
         entry_fill_id: str | None = None,
         unprotected_seconds: float | None = None,
+        cause: str | None = None,
         detail: str = "",
     ) -> None:
         """Record that a position gained or lost its protective stop.
@@ -624,6 +625,7 @@ class OrderSubmitter:
                 stop_price=stop_price,
                 entry_fill_id=entry_fill_id,
                 unprotected_seconds=unprotected_seconds,
+                cause=cause,
                 detail=detail,
             ),
             actor=Actor.RISK,

@@ -18,7 +18,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -480,12 +480,15 @@ class Ledger:
         start_seq: int = 1,
         end_seq: int | None = None,
         event_type: EventType | None = None,
+        event_types: Collection[EventType] | None = None,
         batch_size: int = 1000,
     ) -> Iterator[sqlite3.Row]:
         """Stream events in sequence order.
 
         Batched rather than `fetchall`, because verification has to walk a
-        ledger that will eventually be far larger than memory.
+        ledger that will eventually be far larger than memory. `event_types`
+        narrows to several types in one ordered pass, for a reader that needs
+        how they interleave.
         """
         sql = "SELECT * FROM event_log WHERE seq >= ?"
         params: list[Any] = [start_seq]
@@ -495,6 +498,12 @@ class Ledger:
         if event_type is not None:
             sql += " AND event_type = ?"
             params.append(event_type.value)
+        if event_types is not None:
+            wanted = sorted({t.value for t in event_types})
+            if not wanted:
+                return
+            sql += f" AND event_type IN ({', '.join('?' for _ in wanted)})"
+            params.extend(wanted)
         sql += " ORDER BY seq ASC"
 
         cursor = self.conn.execute(sql, params)

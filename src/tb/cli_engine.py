@@ -238,65 +238,91 @@ def run(
             err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
             raise typer.Exit(2) from exc
 
-        # Now that this process holds the lease: what it is trading. Not
-        # answerable from the decisions alone, since a funded strategy that
-        # signalled nothing leaves no rows for the instruments it declined and
-        # an excluded one leaves none at all.
-        record_book(ledger, book, run_id=run_id)
+        # Now that this process holds the lease: that it is running, in which
+        # mode, from which code and config, on which host. A trading run was
+        # the one kind of run that recorded none of this, so "was that session
+        # on the demo account or on paper" had no answer in the ledger — and
+        # it is the question the live gate's clean-session count asks.
+        ledger.record_run_start(run_id=run_id, mode=mode)
 
-        loop = TradingLoop(
-            ledger=ledger,
-            pinned=pinned,
-            broker=broker,
-            bars=store,
-            book=book,
-            submitter=submitter,
-            log=log,
-            run_id=run_id,
-            instruments=universe,
-            state=StateMachine(ledger, pinned, run_id=run_id),
-            self_check=self_check,
-            lock=lock,
-            equity=EquityCurve(ledger, run_id=run_id),
-            # The promoted book is reviewed, re-rung, re-allocated and rebuilt
-            # once a session. The drill book is not: nothing funds it.
-            on_new_session=(
-                None
-                if strategy is not None
-                else _session_refresh(
-                    ledger,
-                    pinned,
-                    broker=broker,
-                    universe=universe,
-                    run_id=run_id,
-                    models=model_store,
-                )
-            ),
-        )
-        _price_paper_venue(broker, store=store, universe=universe, resolution=loop.resolution)
-
-        console.print(
-            f"run [bold]{run_id}[/bold] in [bold]{mode}[/bold] mode over "
-            f"{len(universe)} instrument(s), lease to {lease.expires_at.isoformat()}"
-        )
-        for line in book.explain().splitlines():
-            console.print(f"  {escape(line)}", soft_wrap=True)
-        if no_watchdog:
-            console.print(
-                f"{WARN} running without a supervisor. A wedged loop is the one state it "
-                "cannot detect about itself, so nothing would notice.",
-                soft_wrap=True,
-            )
-
+        # How the run ended, recorded however it ends, from the moment its start
+        # is on record. A run whose end is never written is itself the evidence
+        # of a crash — a kill -9, a power cut — so this is written for every
+        # exit this process survives to see, a failure setting up included.
+        ending: tuple[str, str | None, str | None] = ("error", None, None)
         try:
+            # Then what it is trading. Not answerable from the decisions alone,
+            # since a funded strategy that signalled nothing leaves no rows for
+            # the instruments it declined and an excluded one leaves none at all.
+            record_book(ledger, book, run_id=run_id)
+
+            loop = TradingLoop(
+                ledger=ledger,
+                pinned=pinned,
+                broker=broker,
+                bars=store,
+                book=book,
+                submitter=submitter,
+                log=log,
+                run_id=run_id,
+                instruments=universe,
+                state=StateMachine(ledger, pinned, run_id=run_id),
+                self_check=self_check,
+                lock=lock,
+                equity=EquityCurve(ledger, run_id=run_id),
+                # The promoted book is reviewed, re-rung, re-allocated and
+                # rebuilt once a session. The drill book is not: nothing funds it.
+                on_new_session=(
+                    None
+                    if strategy is not None
+                    else _session_refresh(
+                        ledger,
+                        pinned,
+                        broker=broker,
+                        universe=universe,
+                        run_id=run_id,
+                        models=model_store,
+                    )
+                ),
+            )
+            _price_paper_venue(broker, store=store, universe=universe, resolution=loop.resolution)
+
+            console.print(
+                f"run [bold]{run_id}[/bold] in [bold]{mode}[/bold] mode over "
+                f"{len(universe)} instrument(s), lease to {lease.expires_at.isoformat()}"
+            )
+            for line in book.explain().splitlines():
+                console.print(f"  {escape(line)}", soft_wrap=True)
+            if no_watchdog:
+                console.print(
+                    f"{WARN} running without a supervisor. A wedged loop is the one state it "
+                    "cannot detect about itself, so nothing would notice.",
+                    soft_wrap=True,
+                )
+
             results = loop.run_forever(
                 interval_seconds=interval, max_cycles=None if cycles == 0 else cycles
             )
+            ending = (f"completed {len(results)} cycle(s)", None, None)
         except LoopHalted as exc:
+            ending = ("halted", type(exc).__name__, str(exc))
             err_console.print(f"\n{BAD} halted: {escape(str(exc))}", soft_wrap=True)
-            lock.release()
             raise typer.Exit(1) from exc
+        except KeyboardInterrupt:
+            # Stopped by the operator: an ending, not a fault.
+            ending = ("interrupted", None, None)
+            raise
+        except Exception as exc:
+            ending = ("error", type(exc).__name__, str(exc))
+            raise
         finally:
+            with suppress(Exception):
+                ledger.record_run_end(
+                    run_id=run_id,
+                    exit_reason=ending[0],
+                    error_type=ending[1],
+                    error_detail=ending[2],
+                )
             # Best effort: the lease expires on its own, so failing to release
             # it costs the next instance a wait rather than the account.
             with suppress(Exception):

@@ -331,6 +331,43 @@ class SafetyLimits(_Section):
     halt_on_unreconciled: bool
 
 
+class LiveLimits(_Section):
+    """What real money needs: a human's change here, and evidence in the ledger.
+
+    `enabled` is the reviewed change. It is false in the shipped file, this
+    file is mounted read-only under another user, and its hash is pinned — so
+    turning live trading on is an edit a person makes and the ledger records,
+    never a flag a process can pass. With it on, `tb arm --live` still refuses
+    until the evidence below is in the ledger.
+
+    The session figures decide what a *clean* session is. They live here rather
+    than in code because the arming gate counts clean sessions, and a threshold
+    that gates real money belongs where every other one does.
+    """
+
+    enabled: bool
+    # A session counts only if the loop ran through it: this share of the
+    # regular session within `session_max_cycle_gap_seconds` of a cycle.
+    session_min_coverage_pct: Percent
+    session_max_cycle_gap_seconds: int = Field(ge=60, le=3600)
+    # A position left without a working protective stop for longer than this
+    # makes its session unclean.
+    max_unprotected_seconds: int = Field(ge=1)
+    # Evidence `tb arm --live` requires. Closed trades as well as clean
+    # sessions: thirty sessions of a loop that never traded prove it does not
+    # crash, and nothing about the order path that real money will use.
+    min_clean_demo_sessions: int = Field(ge=1)
+    min_demo_closed_trades: int = Field(ge=1)
+    drills_valid_days: int = Field(ge=1)
+    restore_valid_days: int = Field(ge=1)
+    # An arming lapses; re-arming re-reads the evidence.
+    arming_valid_days: int = Field(ge=1, le=30)
+    # Live starts small and narrow: this many strategies, named at arming, at
+    # no rung above this. Raising either is another reviewed change.
+    max_armed_strategies: int = Field(ge=1)
+    max_rung: int = Field(ge=0)
+
+
 class HardLimits(_Section):
     """The whole control layer, as validated values."""
 
@@ -348,6 +385,7 @@ class HardLimits(_Section):
     promotion: PromotionLimits
     data: DataLimits
     safety: SafetyLimits
+    live: LiveLimits
 
     @model_validator(mode="after")
     def _check_cross_section(self) -> HardLimits:

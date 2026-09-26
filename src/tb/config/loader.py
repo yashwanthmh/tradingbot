@@ -48,7 +48,12 @@ ENV_PATH_VAR = "TB_HARD_LIMITS_PATH"
 # deployed cap, and a second deflation threshold a candidate must also clear.
 # Defaulting them would have let an un-upgraded file silently run without
 # either control, which is the one direction a missing limit must never fail.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({4})
+#
+# v5 adds the `live` section: whether real money is enabled at all (off in the
+# shipped file), what makes a session clean, and the evidence `tb arm --live`
+# requires. Required rather than defaulted for the same reason — a file that
+# predates it has never had a human decide any of it.
+SUPPORTED_SCHEMA_VERSIONS = frozenset({5})
 
 
 @dataclass(frozen=True, slots=True)

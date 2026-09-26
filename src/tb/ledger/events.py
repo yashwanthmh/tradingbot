@@ -952,6 +952,11 @@ class ProtectionPayload(EventPayload):
     stop_price: Decimal | None = None
     entry_fill_id: str | None = None
     unprotected_seconds: float | None = None
+    # Why a position lost its stop, for the one distinction that matters: a
+    # stop withdrawn on purpose ahead of an exit ("withdrawn") against a failure
+    # to protect — "no_price", "risk_refused", "placement_failed". Absent on
+    # events written before it existed, where the detail text still says.
+    cause: str | None = None
     detail: str = ""
 
 

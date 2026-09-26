@@ -24,6 +24,7 @@ they both use lives in `conftest.py` for the same reason.
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -986,6 +987,46 @@ def test_tb_run_trades_the_trivial_strategy_only_when_asked(env: dict[str, Any])
         ).fetchone()
     assert row is not None, "the drill book was not recorded"
     assert "explicit" in str(row["payload_json"])
+
+
+def test_tb_run_records_its_mode_and_how_it_ended(env: dict[str, Any]) -> None:
+    """A trading run is recorded like every other run: started, in which mode, ended.
+
+    Before this it was the one kind of run that recorded neither, so whether a
+    session had been on paper or on the demo account had no answer in the
+    ledger — and the live gate counts demo sessions.
+    """
+    _seed(env, _rising_bars(days=140))
+    result = _cli(env, "--strategy", "trivial")
+    assert result.exit_code == 0, result.output
+
+    with Ledger(env["db"]) as ledger:
+        [run] = ledger.conn.execute("SELECT * FROM runs WHERE mode = 'paper'").fetchall()
+        ends = ledger.conn.execute(
+            "SELECT payload_json FROM event_log WHERE event_type = 'run.ended'"
+        ).fetchall()
+    assert run["ended_at"] is not None
+    assert run["exit_reason"] == "completed 1 cycle(s)"
+    assert len(ends) == 1
+
+
+def test_tb_run_records_a_halt_as_its_ending(env: dict[str, Any]) -> None:
+    """A halted run says so, with the reason, where the session record reads it."""
+    from tb.ops.killswitch import engage_kill_switch
+
+    _seed(env, _rising_bars(days=140))
+    engage_kill_switch(env["run_dir"] / "KILL", engaged_by="test", reason="drill")
+    result = _cli(env, "--strategy", "trivial")
+    assert result.exit_code == 1, result.output
+
+    with Ledger(env["db"]) as ledger:
+        [row] = ledger.conn.execute(
+            "SELECT payload_json FROM event_log WHERE event_type = 'run.ended'"
+        ).fetchall()
+    ending = json.loads(row["payload_json"])
+    assert ending["exit_reason"] == "halted"
+    assert ending["error_type"] == "LoopHalted"
+    assert "kill switch" in ending["error_detail"]
 
 
 def test_tb_run_refuses_an_unknown_strategy_name(env: dict[str, Any]) -> None:

@@ -97,6 +97,12 @@ from tb.cli_ml import ml_app  # noqa: E402
 
 app.add_typer(ml_app, name="ml")
 
+# M8: operating it. Which sessions ran cleanly is the first question an
+# operator asks each morning and the one the live gate counts.
+from tb.cli_ops import sessions_command  # noqa: E402
+
+app.command("sessions")(sessions_command)
+
 
 @app.command("reconcile")
 def reconcile(

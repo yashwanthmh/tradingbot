@@ -17,7 +17,7 @@
 #  Changing a value takes effect on the next process start, not mid-run.
 # ============================================================================
 
-schema_version: 4
+schema_version: 5
 
 # Currency of every *_ccy figure below. Asserted against the base currency the
 # broker reports for the account at startup; a mismatch is fatal, because a
@@ -253,3 +253,34 @@ safety:
   # An intent whose state cannot be resolved against the broker halts the bot
   # and requires human acknowledgement. Guessing about real money is worse.
   halt_on_unreconciled: true
+
+live:
+  # Real money. Off. Turning it on is this line, changed by a person in a file
+  # the bot cannot write — the reviewed change the ledger pins by hash — and
+  # even then `tb arm --live` refuses until the evidence below is recorded.
+  enabled: false
+  # A session counts as run only if the loop was cycling through it: this share
+  # of regular hours within `session_max_cycle_gap_seconds` of a cycle.
+  session_min_coverage_pct: 90
+  session_max_cycle_gap_seconds: 900
+  # A position without a working protective stop for longer than this makes
+  # its session unclean. The entry-to-stop window is unavoidable on this venue;
+  # an unbounded one is a fault.
+  max_unprotected_seconds: 300
+  # The evidence `tb arm --live` requires, all of it read from the ledger:
+  # consecutive clean sessions on the demo account with at least this many
+  # trades closed across them (a loop that never traded has not exercised the
+  # order path), a kill-switch drill and a watchdog drill (each during market
+  # hours with positions open) within `drills_valid_days`, and a restore from
+  # backup verified on another machine within `restore_valid_days`.
+  min_clean_demo_sessions: 30
+  min_demo_closed_trades: 5
+  drills_valid_days: 30
+  restore_valid_days: 90
+  # An arming lapses after this long, and re-arming re-reads the evidence.
+  arming_valid_days: 7
+  # Live starts narrow and at floor size: this many strategies, each named at
+  # arming, at no size rung above this. Raising either is another reviewed
+  # change to this file.
+  max_armed_strategies: 1
+  max_rung: 0

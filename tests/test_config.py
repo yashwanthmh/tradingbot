@@ -363,6 +363,32 @@ def test_a_missing_costs_section_is_fatal() -> None:
         HardLimits.model_validate(payload)
 
 
+def test_the_shipped_limits_never_enable_real_money() -> None:
+    """Live trading is a person's edit to this file, never its default."""
+    live = load_hard_limits(REFERENCE_LIMITS).limits.live
+    assert live.enabled is False
+    assert live.max_rung == 0
+    assert live.max_armed_strategies == 1
+
+
+def test_a_v4_limits_file_is_refused_rather_than_partly_understood(tmp_path: Path) -> None:
+    """v4 predates the `live` section: nobody decided any of it for that file."""
+    payload = yaml.safe_load(REFERENCE_LIMITS.read_text(encoding="utf-8"))
+    payload["schema_version"] = 4
+    del payload["live"]
+    target = tmp_path / "v4.yaml"
+    target.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    with pytest.raises(ConfigError, match="schema_version=4"):
+        load_hard_limits(target)
+
+
+def test_a_limits_file_without_the_live_section_is_invalid() -> None:
+    payload = yaml.safe_load(REFERENCE_LIMITS.read_text(encoding="utf-8"))
+    del payload["live"]
+    with pytest.raises(Exception, match="live"):
+        HardLimits.model_validate(payload)
+
+
 def test_a_v2_limits_file_is_refused_rather_than_partly_understood(tmp_path: Path) -> None:
     """v2 predates the costs section, so claiming support would be a lie."""
     payload = yaml.safe_load(REFERENCE_LIMITS.read_text(encoding="utf-8"))
