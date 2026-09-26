@@ -160,6 +160,16 @@ class EquityCurve:
     percentages are computed on read. Storing the percentages would mean a
     cached number that drifts from the marks it summarises, and a drifting
     loss breaker is worse than none.
+
+    **One account per curve.** A ledger carries marks from paper, demo and
+    live runs, and those are different accounts: a demo run read against a
+    paper run's peak sees a drawdown that never happened, and is flattened for
+    it; a live run read against demo's larger balance hides one that did. So a
+    demo or live run reads the marks of every run of its own mode — one
+    persistent account each — and a paper run reads only its own, because
+    every paper run starts a fresh simulated account. A run with no recorded
+    mode (a ledger from before runs were recorded, or a test) reads every
+    mark, as before.
     """
 
     def __init__(
@@ -235,6 +245,24 @@ class EquityCurve:
 
     # -- reading -----------------------------------------------------------
 
+    def _scope(self) -> tuple[str, tuple[str, ...]]:
+        """The SQL condition that keeps this curve to one account.
+
+        Resolved on each read rather than once: the run's mode is recorded
+        when it starts, which may be after the curve was built.
+        """
+        if self._run_id is None:
+            return "1 = 1", ()
+        row = self._ledger.conn.execute(
+            "SELECT mode FROM runs WHERE run_id = ?", (self._run_id,)
+        ).fetchone()
+        mode = None if row is None else str(row["mode"])
+        if mode == "paper":
+            return "run_id = ?", (self._run_id,)
+        if mode in ("demo", "live"):
+            return "run_id IN (SELECT run_id FROM runs WHERE mode = ?)", (mode,)
+        return "1 = 1", ()
+
     def read(self, *, at: datetime | None = None) -> PnlReading:
         """The three breaker inputs as of `at`.
 
@@ -277,17 +305,21 @@ class EquityCurve:
         )
 
     def marks(self, *, limit: int = 100) -> tuple[EquityMark, ...]:
+        scope, params = self._scope()
         rows = self._ledger.conn.execute(
-            "SELECT * FROM equity_marks ORDER BY at_utc DESC LIMIT ?", (limit,)
+            f"SELECT * FROM equity_marks WHERE {scope} ORDER BY at_utc DESC LIMIT ?",  # noqa: S608
+            (*params, limit),
         ).fetchall()
         return tuple(_mark_from_row(row) for row in reversed(rows))
 
     # -- internals ---------------------------------------------------------
 
     def _latest(self, moment: datetime) -> Decimal | None:
+        scope, params = self._scope()
         row = self._ledger.conn.execute(
-            "SELECT equity FROM equity_marks WHERE at_utc <= ? ORDER BY at_utc DESC LIMIT 1",
-            (to_iso(moment),),
+            f"SELECT equity FROM equity_marks WHERE {scope} AND at_utc <= ?"  # noqa: S608
+            " ORDER BY at_utc DESC LIMIT 1",
+            (*params, to_iso(moment)),
         ).fetchone()
         return None if row is None else Decimal(str(row["equity"]))
 
@@ -301,10 +333,11 @@ class EquityCurve:
         that exposure, and double-counting it here would halt on a risk that
         was already budgeted.
         """
+        scope, params = self._scope()
         row = self._ledger.conn.execute(
-            "SELECT equity FROM equity_marks WHERE session_date = ? AND at_utc <= ?"
-            " ORDER BY at_utc ASC LIMIT 1",
-            (session.isoformat(), to_iso(moment)),
+            f"SELECT equity FROM equity_marks WHERE {scope} AND session_date = ?"  # noqa: S608
+            " AND at_utc <= ? ORDER BY at_utc ASC LIMIT 1",
+            (*params, session.isoformat(), to_iso(moment)),
         ).fetchone()
         return None if row is None else Decimal(str(row["equity"]))
 
@@ -316,10 +349,11 @@ class EquityCurve:
         let a slow bleed never register — and the slow bleed is exactly what
         this breaker exists to catch.
         """
+        scope, params = self._scope()
         row = self._ledger.conn.execute(
-            "SELECT equity FROM equity_marks WHERE at_utc <= ?"
+            f"SELECT equity FROM equity_marks WHERE {scope} AND at_utc <= ?"  # noqa: S608
             " ORDER BY CAST(equity AS REAL) DESC LIMIT 1",
-            (to_iso(moment),),
+            (*params, to_iso(moment)),
         ).fetchone()
         return None if row is None else Decimal(str(row["equity"]))
 
@@ -340,15 +374,16 @@ class EquityCurve:
         window = sessions[-ROLLING_SESSIONS:]
         earliest = window[0].day
 
+        scope, params = self._scope()
         row = self._ledger.conn.execute(
-            "SELECT equity FROM equity_marks WHERE session_date >= ? AND at_utc <= ?"
-            " ORDER BY at_utc ASC LIMIT 1",
-            (earliest.isoformat(), to_iso(moment)),
+            f"SELECT equity FROM equity_marks WHERE {scope} AND session_date >= ?"  # noqa: S608
+            " AND at_utc <= ? ORDER BY at_utc ASC LIMIT 1",
+            (*params, earliest.isoformat(), to_iso(moment)),
         ).fetchone()
         observed = self._ledger.conn.execute(
-            "SELECT COUNT(DISTINCT session_date) AS n FROM equity_marks"
-            " WHERE session_date >= ? AND at_utc <= ?",
-            (earliest.isoformat(), to_iso(moment)),
+            "SELECT COUNT(DISTINCT session_date) AS n FROM equity_marks"  # noqa: S608
+            f" WHERE {scope} AND session_date >= ? AND at_utc <= ?",
+            (*params, earliest.isoformat(), to_iso(moment)),
         ).fetchone()
         return (
             None if row is None else Decimal(str(row["equity"])),
@@ -356,8 +391,10 @@ class EquityCurve:
         )
 
     def _count(self, moment: datetime) -> int:
+        scope, params = self._scope()
         row = self._ledger.conn.execute(
-            "SELECT COUNT(*) AS n FROM equity_marks WHERE at_utc <= ?", (to_iso(moment),)
+            f"SELECT COUNT(*) AS n FROM equity_marks WHERE {scope} AND at_utc <= ?",  # noqa: S608
+            (*params, to_iso(moment)),
         ).fetchone()
         return int(row["n"] or 0)
 
@@ -369,10 +406,17 @@ class EquityCurve:
         movement it can actually explain, which is a different and useful
         question.
         """
+        scope, params = self._scope()
+        if params:
+            # Fills carry no run of their own; they belong to one through the
+            # intent that placed them. A fill with no intent — history for an
+            # order this bot never placed — belongs to no account's curve.
+            # The condition is one of `_scope`'s fixed strings; values are bound.
+            scope = f"intent_id IN (SELECT intent_id FROM order_intents WHERE {scope})"  # noqa: S608
         rows = self._ledger.conn.execute(
-            "SELECT side, quantity, price, admissible_for_pnl FROM fills"
-            " WHERE filled_at <= ? OR filled_at IS NULL",
-            (to_iso(moment),),
+            "SELECT side, quantity, price, admissible_for_pnl FROM fills"  # noqa: S608
+            f" WHERE {scope} AND (filled_at <= ? OR filled_at IS NULL)",
+            (*params, to_iso(moment)),
         ).fetchall()
         if not rows:
             return None, 0

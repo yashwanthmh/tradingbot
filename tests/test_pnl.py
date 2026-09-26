@@ -517,3 +517,71 @@ def test_marks_are_not_events(ledger: Ledger) -> None:
 
     assert after == before, "fifty equity marks appended fifty events to the chain"
     assert len(curve.marks(limit=100)) == 50
+
+
+# --------------------------------------------------------------------------
+# One account per curve
+# --------------------------------------------------------------------------
+
+
+def _marked(ledger: Ledger, run_id: str, mode: str, *points: tuple[datetime, str]) -> EquityCurve:
+    """A run of `mode`, recorded as `tb run` records it, and its equity marks."""
+    ledger.record_run_start(run_id=run_id, mode=mode)
+    curve = EquityCurve(ledger, run_id=run_id)
+    for at, equity in points:
+        curve.mark(equity_ccy=Decimal(equity), at=at, currency="GBP")
+    return curve
+
+
+def test_a_demo_run_is_not_measured_against_a_paper_account(ledger: Ledger) -> None:
+    """A paper peak of 10,000 is not a demo drawdown of half: different accounts.
+
+    Read as one curve, the demo run's first mark is a 50% drawdown and the
+    drawdown breaker flattens and halts a run that has lost nothing.
+    """
+    _marked(ledger, "run_paper", "paper", (AS_OF - timedelta(days=2), "10000.00"))
+    demo = _marked(ledger, "run_demo", "demo", (AS_OF, "5000.00"))
+
+    reading = demo.read(at=AS_OF)
+    assert reading.equity_ccy == Decimal("5000.00")
+    assert reading.drawdown_from_peak_pct == 0.0
+    assert reading.n_marks == 1
+
+
+def test_demo_runs_share_one_account_and_its_peak(ledger: Ledger) -> None:
+    """A restart is the same demo account: its drawdown must survive the restart."""
+    _marked(ledger, "run_demo_1", "demo", (AS_OF - timedelta(days=1), "10000.00"))
+    second = _marked(ledger, "run_demo_2", "demo", (AS_OF, "9500.00"))
+
+    reading = second.read(at=AS_OF)
+    assert reading.peak_equity_ccy == Decimal("10000.00")
+    assert reading.drawdown_from_peak_pct == pytest.approx(5.0)
+
+
+def test_each_paper_run_is_its_own_account(ledger: Ledger) -> None:
+    """Every paper run starts a fresh simulated account at --equity."""
+    _marked(ledger, "run_paper_1", "paper", (AS_OF - timedelta(days=1), "11000.00"))
+    fresh = _marked(ledger, "run_paper_2", "paper", (AS_OF, "10000.00"))
+    assert fresh.read(at=AS_OF).drawdown_from_peak_pct == 0.0
+
+
+def test_a_live_run_is_not_measured_against_demo(ledger: Ledger) -> None:
+    """Demo's larger balance would otherwise hide a real loss, or invent one."""
+    _marked(ledger, "run_demo", "demo", (AS_OF - timedelta(days=1), "50000.00"))
+    live = _marked(
+        ledger,
+        "run_live",
+        "live",
+        (AS_OF - timedelta(hours=2), "500.00"),
+        (AS_OF, "480.00"),
+    )
+    reading = live.read(at=AS_OF)
+    assert reading.peak_equity_ccy == Decimal("500.00")
+    assert reading.drawdown_from_peak_pct == pytest.approx(4.0)
+
+
+def test_a_run_with_no_recorded_mode_reads_every_mark(ledger: Ledger) -> None:
+    """A ledger from before runs were recorded keeps the curve it had."""
+    EquityCurve(ledger, run_id="run_old").mark(equity_ccy=Decimal("100.00"), at=AS_OF)
+    unrecorded = EquityCurve(ledger, run_id="run_older")
+    assert unrecorded.read(at=AS_OF).equity_ccy == Decimal("100.00")
