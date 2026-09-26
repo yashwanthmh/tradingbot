@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from tb.data.asof import UNKNOWN, BarWindow
-from tb.features.pipeline import FeaturePipeline, FeatureSnapshot, make_spec
+from tb.features.pipeline import FeaturePipeline, FeatureSnapshot, pipeline_for
 from tb.strategy.base import Action, Decision, PositionState, hold
 from tb.strategy.dsl.interpreter import evaluate
 from tb.strategy.dsl.schema import StrategySpec
@@ -37,9 +37,7 @@ def pipeline_from_spec(spec: StrategySpec) -> FeaturePipeline:
     is recorded as a strategy that found no opportunities — a false negative
     that looks exactly like a true one.
     """
-    return FeaturePipeline(
-        specs=tuple(make_spec(kind, lookback) for kind, lookback in spec.feature_requests)
-    )
+    return pipeline_for(spec.feature_requests)
 
 
 @dataclass(frozen=True, slots=True)

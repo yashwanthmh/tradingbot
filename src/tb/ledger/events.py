@@ -49,6 +49,7 @@ class AggregateType(StrEnum):
     ORDER = "order"
     POSITION = "position"
     DATA = "data"
+    MODEL = "model"
 
 
 class EventType(StrEnum):
@@ -214,6 +215,13 @@ class EventType(StrEnum):
     # while holding is how a position ends up unmanaged, and the count of
     # these is how you notice it happening regularly.
     POSITION_ORPHANED = "position.orphaned"
+
+    # --- the ML signal layer (M7) ---
+    #
+    # A model artifact admitted to the store. The event, not the file, is what
+    # makes a model exist: a file on disk with no event is never loaded, and an
+    # event whose file has changed or vanished is refused at load.
+    MODEL_RECORDED = "model.recorded"
 
 
 class EventPayload(BaseModel):
@@ -1385,6 +1393,43 @@ class PositionOrphanedPayload(EventPayload):
 
 
 # --------------------------------------------------------------------------
+# The ML signal layer (M7)
+# --------------------------------------------------------------------------
+
+
+class ModelRecordedPayload(EventPayload):
+    """A model artifact, the hash that is its identity, and how it was made.
+
+    Everything needed to rebuild the model from the data is on the event
+    rather than only on the projection row: the features in the order the model
+    reads them, the label definition, the parameters and the vintage. The row
+    is a cache and can be edited; the event is chained. `trained_through` is
+    the latest instant any training label was knowable — the claim a holdout
+    evaluation checks, because a model that saw prices past the seal carries
+    them into every spec that reads it.
+    """
+
+    model_id: str
+    artifact_sha256: str
+    kind: str
+    relative_path: str
+    byte_size: int
+    feature_names: list[str]
+    features: list[dict[str, Any]]
+    label: dict[str, str]
+    params: dict[str, str]
+    vintage_id: str
+    sealed_from: str | None = None
+    window_start: str
+    window_end: str
+    trained_through: str
+    n_samples: int
+    base_rate: float | None = None
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    search_id: str | None = None
+
+
+# --------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------
 
@@ -1459,6 +1504,8 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     # M5b
     EventType.BOOK_FUNDED: BookFundedPayload,
     EventType.POSITION_ORPHANED: PositionOrphanedPayload,
+    # M7
+    EventType.MODEL_RECORDED: ModelRecordedPayload,
 }
 
 # The default aggregate each event type is filed under, so callers do not have
@@ -1549,6 +1596,10 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     # of the strategies would hide the ones that were excluded.
     EventType.BOOK_FUNDED: AggregateType.RUN,
     EventType.POSITION_ORPHANED: AggregateType.POSITION,
+    # M7. A model is its own aggregate rather than a strategy's: one model can
+    # be read by many specs, and filing it under any one of them would hide it
+    # from the others' histories.
+    EventType.MODEL_RECORDED: AggregateType.MODEL,
 }
 
 

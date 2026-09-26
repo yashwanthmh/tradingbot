@@ -39,7 +39,7 @@ lookback, and asking for a window shorter than the declared lookback returns
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, localcontext
@@ -277,6 +277,17 @@ def make_spec(kind: str, lookback: int, *, name: str | None = None) -> FeatureSp
             "so a generated spec cannot introduce a new one."
         ) from exc
     return FeatureSpec(name=name or f"{kind}_{lookback}", lookback=lookback, compute=compute)
+
+
+def pipeline_for(requests: Iterable[tuple[str, int]]) -> FeaturePipeline:
+    """The pipeline computing `(kind, lookback)` features, under their canonical names.
+
+    `kind_lookback`, as `make_spec` names them and as the DSL's feature keys
+    read them. Strategy specs and models both declare their inputs this way, so
+    the name a model was fitted under and the name the loop computes for it are
+    the same string by construction rather than by two callers agreeing.
+    """
+    return FeaturePipeline(specs=tuple(make_spec(kind, lookback) for kind, lookback in requests))
 
 
 # --------------------------------------------------------------------------

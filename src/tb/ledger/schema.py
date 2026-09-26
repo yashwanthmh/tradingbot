@@ -27,7 +27,7 @@ from pathlib import Path
 
 from tb.core.canonical import GENESIS_HASH
 
-LEDGER_SCHEMA_VERSION = 9
+LEDGER_SCHEMA_VERSION = 10
 
 # --------------------------------------------------------------------------
 # Tables
@@ -975,6 +975,40 @@ _TABLES: tuple[str, ...] = (
         allocating_event_seq INTEGER
     )
     """,
+    # ----------------------------------------------------------------------
+    # v10 (M7) — the model store's catalog.
+    # ----------------------------------------------------------------------
+    #
+    # The artifact bytes live in a content-addressed file; this row, written in
+    # the same transaction as `model.recorded`, is what makes the file part of
+    # the store — the bar store's arrangement, for the same reason. A file with
+    # no row is never loaded; a row whose file no longer hashes to
+    # `artifact_sha256` is refused at load. `model_id` is derived from the
+    # hash, so recording the same bytes twice is one model, not two.
+    """
+    CREATE TABLE IF NOT EXISTS ml_models (
+        model_id          TEXT    PRIMARY KEY,
+        artifact_sha256   TEXT    NOT NULL UNIQUE,
+        kind              TEXT    NOT NULL,
+        relative_path     TEXT    NOT NULL,
+        byte_size         INTEGER NOT NULL,
+        feature_names_json TEXT   NOT NULL,
+        features_json     TEXT    NOT NULL,
+        label_json        TEXT    NOT NULL,
+        params_json       TEXT    NOT NULL,
+        vintage_id        TEXT    NOT NULL,
+        sealed_from       TEXT,
+        window_start      TEXT    NOT NULL,
+        window_end        TEXT    NOT NULL,
+        trained_through   TEXT    NOT NULL,
+        n_samples         INTEGER NOT NULL,
+        base_rate         REAL,
+        metrics_json      TEXT,
+        search_id         TEXT,
+        recorded_at       TEXT    NOT NULL,
+        recording_event_seq INTEGER NOT NULL
+    )
+    """,
 )
 
 # --------------------------------------------------------------------------
@@ -1099,6 +1133,9 @@ _INDEXES: tuple[str, ...] = (
     "ON ladder_moves (strategy_id, version, moved_at)",
     "CREATE INDEX IF NOT EXISTS ix_allocations_as_of ON allocations (as_of_utc)",
     "CREATE INDEX IF NOT EXISTS ix_allocations_strategy ON allocations (strategy_id, version)",
+    # v10 (M7)
+    "CREATE INDEX IF NOT EXISTS ix_ml_models_recorded ON ml_models (recorded_at)",
+    "CREATE INDEX IF NOT EXISTS ix_ml_models_vintage ON ml_models (vintage_id)",
 )
 
 
