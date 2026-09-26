@@ -909,6 +909,18 @@ jobs:
           set -o pipefail
           uv run pytest tests/test_drills.py tests/test_sessions.py -q 2>&1 | tail -3
 
+      - name: A policy trades through the one strategy path, or not at all
+        run: |
+          # M9 is an interface by decision (docs/decisions/0003-rl-deferred.md).
+          # What it fixes: a policy observes only what the snapshot hash covers,
+          # answers flat or long, is never asked about a missing feature, is
+          # frozen while it trades, and has no path to the funded book — nothing
+          # outside tb.strategy.rl imports it. The conformance check passes a
+          # well-formed policy and names each rule a broken one breaks, and the
+          # decision record's haircut table must stay the gate's own numbers.
+          set -o pipefail
+          uv run pytest tests/test_rl_policy.py -q 2>&1 | tail -3
+
   # M8's "restore-from-backup on a clean machine", on two machines. Every job
   # here gets a fresh runner VM, so the backup is made on one, restored on
   # another that has never seen the ledger, and the receipt carried back must

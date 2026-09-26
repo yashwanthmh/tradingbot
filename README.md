@@ -134,7 +134,7 @@ data*, then *can I reconcile broker state*, then *is there any edge after costs*
 | M6 | Self-strategising search (LLM optional) | **done** |
 | M7 | ML signal layer — walk-forward, shuffled-label null, hash-pinned models | **done** |
 | M8 | Session record, journal, alerts, backups, drills, live arming, dashboard | **done** — the evidence it asks for is [the operator's to collect](#what-remains-is-the-operators) |
-| M9 | RL — interface stub only, deferred deliberately | |
+| M9 | RL — the interface and a conformance check; RL itself deferred by decision | **done** — [0003](docs/decisions/0003-rl-deferred.md) says what would reopen it |
 
 ## Setup
 
@@ -558,6 +558,32 @@ trained, and a search composing models would stack a second, uncounted search
 on top of them. LightGBM is the optional `ml` extra (`uv sync --extra ml`),
 imported only where a model is fitted or parsed; strategies that read no model
 trade without it.
+
+And where reinforcement learning would come in — nowhere yet, by decision:
+
+```python
+from tb.strategy.rl.policy import Policy, PolicyStrategy, Target  # the interface
+from tb.strategy.rl.conformance import check_policy  # the contract
+```
+
+`tb.strategy.rl` is an interface and a conformance check, and nothing that
+trains a policy. [0003](docs/decisions/0003-rl-deferred.md) gives the reasons
+and the six conditions for reopening it. In short: counted honestly, a training
+run is a search of thousands, and the gate's haircut at that size asks for an
+out-of-sample Sharpe above 4; the simulator a policy would learn against has
+never been measured against the venue; and with flat or long as the only
+choices, under a fee that dominates the edge, RL has little to add over M7's
+scored specs.
+
+What the interface fixes is that a policy, if one ever trades, is just another
+strategy. It observes only features the snapshot hash covers and its own
+position — never the bar window, the account or a reward. It answers flat or
+long, declares a constant edge for the cost gate to divide by, is never asked
+about a missing feature (a held position with one is exited), and is frozen
+while it trades. `check_policy` runs a policy through the real pipeline and
+adapter and names each rule it breaks, from determinism to a time budget. A
+policy can be backtested today; nothing outside the package imports it, so
+nothing can fund one.
 
 ## Operating it
 
