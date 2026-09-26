@@ -74,6 +74,7 @@ from tb.data.asof import BarSource, HoldoutViolation
 from tb.data.provider import Resolution
 from tb.data.regime import RegimeGate
 from tb.data.snapshot import SnapshotStore
+from tb.features.pipeline import FeaturePipeline
 from tb.ledger.events import Actor, EventType, SpecsProposedPayload
 from tb.ledger.store import Ledger
 from tb.registry.lineage import SpecRegistry, strategy_id_for
@@ -136,6 +137,39 @@ class ProposalContext:
 
 
 ProposerFactory = Callable[[ProposalContext], SpecProposer]
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationPlan:
+    """How a search's candidates are backtested, when not by their own pipeline.
+
+    The trainer's plan, in practice. Its candidates pin the final model, which
+    has seen every label in the training window, so a backtest of it there
+    would be in-sample; the plan instead scores each decision with the model of
+    the walk-forward fold it falls in, from `starts_at` — the first instant any
+    fold model may score — to the end of the window.
+
+    `allow_models` lets the validator pass specs that read a model, which a
+    search may never propose; `lineage_id` files every fresh candidate under
+    the model's idea rather than under one lineage per spec, so every retrain
+    of that idea counts against one lineage.
+    """
+
+    pipeline: Callable[[StrategySpec], FeaturePipeline]
+    starts_at: datetime | None = None
+    allow_models: bool = False
+    lineage_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingData:
+    """A sealed vintage's training side: the boundary, the source and the schedule."""
+
+    window: HoldoutWindow
+    source: BarSource
+    uids: tuple[str, ...]
+    schedule: list[datetime]
+    n_training_bars: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +248,7 @@ class ResearchCycle:
         seed_strategy_ids: Sequence[str] = (),
         search_id: str | None = None,
         proposer: ProposerFactory | None = None,
+        evaluation: EvaluationPlan | None = None,
     ) -> CycleReport:
         """Search, record every trial, register the survivors unless dry-running.
 
@@ -222,14 +257,27 @@ class ResearchCycle:
         mutating the seeds, so a proposer passed alongside them would never be
         asked, and a search that silently ignored the one it was given would be
         recorded as something it was not.
+
+        `evaluation` replaces each candidate's own pipeline for its backtest;
+        see `EvaluationPlan`. Everything else — the validator's other checks,
+        the trial log, the multiplicity stamps, registration — is the same
+        machinery whichever pipeline judged the candidates.
         """
         started = time.monotonic()
         moment = self._clock()
         search = search_id or new_id("srch", length=12)
 
-        window, source, uids, schedule, n_training_bars = self._training_data(
-            vintage_id, fraction=fraction
-        )
+        data = sealed_training_data(self._snapshots, vintage_id, fraction=fraction)
+        window, source, uids = data.window, data.source, data.uids
+        schedule, n_training_bars = data.schedule, data.n_training_bars
+        if evaluation is not None and evaluation.starts_at is not None:
+            starts_at = evaluation.starts_at
+            schedule = [instant for instant in schedule if instant >= starts_at]
+            if len(schedule) < 2:
+                raise CycleError(
+                    f"no fold model may score before {starts_at.isoformat()}, which leaves "
+                    f"{len(schedule)} decision time(s) to backtest; a fill needs two"
+                )
         seeds = self._seeds(seed_strategy_ids)
         if proposer is not None and seeds:
             raise CycleError(
@@ -248,9 +296,10 @@ class ResearchCycle:
             # A fresh reader per spec: the reader is forward-only and stateful,
             # so sharing one would hand the second spec a reader already
             # advanced to the end of the window.
+            pipeline = pipeline_from_spec(spec) if evaluation is None else evaluation.pipeline(spec)
             engine = Backtester(
                 cost_model=costs,
-                pipeline=pipeline_from_spec(spec),
+                pipeline=pipeline,
                 instruments=meta,
                 min_holding_minutes=spec.min_holding_minutes,
                 actions=actions,
@@ -262,7 +311,9 @@ class ResearchCycle:
                     sealed_from=window.sealed_from,
                     resolution=Resolution.DAILY,
                     instrument_uids=uids,
-                    lookback=_lookback_for(spec),
+                    # The pipeline's, not the spec's: a spec reading a model
+                    # needs the model's inputs, which only the pipeline knows.
+                    lookback=lookback_for(pipeline.max_lookback),
                 ),
                 decision_times=schedule,
                 resolution=Resolution.DAILY,
@@ -295,7 +346,11 @@ class ResearchCycle:
                 )
             searcher = Searcher(
                 evaluate=evaluate,
-                validator=SpecValidator(limits=self._limits, n_training_bars=n_training_bars),
+                validator=SpecValidator(
+                    limits=self._limits,
+                    n_training_bars=n_training_bars,
+                    allow_models=evaluation is not None and evaluation.allow_models,
+                ),
                 initial_proposer=initial,
                 mutation_proposer=MutationProposer(bounds=bounds),
                 budget=budget,
@@ -305,12 +360,24 @@ class ResearchCycle:
             )
             outcome = searcher.run()
         except HoldoutViolation as exc:
-            raise self._violation(exc, search_id=search, window=window) from exc
+            raise CycleError(
+                record_violation(
+                    self._ledger,
+                    exc,
+                    caller=f"research cycle {search}",
+                    window=window,
+                    run_id=self._run_id,
+                )
+            ) from exc
 
         # The exchange first, then the trials it produced — the order in which
         # they happened, and the order a reader of the log expects.
         notes = self._record_exchanges(initial, search_id=search)
-        lineage_of = self._lineages(outcome.candidates, seeds=seeds)
+        lineage_of = self._lineages(
+            outcome.candidates,
+            seeds=seeds,
+            fresh=None if evaluation is None else evaluation.lineage_id,
+        )
         registered = self._register(outcome.survivors, lineage_of=lineage_of) if register else ()
         n_recorded = self._record(
             outcome.candidates,
@@ -342,33 +409,6 @@ class ResearchCycle:
             lineage_of=lineage_of,
             proposer="mutation" if seeds else initial.name,
             proposer_notes=notes,
-        )
-
-    def _violation(
-        self, exc: HoldoutViolation, *, search_id: str, window: HoldoutWindow
-    ) -> CycleError:
-        """Record a read past the seal, and the error that ends the search.
-
-        Fatal, as `HoldoutViolation` promises: every result this search produced
-        came from machinery that has just reached past its own boundary, so
-        nothing is registered and no trial is recorded — a re-run once the cause
-        is fixed records its own. Recorded, because a raise stops one process
-        and the event is what makes a pattern of attempts visible. Before this
-        the searcher filed the violation as one more errored trial and the
-        cycle went on to register survivors, and `record_violation` had no
-        caller at all.
-        """
-        HoldoutRegistry(self._ledger, run_id=self._run_id).record_violation(
-            sealed_from=exc.sealed_from or window.sealed_from,
-            requested_at=exc.requested_at or window.sealed_from,
-            caller=f"research cycle {search_id}",
-            detail=str(exc),
-        )
-        return CycleError(
-            f"search {search_id} stopped: it reached past the holdout boundary "
-            f"{window.sealed_from.isoformat()}, so nothing it produced can be trusted. "
-            "Nothing was registered and no trial recorded; the attempt is in the ledger "
-            f"as {EventType.HOLDOUT_VIOLATION_ATTEMPTED.value}. {exc}"
         )
 
     # -- what a proposer told us -----------------------------------------------
@@ -414,46 +454,6 @@ class ResearchCycle:
             lines.extend(report.lines())
         return tuple(lines)
 
-    # -- the data the search may see ----------------------------------------
-
-    def _training_data(
-        self, vintage_id: str, *, fraction: float
-    ) -> tuple[HoldoutWindow, BarSource, tuple[str, ...], list[datetime], int]:
-        """The sealed source, the boundary, and the schedule strictly before it."""
-        admissible, why = self._snapshots.is_admissible(vintage_id)
-        if not admissible:
-            raise CycleError(why)
-        vintage = self._snapshots.get(vintage_id)
-        if vintage is None:  # pragma: no cover - is_admissible just found it
-            raise CycleError(f"{vintage_id} vanished between checks")
-
-        window = holdout_boundary(vintage, fraction=fraction)
-        if not window.is_usable:
-            raise CycleError(
-                f"{window.summary()}. The holdout is too short to judge anything this "
-                "search produces, so running the search would spend trials on candidates "
-                "that can never be evaluated."
-            )
-
-        bars = self._snapshots.bars_of(vintage_id)
-        schedule = decisions_between(bars, end=window.sealed_from)
-        if len(schedule) < 2:
-            raise CycleError(
-                f"the training window of {vintage_id} holds {len(schedule)} decision "
-                "time(s); a backtest needs at least two, since a fill comes from the bar "
-                "after the decision"
-            )
-        uids = tuple(vintage.instrument_uids)
-        # The shortest instrument's history is the binding one: a lookback that
-        # fits the longest series but not the shortest evaluates to UNKNOWN on
-        # the shortest at every decision.
-        per_uid = {uid: 0 for uid in uids}
-        for bar in bars:
-            if bar.available_at_utc < window.sealed_from and bar.instrument_uid in per_uid:
-                per_uid[bar.instrument_uid] += 1
-        n_training_bars = min(per_uid.values()) if per_uid else 0
-        return window, self._snapshots.source_for(vintage_id), uids, schedule, n_training_bars
-
     def _seeds(self, strategy_ids: Sequence[str]) -> list[tuple[RegisteredSpec, StrategySpec]]:
         out: list[tuple[RegisteredSpec, StrategySpec]] = []
         for strategy_id in strategy_ids:
@@ -487,6 +487,7 @@ class ResearchCycle:
         candidates: Sequence[Candidate],
         *,
         seeds: Sequence[tuple[RegisteredSpec, StrategySpec]],
+        fresh: str | None = None,
     ) -> dict[str, str]:
         """Which lineage each candidate belongs to.
 
@@ -495,6 +496,9 @@ class ResearchCycle:
         (a spec it holds keeps its lineage), the parent (a mutation joins it),
         and the spec itself (a fresh draw starts a lineage named for its hash,
         so the same idea drawn in two searches is one lineage rather than two).
+        `fresh` names that last lineage instead when the search knows the idea
+        its candidates share — the trainer's model — so thresholds on one model
+        are one lineage, not one each.
         """
         lineage_of: dict[str, str] = {
             registered.spec_hash: registered.lineage_id for registered, _ in seeds
@@ -511,7 +515,7 @@ class ResearchCycle:
             if parent is not None and parent in lineage_of:
                 lineage_of[spec_hash] = lineage_of[parent]
                 continue
-            lineage_of[spec_hash] = f"lin_{spec_hash[:12]}"
+            lineage_of[spec_hash] = fresh or f"lin_{spec_hash[:12]}"
         return lineage_of
 
     # -- registering the survivors -------------------------------------------
@@ -653,12 +657,94 @@ def training_regime(
     return RegimeDescription.from_reading(reading)
 
 
-def _lookback_for(spec: StrategySpec) -> timedelta:
-    """The calendar window a spec's longest feature needs.
+def lookback_for(max_lookback: int) -> timedelta:
+    """The calendar window a pipeline's longest feature needs, from its bar count.
 
     Bars are sessions and the window is calendar days: about 1.45 calendar days
     per trading session, plus holidays. `1.6x + 30` covers that with room, and a
     window larger than needed changes no feature value — each feature reads only
     its own last `lookback` closes — so erring long costs time, not correctness.
+    Sized from a pipeline rather than a spec, since a spec reading a model does
+    not know its model's inputs.
     """
-    return timedelta(days=int(spec.max_lookback * 1.6) + 30)
+    return timedelta(days=int(max_lookback * 1.6) + 30)
+
+
+def sealed_training_data(
+    snapshots: SnapshotStore, vintage_id: str, *, fraction: float
+) -> TrainingData:
+    """The sealed source, the boundary, and the schedule strictly before it.
+
+    One function for every process that learns from a vintage — the search and
+    the trainer — so there is one place the training side of the seal is drawn.
+    """
+    admissible, why = snapshots.is_admissible(vintage_id)
+    if not admissible:
+        raise CycleError(why)
+    vintage = snapshots.get(vintage_id)
+    if vintage is None:  # pragma: no cover - is_admissible just found it
+        raise CycleError(f"{vintage_id} vanished between checks")
+
+    window = holdout_boundary(vintage, fraction=fraction)
+    if not window.is_usable:
+        raise CycleError(
+            f"{window.summary()}. The holdout is too short to judge anything this "
+            "search produces, so running the search would spend trials on candidates "
+            "that can never be evaluated."
+        )
+
+    bars = snapshots.bars_of(vintage_id)
+    schedule = decisions_between(bars, end=window.sealed_from)
+    if len(schedule) < 2:
+        raise CycleError(
+            f"the training window of {vintage_id} holds {len(schedule)} decision "
+            "time(s); a backtest needs at least two, since a fill comes from the bar "
+            "after the decision"
+        )
+    uids = tuple(vintage.instrument_uids)
+    # The shortest instrument's history is the binding one: a lookback that
+    # fits the longest series but not the shortest evaluates to UNKNOWN on
+    # the shortest at every decision.
+    per_uid = {uid: 0 for uid in uids}
+    for bar in bars:
+        if bar.available_at_utc < window.sealed_from and bar.instrument_uid in per_uid:
+            per_uid[bar.instrument_uid] += 1
+    return TrainingData(
+        window=window,
+        source=snapshots.source_for(vintage_id),
+        uids=uids,
+        schedule=schedule,
+        n_training_bars=min(per_uid.values()) if per_uid else 0,
+    )
+
+
+def record_violation(
+    ledger: Ledger,
+    exc: HoldoutViolation,
+    *,
+    caller: str,
+    window: HoldoutWindow,
+    run_id: str | None = None,
+) -> str:
+    """Record a read past the seal, and return the message that ends the process.
+
+    Fatal, as `HoldoutViolation` promises: every result the process produced
+    came from machinery that has just reached past its own boundary, so nothing
+    is registered and no trial is recorded — a re-run once the cause is fixed
+    records its own. Recorded, because a raise stops one process and the event
+    is what makes a pattern of attempts visible. Before this the searcher filed
+    the violation as one more errored trial and the cycle went on to register
+    survivors, and `record_violation` had no caller at all.
+    """
+    HoldoutRegistry(ledger, run_id=run_id).record_violation(
+        sealed_from=exc.sealed_from or window.sealed_from,
+        requested_at=exc.requested_at or window.sealed_from,
+        caller=caller,
+        detail=str(exc),
+    )
+    return (
+        f"{caller} stopped: it reached past the holdout boundary "
+        f"{window.sealed_from.isoformat()}, so nothing it produced can be trusted. "
+        "Nothing was registered and no trial recorded; the attempt is in the ledger "
+        f"as {EventType.HOLDOUT_VIOLATION_ATTEMPTED.value}. {exc}"
+    )

@@ -205,6 +205,39 @@ def test_each_instrument_is_labelled_from_its_own_prices() -> None:
     assert data.base_rate == pytest.approx(0.5)
 
 
+@pytest.mark.parametrize(
+    ("lookback_days", "every", "horizon"),
+    [
+        # Daily decisions: the label could never complete, and would have been
+        # dropped as "unlabelled" with nothing to say why.
+        (3, 1, 5),
+        # Every tenth session: at the next decision the window holds six later
+        # bars, so the label *would* complete — from the wrong entry bar.
+        (6, 10, 2),
+    ],
+)
+def test_a_lookback_shorter_than_the_label_is_refused_not_mislabelled(
+    lookback_days: int, every: int, horizon: int
+) -> None:
+    """Enough history for every feature at the decision, and too little to
+    still hold the decision's bars when its exit arrives."""
+    bars = ramp(60)
+    short = ForwardOnlyReader(
+        source=InMemoryBarSource(bars=bars),
+        resolution=Resolution.DAILY,
+        instrument_uids=(UID,),
+        lookback=timedelta(days=lookback_days),
+    )
+    with pytest.raises(DatasetError, match="lookback is shorter"):
+        build_dataset(
+            reader=short,
+            pipeline=PIPELINE,
+            decision_times=decisions_between(bars)[::every],
+            instruments=(UID,),
+            label=LabelDefinition(horizon=horizon, cost_bps=COST),
+        )
+
+
 def test_decision_times_must_run_forward() -> None:
     bars = ramp(10)
     with pytest.raises(DatasetError, match="ascending"):

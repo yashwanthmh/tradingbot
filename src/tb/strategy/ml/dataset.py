@@ -210,6 +210,17 @@ def _complete(
             continue
         # The first bar knowable after the decision: the backtester's fill.
         entry = bisect_right(knowable, pending.decided_at)
+        if entry == 0:
+            # The decision saw bars — its features were complete — and none
+            # of them is in the window now: the reader's lookback has dropped
+            # them. The first bar still held is then not necessarily the next
+            # one after the decision, and a label read from it would be a
+            # different trade. Refused rather than mislabelled.
+            raise DatasetError(
+                f"the reader no longer holds the bars {uid} was decided on at "
+                f"{pending.decided_at.isoformat()}, so its entry bar cannot be found: the "
+                f"reader's lookback is shorter than a {label.horizon}-bar label needs"
+            )
         if entry + label.horizon >= len(bars):
             still.append(pending)
             continue

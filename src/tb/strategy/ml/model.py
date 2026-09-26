@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from tb.core.errors import TbError
@@ -227,5 +228,7 @@ class ModelScorer:
     def inputs(self) -> tuple[str, ...]:
         return self.model.feature_names
 
-    def score(self, row: Sequence[float]) -> float:
+    def score(self, row: Sequence[float], *, as_of: datetime) -> float:
+        """The model's score. The decision time changes nothing for one model."""
+        del as_of
         return self.model.score(row)

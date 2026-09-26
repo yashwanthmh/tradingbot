@@ -283,12 +283,17 @@ def make_spec(kind: str, lookback: int, *, name: str | None = None) -> FeatureSp
 class Scorer(Protocol):
     """A value computed from other features at the same instant: a model's score.
 
-    Evaluated after every feature, from those features' values alone — no bars,
-    no window, no clock — so a scorer sees exactly what a strategy reading the
-    same features sees, and nothing a strategy could not. It is the only way a
+    Evaluated after every feature, from those features' values alone — no bars
+    and no window — so a scorer sees exactly what a strategy reading the same
+    features sees, and nothing a strategy could not. It is the only way a
     model's output enters a snapshot, which is what keeps models inside the one
     pipeline: the backtest, the loop and `tb replay` all get the score from the
     same `compute` call, hashed with everything else in the snapshot.
+
+    `as_of` is the decision time, which a strategy also knows. A recorded model
+    ignores it; the trainer's walk-forward scorer uses it to pick the model
+    fitted before that instant's fold, and has none to offer before the first
+    fold — `None`, which the snapshot reads as `UNKNOWN`.
     """
 
     @property
@@ -299,7 +304,7 @@ class Scorer(Protocol):
         """Feature names, in the order `score` reads them."""
         ...
 
-    def score(self, row: Sequence[float]) -> float: ...
+    def score(self, row: Sequence[float], *, as_of: datetime) -> float | None: ...
 
 
 def pipeline_for(
@@ -412,7 +417,7 @@ class FeaturePipeline:
             values[spec.name] = self._round(spec.compute([close.value for close in window_closes]))
 
         for scorer in self.scorers:
-            values[scorer.name] = self._score(scorer, values)
+            values[scorer.name] = self._score(scorer, values, as_of=window.as_of)
 
         return FeatureSnapshot(
             as_of=window.as_of,
@@ -488,7 +493,9 @@ class FeaturePipeline:
         quantum = Decimal(1).scaleb(-FEATURE_PLACES)
         return value.quantize(quantum)
 
-    def _score(self, scorer: Scorer, values: Mapping[str, FeatureValue]) -> FeatureValue:
+    def _score(
+        self, scorer: Scorer, values: Mapping[str, FeatureValue], *, as_of: datetime
+    ) -> FeatureValue:
         """A scorer's value, `UNKNOWN` whenever any input is.
 
         Not imputed: the model was never fitted on a guessed input (the dataset
@@ -502,7 +509,9 @@ class FeaturePipeline:
             if not isinstance(value, Decimal):
                 return UNKNOWN
             row.append(float(value))
-        result = scorer.score(row)
+        result = scorer.score(row, as_of=as_of)
+        if result is None:
+            return UNKNOWN
         if not math.isfinite(result):
             raise FeatureError(f"scorer {scorer.name!r} returned {result} for {row}")
         # Through the float's exact binary value, then the same rounding as

@@ -54,6 +54,10 @@ class AuthorKind(StrEnum):
     # parent's trials are part of this candidate's multiplicity: a mutation of
     # a spec found after 900 trials inherits those 900.
     MUTATION = "mutation"
+    # A spec reading a model, proposed by the trainer that recorded the model.
+    # Its lineage is the model's idea — features and label — so every retrain
+    # of one idea counts against one lineage.
+    ML = "ml"
 
 
 class StrategyStatus(StrEnum):
