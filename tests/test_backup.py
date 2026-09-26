@@ -333,7 +333,8 @@ def test_tb_backup_end_to_end(traded: dict[str, Any], tmp_path: Path) -> None:
 
     listed = runner.invoke(app, ["backup", "list", "--db", str(traded["db"])])
     assert listed.exit_code == 0, listed.output
-    assert "(same host)" in listed.output
+    assert path.name in listed.output
+    assert "same host, so the live gate does not count it" in listed.output
 
     partition = next((path / "bars").rglob("*.parquet"))
     partition.write_bytes(partition.read_bytes() + b"\0")

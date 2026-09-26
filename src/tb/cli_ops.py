@@ -557,19 +557,36 @@ def backup_list(db: DbOpt = None) -> None:
     if not made:
         console.print(f"{WARN} no backups recorded. `tb backup create` makes one.")
         return
-    table = Table("backup", "made", "through seq", "files", "bytes", "restored on", title="backups")
+    # Identifiers and hosts go on their own lines, never into a wrapped cell:
+    # a host name broken across two rows is one nobody can read back, and a
+    # backup id broken across two is one nobody can paste into `verify`.
+    table = Table("backup", "made", "through seq", "files", "bytes", "restores", title="backups")
+    for column in table.columns:
+        column.no_wrap = True
     for backup in made:
-        where = [
-            f"{r.restored_host} {r.restored_at:%Y-%m-%d}" + (" (same host)" if r.same_host else "")
-            for r in restores
-            if r.backup_id == backup["backup_id"]
-        ]
         table.add_row(
             str(backup["backup_id"]),
             f"{backup['at']:%Y-%m-%d %H:%M}",
             str(backup["head_seq"]),
             str(backup["n_files"]),
             f"{int(backup['n_bytes']):,}",
-            escape(", ".join(where)) or "[yellow]never[/yellow]",
+            str(sum(1 for r in restores if r.backup_id == backup["backup_id"])),
         )
     console.print(table)
+    if not restores:
+        console.print(
+            f"{WARN} no restore reported back yet. Restore on another machine, then run "
+            "`tb backup receipt` here."
+        )
+    for restore in restores:
+        counted = (
+            "same host, so the live gate does not count it"
+            if restore.same_host
+            else "on another machine"
+        )
+        console.print(
+            f"  {WARN if restore.same_host else OK} {restore.backup_id} restored on "
+            f"{escape(restore.restored_host)} at {restore.restored_at:%Y-%m-%d %H:%M}: "
+            f"{counted}",
+            soft_wrap=True,
+        )
