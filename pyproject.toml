@@ -28,6 +28,9 @@ data = [
 llm = [
     "anthropic>=1.8.0",
 ]
+ml = [
+    "lightgbm>=4.5",
+]
 
 [project.scripts]
 tb = "tb.cli:app"
