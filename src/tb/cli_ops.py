@@ -9,6 +9,12 @@
     tb journal verify               every page, regenerated and compared
     tb journal show --date D        one page, printed rather than written
 
+    tb backup create                the ledger and everything it names, hashed
+    tb backup verify DIR            every file, the chain, and the catalogues
+    tb backup restore DIR --to T    rebuild on a clean machine, and prove it
+    tb backup receipt FILE          bring that proof home, where the gate reads it
+    tb backup list                  the backups made and the restores reported
+
 The streak `tb sessions` prints is the number `tb arm --live` will count,
 computed by the same function from the same ledger, so what an operator reads
 here is what the gate will see. The journal is the same record written down:
@@ -34,6 +40,18 @@ from tb.core.errors import TbError
 from tb.data.calendar import TradingCalendar
 from tb.ledger.anchor import GitAnchorSink, anchor_head
 from tb.ledger.store import Ledger, default_ledger_path
+from tb.ops.backup import (
+    DEFAULT_DESTINATION,
+    RECEIPT,
+    BackupError,
+    RestoreReceipt,
+    backups_made,
+    create_backup,
+    record_receipt,
+    restore_backup,
+    verified_restores,
+    verify_backup,
+)
 from tb.ops.journal import (
     DEFAULT_DIR,
     HEADS_FILE,
@@ -401,3 +419,157 @@ def journal_show(
             err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
             raise typer.Exit(2) from exc
     typer.echo(page.text, nl=False)
+
+
+# --------------------------------------------------------------------------
+# tb backup
+# --------------------------------------------------------------------------
+
+backup_app = typer.Typer(
+    help="Back up the ledger and what it names, restore it elsewhere, and prove it.",
+    no_args_is_help=True,
+)
+
+
+@backup_app.command("create")
+def backup_create(
+    destination: Annotated[
+        Path, typer.Option("--to", help="Where backups are kept. Never inside the repo.")
+    ] = DEFAULT_DESTINATION,
+    bars: Annotated[
+        Path | None,
+        typer.Option(
+            "--bars", help="The bar store. Default: beside the ledger.", show_default=False
+        ),
+    ] = None,
+    models: Annotated[
+        Path | None,
+        typer.Option(
+            "--models", help="The model store. Default: beside the ledger.", show_default=False
+        ),
+    ] = None,
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """Copy the ledger and every file it names, hash it all, and record the backup."""
+    pinned = _load(limits)
+    with _ledger(db, writer=pinned) as ledger:
+        beside = Path(ledger.path).parent
+        try:
+            result = create_backup(
+                ledger,
+                destination=destination,
+                bars_root=bars or beside / "bars",
+                models_root=models or beside / "models",
+                limits=pinned,
+            )
+        except (BackupError, OSError) as exc:
+            err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+            raise typer.Exit(1) from exc
+    manifest = result.manifest
+    kinds = ", ".join(
+        f"{sum(1 for f in manifest.files if f.kind == kind)} {kind}(s)"
+        for kind in ("ledger", "partition", "model", "limits")
+    )
+    console.print(
+        f"{OK} backup {result.backup_id} at {result.path}: {kinds}, "
+        f"{manifest.total_bytes:,} bytes, through seq {manifest.head_seq}"
+    )
+    console.print(
+        f"  manifest {result.manifest_sha256}. Copy the directory to another machine and run "
+        "`tb backup restore` there; it holds account data, so keep it off anything public."
+    )
+
+
+@backup_app.command("verify")
+def backup_verify(
+    path: Annotated[Path, typer.Argument(help="The backup directory.")],
+) -> None:
+    """Check a backup: every file, the chain, and nothing the ledger names missing."""
+    check = verify_backup(path)
+    if not check.ok:
+        for problem in check.problems:
+            console.print(f"{BAD} {escape(problem)}", soft_wrap=True)
+        raise typer.Exit(1)
+    assert check.manifest is not None
+    console.print(f"{OK} backup {check.manifest.backup_id} is whole:")
+    for line in check.checks:
+        console.print(f"  {OK} {escape(line)}")
+
+
+@backup_app.command("restore")
+def backup_restore(
+    path: Annotated[Path, typer.Argument(help="The backup directory.")],
+    target: Annotated[Path, typer.Option("--to", help="An empty directory to restore into.")],
+) -> None:
+    """Rebuild a ledger and its stores in an empty directory, check it, and write a receipt."""
+    try:
+        receipt = restore_backup(path, target)
+    except (BackupError, OSError) as exc:
+        err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+        raise typer.Exit(1) from exc
+    console.print(f"{OK} restored {receipt.backup_id} into {target} on {receipt.restored_host}:")
+    for line in receipt.checks:
+        console.print(f"  {OK} {escape(line)}")
+    console.print(
+        f"\n  The receipt is {target / RECEIPT}. Take it back to the machine the backup came "
+        "from and run `tb backup receipt` there: that ledger is the one the live gate reads."
+    )
+
+
+@backup_app.command("receipt")
+def backup_receipt(
+    path: Annotated[Path, typer.Argument(help="The restore-receipt.json a restore wrote.")],
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """Record a restore done elsewhere, if this ledger made the backup it restored."""
+    try:
+        receipt = RestoreReceipt.parse(path.read_text(encoding="utf-8"))
+    except (BackupError, OSError) as exc:
+        err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+        raise typer.Exit(2) from exc
+    pinned = _load(limits)
+    with _ledger(db, writer=pinned) as ledger:
+        try:
+            recorded = record_receipt(ledger, receipt)
+        except BackupError as exc:
+            err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+            raise typer.Exit(1) from exc
+    console.print(
+        f"{OK} recorded the restore of {recorded.backup_id} on {recorded.restored_host} "
+        f"at {recorded.restored_at.isoformat()} (seq {recorded.seq})"
+    )
+    if recorded.same_host:
+        console.print(
+            f"{WARN} it was restored on the machine that made it. That proves the files are "
+            "intact, not that the state survives losing this machine, so the live gate does "
+            "not count it. Restore on another machine."
+        )
+
+
+@backup_app.command("list")
+def backup_list(db: DbOpt = None) -> None:
+    """The backups this ledger made, and the restores reported back to it."""
+    with _ledger(db) as ledger:
+        made = backups_made(ledger)
+        restores = verified_restores(ledger)
+    if not made:
+        console.print(f"{WARN} no backups recorded. `tb backup create` makes one.")
+        return
+    table = Table("backup", "made", "through seq", "files", "bytes", "restored on", title="backups")
+    for backup in made:
+        where = [
+            f"{r.restored_host} {r.restored_at:%Y-%m-%d}" + (" (same host)" if r.same_host else "")
+            for r in restores
+            if r.backup_id == backup["backup_id"]
+        ]
+        table.add_row(
+            str(backup["backup_id"]),
+            f"{backup['at']:%Y-%m-%d %H:%M}",
+            str(backup["head_seq"]),
+            str(backup["n_files"]),
+            f"{int(backup['n_bytes']):,}",
+            escape(", ".join(where)) or "[yellow]never[/yellow]",
+        )
+    console.print(table)

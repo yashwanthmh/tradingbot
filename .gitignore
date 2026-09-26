@@ -8,6 +8,9 @@ secrets/
 
 # Runtime state: ledger DBs, kill switch, heartbeats, raw API archives
 var/
+# Backups hold account data. `tb backup create` defaults to var/backups; this
+# catches one made at the root by hand.
+backups/
 *.db
 *.db-wal
 *.db-shm

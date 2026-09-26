@@ -223,6 +223,15 @@ class EventType(StrEnum):
     # event whose file has changed or vanished is refused at load.
     MODEL_RECORDED = "model.recorded"
 
+    # --- operating it (M8) ---
+    #
+    # A backup made, a backup restored (written into the restored ledger, on
+    # the machine that restored it), and that restore reported back to the
+    # ledger the backup came from — the evidence the live gate reads.
+    BACKUP_CREATED = "backup.created"
+    BACKUP_RESTORED = "backup.restored"
+    BACKUP_RESTORE_VERIFIED = "backup.restore_verified"
+
 
 class EventPayload(BaseModel):
     """Base for every payload.
@@ -1435,6 +1444,66 @@ class ModelRecordedPayload(EventPayload):
 
 
 # --------------------------------------------------------------------------
+# Operating it (M8)
+# --------------------------------------------------------------------------
+
+
+class BackupCreatedPayload(EventPayload):
+    """A copy of everything a restore needs, and the manifest that names it.
+
+    The manifest's hash is the backup's identity. A restore elsewhere reports
+    it back, and a receipt naming a manifest this ledger never recorded is not
+    evidence of anything.
+    """
+
+    backup_id: str
+    manifest_sha256: str
+    head_seq: int
+    head_chain_hash: str
+    n_files: int
+    n_bytes: int
+    host: str
+    destination: str
+
+
+class BackupRestoredPayload(EventPayload):
+    """A backup restored and checked, written into the restored ledger itself.
+
+    `checks` names what was checked rather than only that something passed:
+    a restore whose replay step had no fills to replay proved less than one
+    that replayed three, and the record should say which it was.
+    """
+
+    backup_id: str
+    manifest_sha256: str
+    source_host: str
+    restored_host: str
+    n_files: int
+    checks: list[str] = Field(default_factory=list)
+    n_fills_replayed: int = 0
+
+
+class BackupRestoreVerifiedPayload(EventPayload):
+    """A restore on another machine, reported back to the ledger it came from.
+
+    `same_host` is on the event because a restore onto the machine that made
+    the backup proves the files are intact and nothing about surviving the
+    loss of that machine, which is the point of the drill.
+    """
+
+    backup_id: str
+    manifest_sha256: str
+    source_host: str
+    restored_host: str
+    restored_at: str
+    same_host: bool
+    restored_head_seq: int
+    restored_head_chain_hash: str
+    checks: list[str] = Field(default_factory=list)
+    n_fills_replayed: int = 0
+
+
+# --------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------
 
@@ -1511,6 +1580,10 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.POSITION_ORPHANED: PositionOrphanedPayload,
     # M7
     EventType.MODEL_RECORDED: ModelRecordedPayload,
+    # M8
+    EventType.BACKUP_CREATED: BackupCreatedPayload,
+    EventType.BACKUP_RESTORED: BackupRestoredPayload,
+    EventType.BACKUP_RESTORE_VERIFIED: BackupRestoreVerifiedPayload,
 }
 
 # The default aggregate each event type is filed under, so callers do not have
@@ -1605,6 +1678,10 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     # be read by many specs, and filing it under any one of them would hide it
     # from the others' histories.
     EventType.MODEL_RECORDED: AggregateType.MODEL,
+    # M8. Backups are filed with the ledger they copy.
+    EventType.BACKUP_CREATED: AggregateType.LEDGER,
+    EventType.BACKUP_RESTORED: AggregateType.LEDGER,
+    EventType.BACKUP_RESTORE_VERIFIED: AggregateType.LEDGER,
 }
 
 
