@@ -582,6 +582,9 @@ def holdout(
             pipeline=pipeline_from_spec(spec),
             instruments={uid: InstrumentMeta(uid, "USD", Jurisdiction.US) for uid in uids},
             min_holding_minutes=spec.min_holding_minutes,
+            # The adjusted history the search trained on, so the holdout judges
+            # the strategy on the same prices it was selected on.
+            actions=snapshots.actions_of(vintage_id),
         )
         result = engine.run(
             strategy=DslStrategy(spec=spec, strategy_id=strategy_id, version=version),

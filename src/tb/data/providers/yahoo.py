@@ -28,7 +28,7 @@ Two honest limitations, both encoded in `capabilities` rather than buried:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -47,6 +47,7 @@ from tb.data.provider import (
     Resolution,
     Session,
     TimestampConvention,
+    action_knowledge_time,
     knowledge_time,
     normalise_bar_open,
     parse_price,
@@ -323,7 +324,10 @@ class YahooProvider:
 
         Yahoo gives no declaration date, so `declared_date` is None — stored as
         None rather than imputed. Pretending to know when a split became public
-        is how a factor table ends up containing tomorrow's split.
+        is how a factor table ends up containing tomorrow's split. What *is*
+        certain is that it was public by its ex-date, so that bounds `known_at`
+        (`action_knowledge_time`) rather than the moment of the fetch, which for
+        a backfill is years after every action in it.
         """
         payload, _ = self._request(
             symbol,
@@ -347,12 +351,13 @@ class YahooProvider:
             denominator = entry.get("denominator")
             if not numerator or not denominator:
                 continue
+            effective = _date_of(entry.get("date"))
             actions.append(
                 RawAction(
                     instrument_uid=instrument_uid,
                     action_type="split",
-                    effective_date=_date_of(entry.get("date")),
-                    known_at_utc=observed,
+                    effective_date=effective,
+                    known_at_utc=_known_at(effective, observed=observed),
                     provider=self.name,
                     ratio_num=int(numerator),
                     ratio_den=int(denominator),
@@ -363,12 +368,13 @@ class YahooProvider:
             amount = entry.get("amount")
             if amount is None:
                 continue
+            effective = _date_of(entry.get("date"))
             actions.append(
                 RawAction(
                     instrument_uid=instrument_uid,
                     action_type="cash_dividend",
-                    effective_date=_date_of(entry.get("date")),
-                    known_at_utc=observed,
+                    effective_date=effective,
+                    known_at_utc=_known_at(effective, observed=observed),
                     provider=self.name,
                     gross_amount=Decimal(str(amount)),
                     currency=(result.get("meta") or {}).get("currency"),
@@ -532,3 +538,10 @@ def _date_of(epoch: Any) -> str:
     if epoch is None:
         raise DataError("corporate action with no date")
     return datetime.fromtimestamp(int(epoch), tz=UTC).date().isoformat()
+
+
+def _known_at(effective: str, *, observed: datetime) -> datetime:
+    """Public by its ex-date at the latest; Yahoo gives no declaration date."""
+    return action_knowledge_time(
+        effective_date=date.fromisoformat(effective), declared_date=None, observed=observed
+    )

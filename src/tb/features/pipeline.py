@@ -332,7 +332,12 @@ class FeaturePipeline:
         at all, so the module that owns the distinction keeps it.
         """
         bars = window.bars(instrument_uid)
-        closes, unadjustable = self._adjusted_closes(bars, actions=actions, as_of=window.as_of)
+        # This instrument's own actions only. `price_factor` does not look at
+        # the instrument, so a caller handing over a mixed list — as
+        # `compute_all` does — would otherwise scale every name by every other
+        # name's splits.
+        own = [action for action in actions if action.instrument_uid == instrument_uid]
+        closes, unadjustable = self._adjusted_closes(bars, actions=own, as_of=window.as_of)
 
         values: dict[str, FeatureValue] = {}
         for spec in self.specs:
@@ -386,8 +391,12 @@ class FeaturePipeline:
 
         `RAW` is passed straight through — it is what the cross-venue price
         check, stop placement and tick rounding need. Anything else is scaled
-        by the exact `Fraction` factor for that bar's own session date, so a
-        split part-way through the window does not appear as a return.
+        by the exact `Fraction` factor from the last session that bar's price
+        already reflects (`Bar.quoted_through`), so a split part-way through
+        the window does not appear as a return. That is the bar's own session
+        for a raw feed and the day it was fetched for a vendor-adjusted one:
+        Yahoo has already divided its history by every split before the fetch,
+        and scaling from the bar's session would divide again.
 
         A close is `unadjustable` when its factor was incomplete: some action
         effective after that bar could not be applied, so this close is on a
@@ -402,7 +411,7 @@ class FeaturePipeline:
         adjusted: list[_Close] = []
         unadjustable: list[str] = []
         for bar in bars:
-            factor = price_factor(actions, at=bar.session_date, as_of=as_of)
+            factor = price_factor(actions, at=bar.quoted_through, as_of=as_of)
             for action_id in factor.missing:
                 if action_id not in unadjustable:
                     unadjustable.append(action_id)

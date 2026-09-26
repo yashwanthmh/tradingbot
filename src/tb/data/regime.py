@@ -45,6 +45,7 @@ available then — not the one computed from today's data.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -52,6 +53,7 @@ from enum import StrEnum
 
 from tb.config.hard_limits import HardLimits
 from tb.core.errors import TbError
+from tb.data.adjustments import CorporateAction
 from tb.data.asof import (
     UNKNOWN,
     BarSource,
@@ -203,6 +205,7 @@ class RegimeGate:
         *,
         as_of: datetime,
         check_staleness: bool = True,
+        actions: Sequence[CorporateAction] = (),
     ) -> RegimeReading:
         """The exposure factor as of one instant.
 
@@ -211,6 +214,11 @@ class RegimeGate:
         caller deciding is how "the regime gate was unavailable so we traded
         full size" happens. The one thing this raises on is a naive datetime,
         which is a programming error rather than a data condition.
+
+        `actions` are the reference series' corporate actions, unfiltered, as
+        `FeaturePipeline.compute` takes them. Without them a split in the index
+        fund puts its 200-day average four times above the price for most of a
+        year: RISK_OFF, and half exposure, on a number that is not a signal.
         """
         if as_of.tzinfo is None:
             raise RegimeError("as_of must be timezone-aware")
@@ -273,7 +281,7 @@ class RegimeGate:
             _by_uid={self.instrument_uid: bars},
         )
         pipeline = self._pipeline()
-        snapshot = pipeline.compute(window, self.instrument_uid)
+        snapshot = pipeline.compute(window, self.instrument_uid, actions=actions)
         average = snapshot.get(f"sma_{self.ma_days}")
         last = snapshot.get("close")
 
@@ -297,12 +305,22 @@ class RegimeGate:
         )
 
     def read_bars(
-        self, bars: list[Bar], *, as_of: datetime, check_staleness: bool = True
+        self,
+        bars: list[Bar],
+        *,
+        as_of: datetime,
+        check_staleness: bool = True,
+        actions: Sequence[CorporateAction] = (),
     ) -> RegimeReading:
         """Convenience for callers that already hold the reference bars."""
         from tb.data.asof import InMemoryBarSource
 
-        return self.read(InMemoryBarSource(bars=bars), as_of=as_of, check_staleness=check_staleness)
+        return self.read(
+            InMemoryBarSource(bars=bars),
+            as_of=as_of,
+            check_staleness=check_staleness,
+            actions=actions,
+        )
 
     # -- internals ---------------------------------------------------------
 

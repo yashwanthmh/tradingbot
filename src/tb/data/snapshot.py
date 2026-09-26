@@ -52,6 +52,7 @@ from enum import StrEnum
 from tb.core.canonical import hash_payload
 from tb.core.clock import from_iso, now_utc, to_iso
 from tb.data.actions import ActionStore
+from tb.data.adjustments import CorporateAction
 from tb.data.asof import ForwardOnlyReader, InMemoryBarSource
 from tb.data.barstore import BarStore, PartitionInfo
 from tb.data.calendar import TradingCalendar
@@ -541,6 +542,36 @@ class SnapshotStore:
         and a convention is broken by the first helper that takes a shortcut.
         """
         return InMemoryBarSource(bars=self.bars_of(vintage_id, verify=verify))
+
+    def actions_of(self, vintage_id: str) -> dict[str, tuple[CorporateAction, ...]]:
+        """The corporate actions this vintage was sealed with, per instrument.
+
+        Those recorded by the event that sealed it and no others, since its
+        `action_table_hash` pins the table as it then stood. The knowledge-time
+        filter cannot do this job: a later backfill records an action with the
+        time it was *public*, which can be years before the seal, so without
+        this a re-run of the same vintage would adjust by a split it had never
+        seen, and two backtests citing one vintage would disagree.
+        """
+        row = self._ledger.conn.execute(
+            "SELECT sealing_event_seq FROM data_snapshots WHERE vintage_id = ?", (vintage_id,)
+        ).fetchone()
+        if row is None:
+            raise SnapshotError(f"{vintage_id} is not in the ledger")
+        recorded: set[str] = set()
+        for event in self._ledger.conn.execute(
+            "SELECT payload_json FROM event_log WHERE event_type = ? AND seq <= ?",
+            (EventType.DATA_ACTION_RECORDED.value, int(row["sealing_event_seq"])),
+        ):
+            recorded.add(str(json.loads(str(event["payload_json"]))["action_id"]))
+        vintage = self.get(vintage_id)
+        uids = () if vintage is None else vintage.instrument_uids
+        return {
+            uid: tuple(
+                action for action in self._actions.actions_for(uid) if action.action_id in recorded
+            )
+            for uid in uids
+        }
 
     def reader_for(
         self,

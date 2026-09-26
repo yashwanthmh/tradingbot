@@ -27,7 +27,7 @@ What it does better than Yahoo, and why it is nonetheless primary:
 * **Low delay on IEX.** Free IEX data is not the 15-minute-delayed SIP feed, so
   it can drive a live decision once the representativeness question is settled.
 * **Corporate actions carry a declaration date**, making `known_at` a fact
-  rather than "whenever we happened to look".
+  rather than "whenever we happened to look" (`_known_at`).
 
 Credentials are read from `ALPACA_DATA_KEY_ID` / `ALPACA_DATA_SECRET_KEY` —
 names chosen to say *data*, following the same discipline as the broker keys.
@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
 from typing import Any
@@ -70,6 +70,7 @@ from tb.data.provider import (
     Resolution,
     Session,
     TimestampConvention,
+    action_knowledge_time,
     classify_us_session,
     knowledge_time,
     normalise_bar_open,
@@ -655,7 +656,7 @@ def _split_action(entry: Any, *, instrument_uid: str, observed: datetime) -> Raw
         instrument_uid=instrument_uid,
         action_type="split",
         effective_date=_effective_date(entry),
-        known_at_utc=observed,
+        known_at_utc=_known_at(entry, observed=observed),
         provider="alpaca",
         # A 4-for-1 arrives as new_rate=4, old_rate=1: one old share becomes
         # four, so the price divides by 4. `ratio_num/ratio_den` is that 4/1,
@@ -677,7 +678,7 @@ def _dividend_action(entry: Any, *, instrument_uid: str, observed: datetime) -> 
         instrument_uid=instrument_uid,
         action_type="cash_dividend",
         effective_date=_effective_date(entry),
-        known_at_utc=observed,
+        known_at_utc=_known_at(entry, observed=observed),
         provider="alpaca",
         gross_amount=parse_price(rate),
         currency="USD",
@@ -693,6 +694,28 @@ def _optional_date(value: Any) -> str | None:
     keeping `known_at` separate from `effective_date`.
     """
     return str(value) if value else None
+
+
+def _known_at(entry: dict[str, Any], *, observed: datetime) -> datetime:
+    """When the action was public: its declaration day where Alpaca gives one.
+
+    What the declaration date is for. Stamped with the fetch instead, as it
+    was, a backfilled split was unknown to every backtest instant before the
+    fetch, and its factor never applied.
+    """
+    declared = _optional_date(entry.get("declaration_date"))
+    return action_knowledge_time(
+        effective_date=_as_day(_effective_date(entry)),
+        declared_date=None if declared is None else _as_day(declared),
+        observed=observed,
+    )
+
+
+def _as_day(text: str) -> date:
+    try:
+        return date.fromisoformat(text.strip()[:10])
+    except ValueError as exc:
+        raise DataError(f"alpaca sent an unparseable action date {text!r}") from exc
 
 
 def _integer_ratio(new_rate: Any, old_rate: Any) -> tuple[int, int]:

@@ -202,7 +202,7 @@ measurement worth citing should be reproducible rather than something someone
 ran once by hand. It holds **no** Trading 212 credentials, so nothing in it can
 reach an order endpoint.
 
-Three things about the data layer that are load-bearing rather than
+Four things about the data layer that are load-bearing rather than
 decorative:
 
 **Every bar carries three time axes.** Event time, *knowledge* time
@@ -226,6 +226,18 @@ gross edge. The output is one number — the gross edge a strategy would need
 before the feed's own error is small enough to trade through — set against the
 ~30bps a round trip already costs. Until that measurement passes,
 `data.allowed_live_resolutions` stays `[daily]`.
+
+**One bar per session, and every split applied from the scale that bar is
+already on.** A symbol held from both feeds is read from Alpaca wherever it has
+a bar and from Yahoo only where it does not. Yahoo has already divided its
+history by every split up to the day it was fetched, so its bars are adjusted
+only for splits after that; a raw bar is adjusted for every split after its own
+session. The loop, the regime gate, the backtester, the search and the holdout
+evaluation all read the recorded actions — so run `tb data actions` before
+`tb data seal`, or a split reads as a 75% fall in every feature across it and a
+backtest holding through one books the old share count at the new price. A
+vintage's backtests use the actions recorded when it was sealed, so a later
+backfill cannot change a re-run.
 
 Alpaca needs two keys, read from `ALPACA_DATA_KEY_ID` /
 `ALPACA_DATA_SECRET_KEY`. Generate them at

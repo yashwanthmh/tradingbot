@@ -76,6 +76,8 @@ from tb.config.loader import PinnedLimits, load_hard_limits
 from tb.core.clock import now_utc
 from tb.core.errors import TbError, TransportError
 from tb.core.ids import new_id
+from tb.data.actions import ActionStore
+from tb.data.adjustments import CorporateAction
 from tb.data.asof import BarSource, BarWindow, visible_bars
 from tb.data.regime import RegimeGate, RegimeReading
 from tb.data.symbols import SymbolMap
@@ -384,7 +386,20 @@ class TradingLoop:
         one cycle is sized against the same reading — two instruments scaled
         by different factors would not be a coherent portfolio.
         """
-        return RegimeGate(limits=self.pinned.limits).read(self.bars, as_of=at)
+        gate = RegimeGate(limits=self.pinned.limits)
+        return gate.read(self.bars, as_of=at, actions=self._actions_for(gate.instrument_uid))
+
+    def _actions_for(self, uid: str) -> tuple[CorporateAction, ...]:
+        """Every corporate action recorded on one instrument, unfiltered.
+
+        The pipeline applies the knowledge-time and effective-date filters
+        itself. Read afresh each time rather than held, so a split a backfill
+        records while the loop runs reaches the next decision, not the next
+        restart. Before this nothing in the loop passed actions at all, so a
+        split put a step the size of its ratio into every feature across it —
+        a 4-for-1 read as a 75% fall by each strategy, on the day it happened.
+        """
+        return ActionStore(self.ledger).actions_for(uid)
 
     def _settle(self, at: datetime) -> tuple[tuple[str, ...], str]:
         """Read what finished since the last cycle, and charge what it realised.
@@ -535,7 +550,7 @@ class TradingLoop:
     ) -> _Outcome:
         """Ask one strategy about one instrument and act on the answer."""
         window = self._window(uid, at)
-        snapshot = funded.pipeline.compute(window, uid)
+        snapshot = funded.pipeline.compute(window, uid, actions=self._actions_for(uid))
         decision = funded.strategy.decide(snapshot=snapshot, window=window, position=position)
         decision_id = self._record_decision(
             decision, ticker=ticker, snapshot=snapshot, regime=regime

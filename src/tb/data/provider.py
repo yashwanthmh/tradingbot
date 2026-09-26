@@ -338,6 +338,21 @@ class Bar:
         return self.bar_open_utc.astimezone(US_EASTERN).date()
 
     @property
+    def quoted_through(self) -> date:
+        """The last session whose splits this price already reflects.
+
+        A raw feed prints a bar in its own day's shares, so no later split is in
+        it: its own session. A vendor-adjusted feed has rewritten the bar for
+        every split up to the day it was fetched (read in New York, where the
+        ex-date is a session), so that day — and adjusting a Yahoo bar again for
+        a split before it would divide by the ratio twice. Everything that
+        carries a price or a holding across a split starts from here.
+        """
+        if self.provider in VENDOR_ADJUSTED_PROVIDERS:
+            return max(self.session_date, self.ingested_at_utc.astimezone(US_EASTERN).date())
+        return self.session_date
+
+    @property
     def delay_seconds(self) -> float:
         """How long after closing the bar became knowable."""
         return (self.available_at_utc - self.bar_close_utc).total_seconds()
@@ -531,6 +546,35 @@ def knowledge_time(
     if ingested_at is not None and ingested_at > available:
         return ingested_at
     return available
+
+
+def action_knowledge_time(
+    *, effective_date: date, declared_date: date | None, observed: datetime
+) -> datetime:
+    """The latest moment a corporate action can still have been news.
+
+    The action side of `knowledge_time`, for the same reason. Both feeds
+    stamped every action with the moment it was fetched, and a backfill fetches
+    years of them at once, so a backtest at any earlier instant knew of no
+    split at all: its factor never applied, and a raw series carried a
+    4-for-1 through every feature as a 75% fall.
+
+    Public by the end of its declaration day where the feed gives one — New
+    York's day, where these are announced — and in any case by the start of
+    its ex-date, the session whose price it changes, which is fixed when the
+    action is announced. Both are bounds the market had certainly passed, never
+    a guess at something earlier; that line is the one `declared_date` exists
+    not to cross. And never later than we actually saw it, so an action fetched
+    before its ex-date is known from then.
+    """
+    candidates = [observed.astimezone(UTC), _new_york_midnight(effective_date)]
+    if declared_date is not None:
+        candidates.append(_new_york_midnight(declared_date + timedelta(days=1)))
+    return min(candidates)
+
+
+def _new_york_midnight(day: date) -> datetime:
+    return datetime.combine(day, time.min, tzinfo=US_EASTERN).astimezone(UTC)
 
 
 # --------------------------------------------------------------------------

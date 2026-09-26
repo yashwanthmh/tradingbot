@@ -102,11 +102,13 @@ class Series(StrEnum):
 class CorporateAction:
     """A dated, revisable fact about an instrument.
 
-    `known_at_utc` is when *we* learned it, which is the only thing an as-of
-    query may filter on. `declared_date` is when it became public and is
-    frequently unknown on free data — stored as None rather than imputed,
-    because a guessed declaration date is how a factor table acquires
-    information from the future.
+    `known_at_utc` is when it became knowable, which is the only thing an
+    as-of query may filter on: never later than when we learned it, and for an
+    action fetched after the fact, the latest moment it can still have been
+    news (`tb.data.provider.action_knowledge_time`). `declared_date` is when it
+    became public and is frequently unknown on free data — stored as None
+    rather than imputed, because a guessed declaration date is how a factor
+    table acquires information from the future.
     """
 
     action_id: str
@@ -329,6 +331,39 @@ def price_factor(actions: Iterable[CorporateAction], *, at: date, as_of: datetim
         complete=not inferred,
         missing=inferred,
     )
+
+
+def holding_factor(
+    actions: Iterable[CorporateAction], *, quoted_through: date, to: date
+) -> Fraction:
+    """Shares held now per share bought, carrying a holding between price scales.
+
+    A holding and its entry price are on the scale of `quoted_through` — the
+    last session whose splits that price reflected (`Bar.quoted_through`).
+    Marked against a price quoted through `to`, a 4-for-1 in between means four
+    shares for every one bought at a quarter of the price; without this a split
+    reads as a 75% loss. Backwards (`to` earlier, as at a seam onto a raw feed
+    from a vendor-adjusted one) the ratio inverts.
+
+    The account's side of a split, which is not the price path's, so there is
+    no `as_of`: shares change at the ex-date whether or not anyone had recorded
+    the action by then, and a factor filtered on knowledge time would book a
+    phantom loss for every split learned late. Each split counts at its newest
+    ratio, since a restated ratio corrects the record of what physically
+    happened. Inferred splits never count — a guess must not resize a holding
+    any more than it may scale a price.
+    """
+    newest: dict[tuple[str, str, str], CorporateAction] = {}
+    for action in actions:
+        held = newest.get(action.identity)
+        if held is None or action.known_at_utc >= held.known_at_utc:
+            newest[action.identity] = action
+    low, high = sorted((quoted_through, to))
+    ratio = Fraction(1)
+    for action in confirmed_only(effective_in(newest.values(), after=low, through=high)):
+        if action.action_type is ActionType.SPLIT:
+            ratio *= action.split_ratio
+    return ratio if to >= quoted_through else 1 / ratio
 
 
 def volume_factor(actions: Iterable[CorporateAction], *, at: date, as_of: datetime) -> Factor:

@@ -1264,7 +1264,11 @@ def data_regime(
     with _ledger(db, pinned) as ledger:
         store = _store(ledger, pinned, bars)
         gate = RegimeGate(limits=pinned.limits)
-        reading = gate.read(store, as_of=moment)
+        reading = gate.read(
+            store,
+            as_of=moment,
+            actions=ActionStore(ledger).actions_for(gate.instrument_uid),
+        )
 
         # Recorded on every read, not only on a change. The factor that was in
         # force at a decision time has to be recoverable from the ledger

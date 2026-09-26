@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -38,6 +38,7 @@ from tb.data.provider import (
     Resolution,
     Session,
     TimestampConvention,
+    action_knowledge_time,
     classify_us_session,
     knowledge_time,
     normalise_bar_open,
@@ -817,6 +818,26 @@ def test_yahoo_actions_keep_exact_integer_ratios_and_no_declared_date() -> None:
     # time in the past.
     assert split.declared_date is None
     assert by_type["cash_dividend"].gross_amount == Decimal("0.205")
+    # What is certain is that it was public by the start of its ex-date — an
+    # upper bound, never a guess at something earlier — so that, rather than
+    # the moment of a backfill years later, is when it was knowable.
+    assert split.known_at_utc == datetime(2020, 8, 31, 4, tzinfo=UTC)
+
+
+def test_an_action_seen_before_its_ex_date_is_known_from_when_it_was_seen() -> None:
+    """The bound is the earliest of when it was seen, the end of its declaration
+    day, and the start of its ex-date. A live fetch a week ahead of the ex-date
+    knows it then; a backfill years later knows it from when it was public."""
+    seen = datetime(2026, 3, 3, 15, tzinfo=UTC)
+    ex_date = date(2026, 3, 10)
+    assert action_knowledge_time(effective_date=ex_date, declared_date=None, observed=seen) == seen
+    assert action_knowledge_time(
+        effective_date=ex_date, declared_date=date(2026, 3, 1), observed=seen
+    ) == datetime(2026, 3, 2, 5, tzinfo=UTC)
+    years_later = datetime(2030, 1, 1, tzinfo=UTC)
+    assert action_knowledge_time(
+        effective_date=ex_date, declared_date=None, observed=years_later
+    ) == datetime(2026, 3, 10, 4, tzinfo=UTC)
 
 
 # --------------------------------------------------------------------------
@@ -1198,6 +1219,13 @@ def test_alpaca_splits_keep_exact_integer_ratios() -> None:
     # `known_at` a fact rather than "whenever we happened to look".
     assert forward.declared_date == "2020-07-30"
     assert dividend.gross_amount == Decimal("0.24")
+    # And `known_at` is taken from it: public by the end of that day in New
+    # York, not years later when a backfill fetched it — which hid every split
+    # from every backtest instant before the fetch.
+    assert forward.known_at_utc == datetime(2020, 7, 31, 4, tzinfo=UTC)
+    assert dividend.known_at_utc == datetime(2021, 1, 28, 5, tzinfo=UTC)
+    # With no declaration date, public by the start of its ex-date at the latest.
+    assert reverse.known_at_utc == datetime(2021, 1, 5, 5, tzinfo=UTC)
 
 
 def test_alpaca_prefers_the_ex_date_over_the_process_date() -> None:

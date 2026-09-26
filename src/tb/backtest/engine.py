@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 
 from tb.backtest import metrics as metrics_mod
@@ -43,6 +43,7 @@ from tb.backtest.costs import CostModel, Jurisdiction, RoundTrip
 from tb.backtest.metrics import CurvePoint, Metrics
 from tb.core.errors import TbError
 from tb.core.ids import new_id
+from tb.data.adjustments import CorporateAction, holding_factor
 from tb.data.asof import UNKNOWN, BarWindow, ForwardOnlyReader
 from tb.data.provider import Bar, Resolution
 from tb.features.pipeline import FeaturePipeline, FeatureSnapshot
@@ -154,7 +155,12 @@ class BacktestResult:
 
 @dataclass(slots=True)
 class _Position:
-    """Open position bookkeeping, in account currency."""
+    """Open position bookkeeping, in account currency.
+
+    `quantity` and `entry_price` are on the scale of `quoted_through`, the last
+    session whose splits they reflect; `_follow_splits` moves all three
+    together, so their product — the entry notional — never changes.
+    """
 
     instrument_uid: str
     quantity: Decimal
@@ -165,6 +171,7 @@ class _Position:
     entry_breakdown: Mapping[str, str]
     expected_edge_bps: Decimal
     expected_cost_bps: Decimal
+    quoted_through: date
 
     def to_state(self) -> PositionState:
         return PositionState(
@@ -188,6 +195,13 @@ class Backtester:
     # Set by the caller from the spec; the risk layer's own minimum is a
     # separate and stricter check applied in M4.
     min_holding_minutes: int = 0
+    # Each instrument's corporate actions, unfiltered — the pipeline applies
+    # the knowledge-time filter itself, and a holding follows a split whether
+    # or not anyone had recorded it (`holding_factor`). Empty is right only
+    # for series that cannot split, like the calibration's random walk: over
+    # real history, leaving it out turns every split into a 75% "loss" inside
+    # any holding across it and a step in every feature across it.
+    actions: Mapping[str, Sequence[CorporateAction]] = field(default_factory=dict)
 
     _trades: list[Trade] = field(default_factory=list, init=False)
     _curve: list[CurvePoint] = field(default_factory=list, init=False)
@@ -236,6 +250,7 @@ class Backtester:
 
         for index, moment in enumerate(decision_times):
             window = reader.advance_to(moment)
+            self._follow_splits(open_positions, window)
 
             # --- fill what the previous step decided ----------------------
             for decision in pending:
@@ -272,7 +287,7 @@ class Backtester:
                 break
 
             for uid in sorted(self.instruments):
-                snapshot = self.pipeline.compute(window, uid)
+                snapshot = self.pipeline.compute(window, uid, actions=self.actions.get(uid, ()))
                 position = open_positions.get(uid)
                 decision = strategy.decide(
                     snapshot=snapshot,
@@ -371,6 +386,7 @@ class Backtester:
                 decision=decision,
                 price=price,
                 at=fill_bar.bar_open_utc,
+                quoted_through=fill_bar.quoted_through,
                 meta=meta,
                 open_positions=open_positions,
             )
@@ -390,6 +406,7 @@ class Backtester:
         decision: Decision,
         price: Decimal,
         at: datetime,
+        quoted_through: date,
         meta: InstrumentMeta,
         open_positions: dict[str, _Position],
     ) -> tuple[Decimal, Decimal, None]:
@@ -418,6 +435,7 @@ class Backtester:
             entry_breakdown=leg.itemised(),
             expected_edge_bps=decision.expected_edge_bps,
             expected_cost_bps=trip.total_bps,
+            quoted_through=quoted_through,
         )
         return leg.total_ccy, notional, None
 
@@ -471,6 +489,38 @@ class Backtester:
             exit_reason=decision.rationale,
         )
         return leg.total_ccy, exit_notional, trade
+
+    # -- splits ------------------------------------------------------------
+
+    def _follow_splits(self, open_positions: Mapping[str, _Position], window: BarWindow) -> None:
+        """Carry each open holding onto the scale of its newest visible price.
+
+        Run as each step's window arrives, before anything fills or is marked
+        against it. A 4-for-1 between entry and exit leaves four shares for each
+        one bought, at a quarter of the price; without this the exit notional
+        was the old share count at the new price — a 75% loss on a trade that
+        made nothing, in every backtest holding across a split, which the
+        search would then learn to avoid as though it were a signal. Quantity
+        and entry price move in step, so the entry notional, and the cost
+        already charged on it, stand.
+        """
+        for uid, position in open_positions.items():
+            newest = window.last(uid)
+            if newest is UNKNOWN or not isinstance(newest, Bar):
+                continue
+            to = newest.quoted_through
+            if to == position.quoted_through:
+                continue
+            ratio = holding_factor(
+                self.actions.get(uid, ()), quoted_through=position.quoted_through, to=to
+            )
+            if ratio != 1:
+                with localcontext() as ctx:
+                    ctx.prec = _WORKING_PRECISION
+                    shares, per = Decimal(ratio.numerator), Decimal(ratio.denominator)
+                    position.quantity = position.quantity * shares / per
+                    position.entry_price = position.entry_price * per / shares
+            position.quoted_through = to
 
     # -- marking -----------------------------------------------------------
 

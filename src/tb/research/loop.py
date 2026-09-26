@@ -69,6 +69,7 @@ from tb.config.hard_limits import HardLimits
 from tb.core.clock import now_utc
 from tb.core.errors import TbError
 from tb.core.ids import new_id
+from tb.data.adjustments import CorporateAction
 from tb.data.asof import BarSource, HoldoutViolation
 from tb.data.provider import Resolution
 from tb.data.regime import RegimeGate
@@ -238,6 +239,9 @@ class ResearchCycle:
 
         costs = CostModel(self._limits)
         meta = {uid: InstrumentMeta(uid, "USD", Jurisdiction.US) for uid in uids}
+        # The actions the vintage was sealed with: every candidate is judged on
+        # the same adjusted history, and a re-run of the search sees it again.
+        actions = self._snapshots.actions_of(vintage_id)
 
         def evaluate(spec: StrategySpec) -> BacktestResult:
             # A fresh reader per spec: the reader is forward-only and stateful,
@@ -248,6 +252,7 @@ class ResearchCycle:
                 pipeline=pipeline_from_spec(spec),
                 instruments=meta,
                 min_holding_minutes=spec.min_holding_minutes,
+                actions=actions,
             )
             return engine.run(
                 strategy=DslStrategy(spec=spec, strategy_id=strategy_id_for(spec.spec_hash)),
@@ -278,6 +283,7 @@ class ResearchCycle:
                         source,
                         sealed_from=window.sealed_from,
                         as_of=schedule[-1],
+                        actions=actions.get(RegimeGate(self._limits).instrument_uid, ()),
                     ),
                     n_trials=budget.n_trials,
                     required_sharpe=required_sharpe(
@@ -578,6 +584,7 @@ def training_regime(
     *,
     sealed_from: datetime,
     as_of: datetime,
+    actions: Sequence[CorporateAction] = (),
 ) -> RegimeDescription:
     """The market's state at a training instant, reduced to one word.
 
@@ -600,6 +607,7 @@ def training_regime(
     reading = RegimeGate(limits).read(
         SealedBarSource(inner=source, sealed_from=sealed_from),
         as_of=as_of,
+        actions=actions,
     )
     return RegimeDescription.from_reading(reading)
 
