@@ -27,7 +27,7 @@ from decimal import Decimal
 from tb.broker.port import OrderPurpose, Side
 from tb.config.loader import load_hard_limits
 from tb.risk.engine import RiskEngine
-from tb.risk.state import AccountState, OrderRequest, RiskContext
+from tb.risk.state import AccountState, OrderRequest, RiskContext, Verdict
 from tb.strategy.base import Action
 
 LIMITS = load_hard_limits(None).limits
@@ -190,3 +190,19 @@ def test_both_causes_together_still_reach_the_minimum_ticket() -> None:
     assert evaluation.approved, evaluation.refusal_summary
     assert evaluation.approved_notional_ccy is not None
     assert evaluation.approved_notional_ccy >= FLOOR
+
+
+def test_the_cost_rule_records_the_ratio_its_limit_bounds() -> None:
+    """A verdict row pairs an observed value with its limit so the margin can be
+    queried. The cost rule recorded the round-trip cost in bps against a limit
+    that is a cost-to-edge ratio: 40 against 0.33, on a trade that passed at
+    about 0.09."""
+    evaluation = RiskEngine().evaluate(
+        _context(regime_factor=Decimal(1), equity=Decimal("10000.00")), run_id="run_sizing"
+    )
+    (cost,) = [verdict for verdict in evaluation.verdicts if verdict.rule_name == "cost_to_edge"]
+
+    assert cost.verdict is Verdict.PASS, cost.detail
+    observed = Decimal(str(cost.observed_value))
+    assert Decimal("0.08") < observed < Decimal("0.10")
+    assert observed < Decimal(str(cost.limit_value))

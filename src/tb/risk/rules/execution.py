@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from tb.backtest.costs import CostModel, jurisdiction_from_isin
+from tb.backtest.costs import CostModel, CostVerdict, jurisdiction_from_isin
 from tb.risk.state import RiskContext, RuleVerdict, Verdict
 
 
@@ -87,7 +87,7 @@ class CostToEdgeRule:
                 self.name,
                 Verdict.BLOCK,
                 detail=verdict.reason,
-                observed_value=verdict.expected_cost_bps,
+                observed_value=_ratio(verdict),
                 limit_value=max_ratio,
             )
         return RuleVerdict(
@@ -95,11 +95,25 @@ class CostToEdgeRule:
             Verdict.PASS,
             detail=(
                 f"{round_trip.total_bps:.1f}bps round trip against a {edge}bps declared "
-                f"edge (ratio {verdict.ratio}, limit {max_ratio})"
+                f"edge (ratio {_ratio(verdict)}, limit {max_ratio})"
             ),
-            observed_value=verdict.expected_cost_bps,
+            observed_value=_ratio(verdict),
             limit_value=max_ratio,
         )
+
+
+def _ratio(verdict: CostVerdict) -> Decimal | str:
+    """What the limit bounds: cost over edge, not cost alone.
+
+    The verdict row pairs an observed value with its limit so the margin is
+    queryable, and this rule recorded the cost in bps against a limit that is
+    a ratio — 40 against 0.33, on a trade that passed at 0.09. Where the gate
+    refused before dividing (an edge above the ceiling, say) there is no ratio,
+    and the row says what it had instead of inventing one.
+    """
+    if verdict.ratio is None:
+        return f"{verdict.expected_cost_bps}bps cost, {verdict.expected_edge_bps}bps edge"
+    return verdict.ratio.quantize(Decimal("0.0001"))
 
 
 @dataclass(frozen=True, slots=True)
