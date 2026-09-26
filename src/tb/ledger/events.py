@@ -231,6 +231,10 @@ class EventType(StrEnum):
     BACKUP_CREATED = "backup.created"
     BACKUP_RESTORED = "backup.restored"
     BACKUP_RESTORE_VERIFIED = "backup.restore_verified"
+    # A safety mechanism fired on purpose, with positions open in market
+    # hours, and what was seen at the broker before and after.
+    DRILL_STARTED = "drill.started"
+    DRILL_COMPLETED = "drill.completed"
 
 
 class EventPayload(BaseModel):
@@ -1503,6 +1507,39 @@ class BackupRestoreVerifiedPayload(EventPayload):
     n_fills_replayed: int = 0
 
 
+class DrillStartedPayload(EventPayload):
+    """A drill's preconditions, as observed before anything was fired.
+
+    `holdings` is the broker's word, not the ledger's: each held position with
+    the quantity its working stops cover. A drill whose point is that stopping
+    the bot leaves positions protected has to record what was protected first.
+    """
+
+    drill_id: str
+    kind: str
+    run_id: str
+    mode: str
+    pid: int
+    host: str
+    session_date: str
+    market_open: bool
+    holdings: list[dict[str, str]] = Field(default_factory=list)
+    detail: str = ""
+
+
+class DrillCompletedPayload(EventPayload):
+    """How a drill ended: what fired, how fast the loop stopped, what was left."""
+
+    drill_id: str
+    kind: str
+    run_id: str
+    passed: bool
+    halted_after_seconds: float | None = None
+    failures: list[str] = Field(default_factory=list)
+    observations: list[str] = Field(default_factory=list)
+    holdings_after: list[dict[str, str]] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------
@@ -1584,6 +1621,8 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.BACKUP_CREATED: BackupCreatedPayload,
     EventType.BACKUP_RESTORED: BackupRestoredPayload,
     EventType.BACKUP_RESTORE_VERIFIED: BackupRestoreVerifiedPayload,
+    EventType.DRILL_STARTED: DrillStartedPayload,
+    EventType.DRILL_COMPLETED: DrillCompletedPayload,
 }
 
 # The default aggregate each event type is filed under, so callers do not have
@@ -1682,6 +1721,8 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     EventType.BACKUP_CREATED: AggregateType.LEDGER,
     EventType.BACKUP_RESTORED: AggregateType.LEDGER,
     EventType.BACKUP_RESTORE_VERIFIED: AggregateType.LEDGER,
+    EventType.DRILL_STARTED: AggregateType.SAFETY,
+    EventType.DRILL_COMPLETED: AggregateType.SAFETY,
 }
 
 

@@ -15,6 +15,10 @@
     tb backup receipt FILE          bring that proof home, where the gate reads it
     tb backup list                  the backups made and the restores reported
 
+    tb drill killswitch             engage the switch on a running demo loop
+    tb drill watchdog               freeze the loop until the watchdog notices
+    tb drill list                   every drill, and whether it passed
+
 The streak `tb sessions` prints is the number `tb arm --live` will count,
 computed by the same function from the same ledger, so what an operator reads
 here is what the gate will see. The journal is the same record written down:
@@ -25,7 +29,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Annotated
 
@@ -34,9 +38,13 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from tb.broker.t212.client import T212Client
+from tb.broker.t212.errors import AuthError, BrokerError
+from tb.broker.t212.ratelimit import RateGovernor
 from tb.config.loader import PinnedLimits, load_hard_limits
 from tb.core.clock import now_utc
 from tb.core.errors import TbError
+from tb.core.ids import new_run_id
 from tb.data.calendar import TradingCalendar
 from tb.ledger.anchor import GitAnchorSink, anchor_head
 from tb.ledger.store import Ledger, default_ledger_path
@@ -52,6 +60,7 @@ from tb.ops.backup import (
     verified_restores,
     verify_backup,
 )
+from tb.ops.drills import DrillError, DrillKind, DrillResult, DrillWorld, drills, run_drill
 from tb.ops.journal import (
     DEFAULT_DIR,
     HEADS_FILE,
@@ -85,6 +94,7 @@ _VERDICT_STYLE = {
     SessionVerdict.FAULTED: "[red]faulted[/red]",
     SessionVerdict.INCOMPLETE: "[yellow]incomplete[/yellow]",
     SessionVerdict.IN_PROGRESS: "[dim]in progress[/dim]",
+    SessionVerdict.DRILL: "[cyan]drill[/cyan]",
 }
 
 
@@ -590,3 +600,168 @@ def backup_list(db: DbOpt = None) -> None:
             f"{counted}",
             soft_wrap=True,
         )
+
+
+# --------------------------------------------------------------------------
+# tb drill
+# --------------------------------------------------------------------------
+
+drill_app = typer.Typer(
+    help="Fire the kill switch or the watchdog on purpose, and record what happened.",
+    no_args_is_help=True,
+)
+
+HaltWithinOpt = Annotated[
+    int,
+    typer.Option(
+        "--halt-within",
+        min=10,
+        help="Seconds the loop has to stop once the switch is engaged.",
+    ),
+]
+
+
+def _drill(
+    kind: DrillKind,
+    *,
+    limits: Path | None,
+    db: Path | None,
+    halt_within: int,
+    notice_within: int | None,
+) -> None:
+    pinned = _load(limits)
+    safety = pinned.limits.safety
+    with _ledger(db, writer=pinned) as ledger:
+        state_dir = Path(safety.kill_switch_path).parent
+        try:
+            client = T212Client.from_env(
+                governor=RateGovernor(state_path=state_dir / "ratelimit.json"),
+                ledger=ledger,
+                run_id=new_run_id(),
+                require_demo=True,
+            )
+        except AuthError as exc:
+            err_console.print(
+                f"{BAD} {escape(str(exc))}. A drill reads positions and stops from the "
+                "demo account, so it needs T212_DEMO_API_KEY.",
+                soft_wrap=True,
+            )
+            raise typer.Exit(2) from exc
+        world = DrillWorld(
+            ledger=ledger,
+            broker=client,
+            kill_switch_path=Path(safety.kill_switch_path),
+            heartbeat_path=Path(safety.heartbeat_path),
+        )
+        try:
+            result = run_drill(
+                world,
+                kind,
+                halt_within=timedelta(seconds=halt_within),
+                notice_within=timedelta(
+                    seconds=notice_within or safety.heartbeat_stale_seconds + 120
+                ),
+                cycling_within=timedelta(seconds=pinned.limits.live.session_max_cycle_gap_seconds),
+            )
+        except DrillError as exc:
+            err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+            raise typer.Exit(2) from exc
+        except BrokerError as exc:
+            err_console.print(
+                f"{BAD} the demo account could not be read: {escape(str(exc))}", soft_wrap=True
+            )
+            raise typer.Exit(2) from exc
+        finally:
+            client.close()
+    _print_drill(result)
+
+
+def _print_drill(result: DrillResult) -> None:
+    marker = OK if result.passed else BAD
+    console.print(
+        f"{marker} {result.kind.value} drill {result.drill_id} on run {result.run_id}: "
+        + ("passed" if result.passed else "failed")
+    )
+    for line in result.observations:
+        console.print(f"  {OK} {escape(line)}", soft_wrap=True)
+    for line in result.failures:
+        console.print(f"  {BAD} {escape(line)}", soft_wrap=True)
+    console.print(
+        "\nThe kill switch is engaged and the loop has stopped. Resuming is your call: "
+        "`tb resume --reason '...'`, then `tb run --mode demo`."
+    )
+    if not result.passed:
+        raise typer.Exit(1)
+
+
+@drill_app.command("killswitch")
+def drill_killswitch(
+    halt_within: HaltWithinOpt = 300,
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """Engage the kill switch on the running demo loop, with positions open.
+
+    Passes when the loop halts, sends nothing after the switch, and every
+    position still has its stop at the broker.
+    """
+    _drill(DrillKind.KILL_SWITCH, limits=limits, db=db, halt_within=halt_within, notice_within=None)
+
+
+@drill_app.command("watchdog")
+def drill_watchdog(
+    halt_within: HaltWithinOpt = 300,
+    notice_within: Annotated[
+        int | None,
+        typer.Option(
+            "--notice-within",
+            min=10,
+            help="Seconds the watchdog has to notice. Default: its stale bound plus two minutes.",
+            show_default=False,
+        ),
+    ] = None,
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """Freeze the running demo loop until the watchdog notices, then thaw it.
+
+    Needs `tb watchdog` running, and runs on the loop's own host. Passes when
+    the watchdog engages the switch, the thawed loop halts on it, nothing is
+    sent after the freeze, and every position still has its stop.
+    """
+    _drill(
+        DrillKind.WATCHDOG,
+        limits=limits,
+        db=db,
+        halt_within=halt_within,
+        notice_within=notice_within,
+    )
+
+
+@drill_app.command("list")
+def drill_list(db: DbOpt = None) -> None:
+    """Every drill in the ledger, and whether it passed."""
+    with _ledger(db) as ledger:
+        records = drills(ledger)
+    if not records:
+        console.print(f"{WARN} no drills recorded. `tb drill killswitch` runs one.")
+        return
+    table = Table("drill", "kind", "started", "run", "mode", "held", "outcome", title="drills")
+    for record in records:
+        outcome = (
+            "[green]passed[/green]"
+            if record.passed
+            else "[yellow]never completed[/yellow]"
+            if record.completed_at is None
+            else "[red]failed[/red]: " + escape("; ".join(record.failures))
+        )
+        table.add_row(
+            record.drill_id,
+            record.kind,
+            f"{record.started_at:%Y-%m-%d %H:%M}",
+            record.run_id,
+            record.mode,
+            str(record.n_holdings),
+            outcome,
+        )
+    console.print(table)

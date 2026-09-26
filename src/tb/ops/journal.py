@@ -742,6 +742,18 @@ _SAFETY_LINES: dict[EventType, Callable[[dict[str, Any]], str]] = {
     EventType.POSITION_ORPHANED: lambda p: (
         f"{p.get('t212_ticker')} orphaned: {p.get('reason')}; {p.get('action_taken')}"
     ),
+    EventType.DRILL_STARTED: lambda p: (
+        f"{p.get('kind')} drill {p.get('drill_id')} started on run {p.get('run_id')} with "
+        f"{len(p.get('holdings', []))} position(s) held"
+    ),
+    EventType.DRILL_COMPLETED: lambda p: (
+        f"{p.get('kind')} drill {p.get('drill_id')} "
+        + (
+            "passed"
+            if p.get("passed")
+            else "failed: " + "; ".join(str(f) for f in p.get("failures", []))
+        )
+    ),
 }
 
 _DATA_LINES: dict[EventType, Callable[[dict[str, Any]], str]] = {

@@ -19,9 +19,12 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
+from typer.testing import CliRunner
 
+from tb.cli import app
 from tb.ledger.store import Ledger
 from tb.ops.killswitch import read_kill_switch, write_heartbeat
 from tb.ops.watchdog import (
@@ -126,6 +129,46 @@ def test_the_watchdog_records_why_it_tripped(paths: dict[str, Path], ledger: Led
     ).fetchall()
     assert len(rows) == 1
     assert "watchdog_to_trader" in rows[0]["payload_json"]
+
+
+def test_a_pass_that_does_not_record_still_engages_the_switch(
+    paths: dict[str, Path], ledger: Ledger
+) -> None:
+    """Fail-closed every pass; recorded once per episode by the caller's choice."""
+    verdict = _watchdog(paths, ledger).check(record=False)
+    assert verdict.tripped
+    assert not read_kill_switch(paths["kill"]).may_trade
+    trips = ledger.conn.execute(
+        "SELECT COUNT(*) FROM event_log WHERE event_type = 'watchdog.tripped'"
+    ).fetchone()[0]
+    assert trips == 0
+
+
+def test_tb_watchdog_records_one_trip_per_stale_episode(env: dict[str, Any]) -> None:
+    """A trader stopped overnight must not leave a trip event every fifteen seconds."""
+    with Ledger(env["db"]) as ledger:
+        ledger.initialise(created_by="test")
+    result = CliRunner().invoke(
+        app,
+        [
+            "watchdog",
+            "--limits",
+            str(env["limits"]),
+            "--db",
+            str(env["db"]),
+            "--cycles",
+            "3",
+            "--interval",
+            "0",
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    assert "tripped on 3 of 3" in result.output
+    with Ledger(env["db"]) as ledger:
+        trips = ledger.conn.execute(
+            "SELECT COUNT(*) FROM event_log WHERE event_type = 'watchdog.tripped'"
+        ).fetchone()[0]
+    assert trips == 1
 
 
 def test_the_watchdog_writes_its_own_liveness_before_deciding(

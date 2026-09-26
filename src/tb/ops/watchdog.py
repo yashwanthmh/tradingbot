@@ -114,7 +114,7 @@ class Watchdog:
     stale_after_seconds: int
     ledger: Ledger | None = None
 
-    def check(self, *, at: datetime | None = None) -> WatchdogVerdict:
+    def check(self, *, at: datetime | None = None, record: bool = True) -> WatchdogVerdict:
         """One supervision pass.
 
         Writes the watchdog's own liveness *first*, before deciding anything.
@@ -122,6 +122,13 @@ class Watchdog:
         still be able to tell that the watchdog was alive up to that moment,
         or a bug in this function would look identical to a dead watchdog and
         halt a perfectly healthy trader.
+
+        A stale heartbeat engages the switch on every pass — cheap, idempotent,
+        and fail-closed if someone releases it while the trader is still
+        silent — but `record=False` leaves the ledger alone. A supervisor
+        passes it for every pass after the first in one stale episode, or a
+        trader stopped overnight would leave a trip event every fifteen
+        seconds until morning.
         """
         moment = at or now_utc()
         self.note_alive(at=moment)
@@ -156,7 +163,8 @@ class Watchdog:
             limit_seconds=self.stale_after_seconds,
             action_taken=action,
         )
-        self._record(verdict, direction="watchdog_to_trader")
+        if record:
+            self._record(verdict, direction="watchdog_to_trader")
         return verdict
 
     def note_alive(self, *, at: datetime | None = None) -> None:

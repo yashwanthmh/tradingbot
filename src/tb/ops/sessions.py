@@ -42,6 +42,13 @@ first, stopping at the first judged session that was not clean. A faulted or
 incomplete session resets it; one still being judged neither counts nor breaks
 it.
 
+**Drills** (`tb drill`) halt the loop on purpose. The halt, the kill switch and
+the watchdog trip inside a passed drill's window are the drill's, filed as
+notes, and a session with a passed drill in it is judged `drill`: neither clean
+nor a break, since the loop was stopped by design and not by fault. A failed
+drill is a fault, and so is anything a drill does not cause — a stop that
+fails to land during one is exactly what the drill exists to find.
+
 Not attributed: `tb reconcile`, an operator's check against whichever account
 its key reaches, records no mode, so its verdict cannot be pinned on one.
 """
@@ -96,9 +103,15 @@ _READ = frozenset(
         EventType.INSTANCE_LOCK_REFUSED,
         EventType.BROKER_RATE_LIMITED,
         EventType.DATA_STALENESS_BREACH,
+        EventType.DRILL_STARTED,
+        EventType.DRILL_COMPLETED,
         *_SETTLING,
     }
 )
+
+# What a drill causes on purpose, and so what a passed drill's window excuses.
+# Nothing else is excused: a protection failure mid-drill is the finding.
+_DRILLED = frozenset({"halted", "halt_raised", "kill_switch", "watchdog"})
 
 
 class FaultKind(StrEnum):
@@ -115,6 +128,7 @@ class FaultKind(StrEnum):
     PROTECTION_FAILED = "protection_failed"
     UNPROTECTED_TOO_LONG = "unprotected_too_long"
     ORDER_UNKNOWN = "order_unknown"
+    DRILL_FAILED = "drill_failed"
 
 
 class NoteKind(StrEnum):
@@ -127,6 +141,7 @@ class NoteKind(StrEnum):
     RATE_LIMITED = "rate_limited"
     STALE_DATA = "stale_data"
     SETTLEMENT_DEFERRED = "settlement_deferred"
+    DRILL = "drill"
 
 
 class SessionVerdict(StrEnum):
@@ -134,6 +149,7 @@ class SessionVerdict(StrEnum):
     FAULTED = "faulted"
     INCOMPLETE = "incomplete"
     IN_PROGRESS = "in_progress"
+    DRILL = "drill"
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,7 +226,7 @@ class ModeRecord:
         """Consecutive clean sessions up to the newest judged one, oldest first."""
         run: list[SessionHealth] = []
         for session in reversed(self.sessions):
-            if not session.judged:
+            if not session.judged or session.verdict is SessionVerdict.DRILL:
                 continue
             if not session.clean:
                 break
@@ -290,6 +306,46 @@ class _Bucket:
     n_trades_closed: int = 0
     faults: list[Finding] = field(default_factory=list)
     notes: list[Finding] = field(default_factory=list)
+    drilled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Drill:
+    drill_id: str
+    kind: str
+    run_id: str
+    started_at: datetime
+    completed_at: datetime | None
+    passed: bool
+
+    def covers(self, run_id: str, at: datetime) -> bool:
+        return (
+            self.passed
+            and self.completed_at is not None
+            and run_id == self.run_id
+            and self.started_at <= at <= self.completed_at
+        )
+
+
+def _drills(events: Sequence[_Event]) -> list[_Drill]:
+    started: dict[str, _Event] = {}
+    completed: dict[str, _Event] = {}
+    for event in events:
+        if event.type is EventType.DRILL_STARTED:
+            started[str(event.payload["drill_id"])] = event
+        elif event.type is EventType.DRILL_COMPLETED:
+            completed[str(event.payload["drill_id"])] = event
+    return [
+        _Drill(
+            drill_id=drill_id,
+            kind=str(start.payload.get("kind")),
+            run_id=str(start.payload.get("run_id")),
+            started_at=start.at,
+            completed_at=completed[drill_id].at if drill_id in completed else None,
+            passed=drill_id in completed and bool(completed[drill_id].payload.get("passed")),
+        )
+        for drill_id, start in started.items()
+    ]
 
 
 def read_sessions(
@@ -331,10 +387,12 @@ def read_all_sessions(
         raise ValueError(f"no such trading mode: {unknown[0]!r}; one of {', '.join(TRADING_MODES)}")
     events = [_parse(row) for row in ledger.iter_events(end_seq=through_seq, event_types=_READ)]
     runs = _runs(events)
+    drills = _drills(events)
     cal = calendar or TradingCalendar()
     moment = now or now_utc()
     return {
-        mode: _record(mode, events, runs, limits=limits, cal=cal, moment=moment) for mode in modes
+        mode: _record(mode, events, runs, drills, limits=limits, cal=cal, moment=moment)
+        for mode in modes
     }
 
 
@@ -354,6 +412,7 @@ def _record(
     mode: str,
     events: Sequence[_Event],
     runs: dict[str, _Run],
+    drills: Sequence[_Drill],
     *,
     limits: LiveLimits,
     cal: TradingCalendar,
@@ -420,7 +479,7 @@ def _record(
         if home is None:
             continue
         sink = buckets.get(home.day) or _Bucket(day=home)
-        _attribute(event, who, sink, limits=limits)
+        _attribute(event, who, sink, limits=limits, drills=drills)
         # Counts and notes land only in a session the mode ran; a fault brings
         # its session into being, so a crash on a Sunday breaks Monday even if
         # nothing ran on Monday.
@@ -583,11 +642,26 @@ def _runs(events: Iterable[_Event]) -> dict[str, _Run]:
     return runs
 
 
-def _attribute(event: _Event, run: _Run, target: _Bucket, *, limits: LiveLimits) -> None:
+def _attribute(
+    event: _Event,
+    run: _Run,
+    target: _Bucket,
+    *,
+    limits: LiveLimits,
+    drills: Sequence[_Drill] = (),
+) -> None:
     """File one event under its session: a count, a fault or a note."""
     p = event.payload
 
     def fault(kind: FaultKind, detail: str) -> None:
+        if kind.value in _DRILLED:
+            drill = next((d for d in drills if d.covers(run.run_id, event.at)), None)
+            if drill is not None:
+                target.drilled = True
+                note(
+                    NoteKind.DRILL, f"{kind.value} in {drill.kind} drill {drill.drill_id}: {detail}"
+                )
+                return
         target.faults.append(
             Finding(kind=kind, at=event.at, seq=event.seq, run_id=run.run_id, detail=detail)
         )
@@ -652,6 +726,16 @@ def _attribute(event: _Event, run: _Run, target: _Bucket, *, limits: LiveLimits)
                 )
         case EventType.TRADE_CLOSED:
             target.n_trades_closed += 1
+        case EventType.DRILL_COMPLETED:
+            if p.get("passed"):
+                target.drilled = True
+                note(NoteKind.DRILL, f"{p.get('kind')} drill {p.get('drill_id')} passed")
+            else:
+                fault(
+                    FaultKind.DRILL_FAILED,
+                    f"{p.get('kind')} drill {p.get('drill_id')} failed: "
+                    + "; ".join(str(f) for f in p.get("failures", [])),
+                )
         case EventType.ORDER_REJECTED:
             said = p.get("broker_message")
             note(
@@ -703,6 +787,8 @@ def _judge(
         verdict = SessionVerdict.FAULTED
     elif now < day.close_utc + silence:
         verdict = SessionVerdict.IN_PROGRESS
+    elif bucket.drilled:
+        verdict = SessionVerdict.DRILL
     elif pct < limits.session_min_coverage_pct:
         verdict = SessionVerdict.INCOMPLETE
     else:

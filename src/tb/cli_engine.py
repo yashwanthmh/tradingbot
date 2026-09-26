@@ -370,8 +370,12 @@ def watchdog(
 
         tripped = 0
         checked = 0
+        # One stale episode, one trip in the ledger: the switch is re-engaged
+        # every pass, but only the first pass of an episode records it.
+        in_episode = False
         while cycles == 0 or checked < cycles:
-            verdict = dog.check()
+            verdict = dog.check(record=not in_episode)
+            in_episode = verdict.tripped
             checked += 1
             if verdict.tripped:
                 tripped += 1
