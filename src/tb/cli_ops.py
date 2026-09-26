@@ -23,6 +23,9 @@
     tb arm --live --strategy S      arm real money, once all of it is in the ledger
     tb disarm --reason R            end an arming; a live run halts next cycle
 
+    tb alerts                       what is new since the last pass, delivered
+    tb alerts --follow              ...every --interval seconds, beside the loop
+
 The streak `tb sessions` prints is the number `tb arm --live` will count,
 computed by the same function from the same ledger, so what an operator reads
 here is what the gate will see. The journal is the same record written down:
@@ -52,6 +55,17 @@ from tb.core.ids import new_run_id
 from tb.data.calendar import TradingCalendar
 from tb.ledger.anchor import GitAnchorSink, anchor_head
 from tb.ledger.store import Ledger, default_ledger_path
+from tb.ops.alerts import (
+    STATE_FILE,
+    WEBHOOK_ENV,
+    AlertError,
+    ConsoleSink,
+    FileSink,
+    Severity,
+    Sink,
+    WebhookSink,
+    run_pass,
+)
 from tb.ops.arming import (
     ArmingError,
     arm_live,
@@ -896,3 +910,108 @@ def disarm_command(
             f"{OK} disarmed {ended}. A running live loop halts at its next cycle; its stops "
             "stay at the broker."
         )
+
+
+# --------------------------------------------------------------------------
+# tb alerts
+# --------------------------------------------------------------------------
+
+
+def alerts_command(
+    follow: Annotated[
+        bool, typer.Option("--follow", help="Keep going, one pass every --interval seconds.")
+    ] = False,
+    interval: Annotated[
+        float, typer.Option("--interval", min=1.0, help="Seconds between passes.")
+    ] = 30.0,
+    sinks: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--sink",
+            help=f"console, file or webhook (URL from {WEBHOOK_ENV}). Repeatable.",
+            show_default=False,
+        ),
+    ] = None,
+    file: Annotated[
+        Path | None,
+        typer.Option("--file", help="Where the file sink appends. Default: beside the state."),
+    ] = None,
+    min_severity: Annotated[
+        str, typer.Option("--min-severity", help="info, warning or critical.")
+    ] = "warning",
+    passes: Annotated[
+        int, typer.Option("--passes", min=0, help="Stop after this many passes. 0: never.")
+    ] = 0,
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """Deliver what the ledger says a person must act on: halts, faults, drills, arming.
+
+    Read-only against the ledger. Its cursor lives beside the kill switch, and
+    a first run starts from now: history is not news.
+    """
+    try:
+        floor = Severity(min_severity)
+    except ValueError as exc:
+        err_console.print(f"{BAD} --min-severity is info, warning or critical.", soft_wrap=True)
+        raise typer.Exit(2) from exc
+    pinned = _load(limits)
+    state_dir = Path(pinned.limits.safety.kill_switch_path).parent
+    chosen = list(dict.fromkeys(sinks or ["console"]))
+    built: list[Sink] = []
+    for name in chosen:
+        if name == "console":
+            built.append(
+                ConsoleSink(write=lambda line: console.print(escape(line), soft_wrap=True))
+            )
+        elif name == "file":
+            built.append(FileSink(path=file or state_dir / "alerts.jsonl"))
+        elif name == "webhook":
+            from tb.core.http import HttpxTransport
+
+            try:
+                built.append(WebhookSink.from_env(HttpxTransport()))
+            except AlertError as exc:
+                err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+                raise typer.Exit(2) from exc
+        else:
+            err_console.print(
+                f"{BAD} unknown sink {name!r}: console, file or webhook.", soft_wrap=True
+            )
+            raise typer.Exit(2)
+
+    import time
+
+    done = 0
+    with _ledger(db) as ledger:
+        while True:
+            try:
+                result = run_pass(
+                    ledger,
+                    state_path=state_dir / STATE_FILE,
+                    sinks=built,
+                    limits=pinned.limits.live,
+                    min_severity=floor,
+                )
+            except AlertError as exc:
+                # Not delivered, so not marked delivered: the next pass offers
+                # it again. Said on stderr, where the operator's service
+                # manager keeps what went wrong.
+                err_console.print(f"{BAD} {escape(str(exc))}; retrying next pass", soft_wrap=True)
+                if not follow:
+                    raise typer.Exit(1) from exc
+            else:
+                if result.started_fresh:
+                    console.print(
+                        f"{OK} alerting from seq {result.cursor} on; what came before is "
+                        "history, not news."
+                    )
+                elif not follow:
+                    console.print(
+                        f"{OK} {len(result.delivered)} alert(s) delivered, "
+                        f"{result.suppressed} repeat(s) held back, read to seq {result.cursor}."
+                    )
+            done += 1
+            if not follow or (passes and done >= passes):
+                return
+            time.sleep(interval)

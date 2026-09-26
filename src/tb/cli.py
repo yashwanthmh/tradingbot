@@ -100,6 +100,7 @@ app.add_typer(ml_app, name="ml")
 # M8: operating it. Which sessions ran cleanly is the first question an
 # operator asks each morning and the one the live gate counts.
 from tb.cli_ops import (  # noqa: E402
+    alerts_command,
     arm_command,
     backup_app,
     disarm_command,
@@ -111,6 +112,7 @@ from tb.cli_ops import (  # noqa: E402
 app.command("sessions")(sessions_command)
 app.command("arm")(arm_command)
 app.command("disarm")(disarm_command)
+app.command("alerts")(alerts_command)
 app.add_typer(journal_app, name="journal")
 app.add_typer(backup_app, name="backup")
 app.add_typer(drill_app, name="drill")
