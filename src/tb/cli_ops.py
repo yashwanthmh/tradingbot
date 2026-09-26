@@ -582,7 +582,9 @@ def backup_receipt(
         console.print(
             f"{WARN} it was restored on the machine that made it. That proves the files are "
             "intact, not that the state survives losing this machine, so the live gate does "
-            "not count it. Restore on another machine."
+            "not count it. Restore on another machine. Machines are told apart by host name, "
+            f"so if that is what you did, give it a name other than {recorded.restored_host}.",
+            soft_wrap=True,
         )
 
 

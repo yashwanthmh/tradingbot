@@ -330,6 +330,9 @@ def test_tb_backup_end_to_end(traded: dict[str, Any], tmp_path: Path) -> None:
     recorded = runner.invoke(app, ["backup", "receipt", str(target / RECEIPT), *common])
     assert recorded.exit_code == 0, recorded.output
     assert "restored on the machine that made it" in recorded.output
+    # Two machines that share a host name are one to the gate; the operator
+    # who did restore elsewhere is told why it did not count.
+    assert "told apart by host name" in recorded.output
 
     listed = runner.invoke(app, ["backup", "list", "--db", str(traded["db"])])
     assert listed.exit_code == 0, listed.output

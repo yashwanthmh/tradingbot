@@ -910,11 +910,11 @@ jobs:
           uv run pytest tests/test_drills.py tests/test_sessions.py -q 2>&1 | tail -3
 
   # M8's "restore-from-backup on a clean machine", on two machines. Every job
-  # here gets a fresh runner with its own host name, so the backup is made on
-  # one, restored on another that has never seen the ledger, and the receipt
-  # carried back must be counted by the live gate. A restore on the machine
-  # that made the backup proves the files are intact, not that the state
-  # survives losing that machine, and the gate does not count one.
+  # here gets a fresh runner VM, so the backup is made on one, restored on
+  # another that has never seen the ledger, and the receipt carried back must
+  # be counted by the live gate. A restore on the machine that made the backup
+  # proves the files are intact, not that the state survives losing that
+  # machine, and the gate does not count one.
   backup:
     runs-on: ubuntu-latest
     steps:
@@ -944,6 +944,7 @@ jobs:
           uv run tb backup create --limits m8/limits.yaml --to m8/backups
           uv run tb backup verify m8/backups/bkp_*
           hostname > m8/made-on
+          echo "$RUNNER_NAME" > m8/made-by-runner
 
       - uses: actions/upload-artifact@v4
         with:
@@ -977,8 +978,18 @@ jobs:
       - name: The backup restores on a machine that has never seen the ledger
         run: |
           set -euo pipefail
+          # Another runner: its own VM, holding nothing of the origin's but
+          # the backup directory.
+          if [ "$RUNNER_NAME" = "$(cat m8/made-by-runner)" ]; then
+            echo "::error::this is the runner that made the backup, which proves nothing here"
+            exit 1
+          fi
+          # GitHub's hosted runners all answer to one host name, and the gate
+          # tells machines apart by host name, so this one takes a name of its
+          # own — as a second machine of the operator's must.
+          sudo hostname "restore-$GITHUB_RUN_ID"
           if [ "$(hostname)" = "$(cat m8/made-on)" ]; then
-            echo "::error::restored on the host that made the backup, which proves nothing here"
+            echo "::error::the restoring machine still shares the maker's host name"
             exit 1
           fi
           # Only the backup directory is read; the origin ledger is not opened.

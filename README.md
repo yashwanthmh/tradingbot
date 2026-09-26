@@ -636,8 +636,12 @@ tb backup receipt restore-receipt.json    # the proof, recorded where the live g
 
 A restore on the machine that made the backup proves the files are intact, not
 that the state survives losing that machine, so the gate does not count one.
-CI does the whole round trip across two runners on every push (`backup` →
-`restore-elsewhere` → `receipt-home`), and fails if they share a host name.
+Machines are told apart by host name, so give the second one a name of its
+own: two machines sharing a name count as one. The name in a receipt is the
+restoring machine's own word, so this catches a mistake, not someone set on
+fooling the gate. CI does the whole round trip across two runners on every
+push (`backup` → `restore-elsewhere` → `receipt-home`); GitHub's runners all
+share one host name, so the second is renamed first, as yours would need to be.
 
 **Drills fire the real mechanisms at a real loop.** Each runs against a demo
 loop that holds the lease, in market hours, with a position held and every
