@@ -80,6 +80,7 @@ from tb.registry.lineage import SpecRegistry, strategy_id_for
 from tb.registry.models import AuthorKind, RegisteredSpec, TrialOutcome
 from tb.research.holdout import (
     DEFAULT_HOLDOUT_FRACTION,
+    HoldoutRegistry,
     HoldoutWindow,
     SealedBarSource,
     decisions_between,
@@ -274,34 +275,37 @@ class ResearchCycle:
         )
         min_deflated = self._limits.promotion.min_oos_deflated_sharpe
         initial: SpecProposer = RandomProposer(bounds=bounds)
-        if proposer is not None:
-            initial = proposer(
-                ProposalContext(
-                    bounds=bounds,
-                    regime=training_regime(
-                        self._limits,
-                        source,
-                        sealed_from=window.sealed_from,
-                        as_of=schedule[-1],
-                        actions=actions.get(RegimeGate(self._limits).instrument_uid, ()),
-                    ),
-                    n_trials=budget.n_trials,
-                    required_sharpe=required_sharpe(
-                        n_trials=budget.n_trials, min_deflated_sharpe=min_deflated
-                    ),
+        try:
+            if proposer is not None:
+                initial = proposer(
+                    ProposalContext(
+                        bounds=bounds,
+                        regime=training_regime(
+                            self._limits,
+                            source,
+                            sealed_from=window.sealed_from,
+                            as_of=schedule[-1],
+                            actions=actions.get(RegimeGate(self._limits).instrument_uid, ()),
+                        ),
+                        n_trials=budget.n_trials,
+                        required_sharpe=required_sharpe(
+                            n_trials=budget.n_trials, min_deflated_sharpe=min_deflated
+                        ),
+                    )
                 )
+            searcher = Searcher(
+                evaluate=evaluate,
+                validator=SpecValidator(limits=self._limits, n_training_bars=n_training_bars),
+                initial_proposer=initial,
+                mutation_proposer=MutationProposer(bounds=bounds),
+                budget=budget,
+                min_deflated_sharpe=min_deflated,
+                search_id=search,
+                seed_parents=tuple(spec for _, spec in seeds),
             )
-        searcher = Searcher(
-            evaluate=evaluate,
-            validator=SpecValidator(limits=self._limits, n_training_bars=n_training_bars),
-            initial_proposer=initial,
-            mutation_proposer=MutationProposer(bounds=bounds),
-            budget=budget,
-            min_deflated_sharpe=min_deflated,
-            search_id=search,
-            seed_parents=tuple(spec for _, spec in seeds),
-        )
-        outcome = searcher.run()
+            outcome = searcher.run()
+        except HoldoutViolation as exc:
+            raise self._violation(exc, search_id=search, window=window) from exc
 
         # The exchange first, then the trials it produced — the order in which
         # they happened, and the order a reader of the log expects.
@@ -338,6 +342,33 @@ class ResearchCycle:
             lineage_of=lineage_of,
             proposer="mutation" if seeds else initial.name,
             proposer_notes=notes,
+        )
+
+    def _violation(
+        self, exc: HoldoutViolation, *, search_id: str, window: HoldoutWindow
+    ) -> CycleError:
+        """Record a read past the seal, and the error that ends the search.
+
+        Fatal, as `HoldoutViolation` promises: every result this search produced
+        came from machinery that has just reached past its own boundary, so
+        nothing is registered and no trial is recorded — a re-run once the cause
+        is fixed records its own. Recorded, because a raise stops one process
+        and the event is what makes a pattern of attempts visible. Before this
+        the searcher filed the violation as one more errored trial and the
+        cycle went on to register survivors, and `record_violation` had no
+        caller at all.
+        """
+        HoldoutRegistry(self._ledger, run_id=self._run_id).record_violation(
+            sealed_from=exc.sealed_from or window.sealed_from,
+            requested_at=exc.requested_at or window.sealed_from,
+            caller=f"research cycle {search_id}",
+            detail=str(exc),
+        )
+        return CycleError(
+            f"search {search_id} stopped: it reached past the holdout boundary "
+            f"{window.sealed_from.isoformat()}, so nothing it produced can be trusted. "
+            "Nothing was registered and no trial recorded; the attempt is in the ledger "
+            f"as {EventType.HOLDOUT_VIOLATION_ATTEMPTED.value}. {exc}"
         )
 
     # -- what a proposer told us -----------------------------------------------
@@ -602,7 +633,9 @@ def training_regime(
         raise HoldoutViolation(
             f"a regime reading for a proposer was asked for at {as_of.isoformat()}, at or "
             f"past the holdout boundary {sealed_from.isoformat()}. What a proposer is told "
-            "must come from the training window like everything else the search sees."
+            "must come from the training window like everything else the search sees.",
+            sealed_from=sealed_from,
+            requested_at=as_of,
         )
     reading = RegimeGate(limits).read(
         SealedBarSource(inner=source, sealed_from=sealed_from),

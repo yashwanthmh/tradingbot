@@ -59,7 +59,21 @@ class HoldoutViolation(LookaheadError):
     it with. That is why it is fatal rather than a warning, and why the
     boundary is enforced here — in the one function every read goes through —
     rather than by a convention in the research code.
+
+    Carries the boundary and the instant asked for, so whatever stops the
+    process can also record the attempt (`HoldoutRegistry.record_violation`).
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        sealed_from: datetime | None = None,
+        requested_at: datetime | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.sealed_from = sealed_from
+        self.requested_at = requested_at
 
 
 class UnknownValueError(DataError):
@@ -524,7 +538,9 @@ class ForwardOnlyReader:
                 "that must not see the holdout, because the holdout is the only "
                 "independent check on what that process produces — reading it does not "
                 "just bias the result, it removes the thing that would have caught the "
-                "bias."
+                "bias.",
+                sealed_from=self.sealed_from,
+                requested_at=decision_time,
             )
         self._current = decision_time
         self._advances += 1

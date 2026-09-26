@@ -39,6 +39,7 @@ from math import ceil
 
 from tb.backtest.engine import BacktestResult
 from tb.core.errors import TbError
+from tb.data.asof import LookaheadError
 from tb.registry.models import TrialOutcome
 from tb.research.mutate import MutationProposer, Proposal, SpecProposer
 from tb.research.selection import expected_max_sharpe
@@ -349,6 +350,15 @@ class Searcher:
             )
         try:
             result = self._evaluate(proposal.spec)
+        # The one exception that is not a sample coming back empty: the
+        # evaluation reached past its own decision time — into the holdout, in
+        # the case that matters. That says the machinery is wrong, not this
+        # spec, so every result this search has produced is in question.
+        # `HoldoutViolation` promises it is fatal; caught below with the rest,
+        # it was recorded as one more errored trial and the search went on to
+        # register survivors. The cycle records it and registers nothing.
+        except LookaheadError:
+            raise
         # Deliberately broad. A spec that breaks the evaluator is a sample that
         # came back empty, not a reason to abandon the search — and narrowing
         # this to the exceptions seen so far would turn the next unfamiliar one

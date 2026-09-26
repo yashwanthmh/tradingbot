@@ -31,6 +31,7 @@ import pytest
 from tb.backtest.engine import BacktestResult
 from tb.backtest.metrics import Metrics
 from tb.config.loader import load_hard_limits
+from tb.data.asof import HoldoutViolation
 from tb.data.provider import Resolution
 from tb.registry.models import AuthorKind, TrialOutcome
 from tb.research.mutate import (
@@ -582,6 +583,21 @@ def test_an_evaluator_that_raises_is_counted_not_fatal() -> None:
     assert outcome.n_evaluated == 0
     assert all(c.outcome is TrialOutcome.ERRORED for c in outcome.candidates)
     assert "could not evaluate" in outcome.candidates[0].error
+
+
+def test_a_read_past_the_seal_stops_the_search_rather_than_counting() -> None:
+    """The one evaluator failure that is not a sample coming back empty.
+
+    Caught with the rest, a `HoldoutViolation` became one more errored trial and
+    the search went on to select survivors from machinery that had just read the
+    holdout. It stops the search instead, for the cycle to record.
+    """
+
+    def peek(spec: StrategySpec) -> BacktestResult:
+        raise HoldoutViolation("reached the seal", sealed_from=datetime(2026, 1, 1, tzinfo=UTC))
+
+    with pytest.raises(HoldoutViolation):
+        _searcher(evaluate=peek, budget=SearchBudget(n_trials=12, n_per_generation=6, seed=3)).run()
 
 
 def test_a_result_with_too_few_trades_cannot_become_a_parent() -> None:

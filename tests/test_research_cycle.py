@@ -215,6 +215,37 @@ def test_the_search_never_decides_at_or_past_the_seal(
     assert max(seen) < boundary, f"a search decision at {max(seen)} reached the seal"
 
 
+def test_a_search_that_reaches_the_seal_is_stopped_and_recorded(
+    cli_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**Fatal, and in the ledger.** A schedule that runs one decision past the
+    boundary — the bug the sealed reader exists to catch. Before, the searcher
+    filed each violation as one more errored trial and the cycle registered
+    survivors anyway, and nothing ever recorded the attempt. Now the search
+    stops, registers nothing, records no trial, and the attempt is an event."""
+    vintage_id = _sealed_vintage(cli_env)
+    import tb.research.loop as research_loop
+
+    def past_the_seal(bars: Any, *, start: Any = None, end: Any = None) -> list[datetime]:
+        schedule = decisions_between(bars, start=start, end=end)
+        return schedule if end is None else [*schedule, end + timedelta(days=1)]
+
+    monkeypatch.setattr(research_loop, "decisions_between", past_the_seal)
+    result = _cycle(cli_env, vintage_id, "--apply")
+
+    assert result.exit_code == 2, _out(result)
+    assert "reached past the holdout boundary" in _out(result)
+    with _ledger(cli_env) as ledger:
+        attempts = ledger.conn.execute(
+            "SELECT payload_json FROM event_log WHERE event_type = 'holdout.violation_attempted'"
+        ).fetchall()
+        n_registered = ledger.conn.execute("SELECT COUNT(*) FROM strategy_specs").fetchone()[0]
+        n_trials = ledger.conn.execute("SELECT COUNT(*) FROM trials").fetchone()[0]
+    assert len(attempts) == 1
+    assert "research cycle srch_" in str(attempts[0]["payload_json"])
+    assert n_registered == 0 and n_trials == 0
+
+
 def test_a_second_search_seeded_from_a_winner_stays_in_its_lineage(
     cli_env: dict[str, Any],
 ) -> None:

@@ -236,7 +236,9 @@ class SealedBarSource:
             f"a research read named {which}={requested.isoformat()}, which is at or past "
             f"the holdout boundary {self.sealed_from.isoformat()}. The holdout is the "
             "only check on this process's own output that the process did not produce, "
-            "so reaching into it removes the evidence rather than adding any."
+            "so reaching into it removes the evidence rather than adding any.",
+            sealed_from=self.sealed_from,
+            requested_at=requested,
         )
 
 
