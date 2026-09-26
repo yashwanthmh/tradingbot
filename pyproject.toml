@@ -31,6 +31,10 @@ llm = [
 ml = [
     "lightgbm>=4.5",
 ]
+api = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
 
 [project.scripts]
 tb = "tb.cli:app"

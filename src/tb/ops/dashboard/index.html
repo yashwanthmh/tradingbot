@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>tb dashboard</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <h1>tb</h1>
+  <label class="mode">Account
+    <select id="mode">
+      <option value="demo">demo</option>
+      <option value="live">live</option>
+      <option value="paper">paper</option>
+    </select>
+  </label>
+  <span id="as-of" class="muted">connecting…</span>
+  <form id="token-form" class="token" hidden>
+    <label>Dashboard token
+      <input id="token" type="password" autocomplete="off" spellcheck="false">
+    </label>
+    <button type="submit">Use token</button>
+  </form>
+  <button id="forget-token" type="button" class="link" hidden>Forget token</button>
+</header>
+
+<main class="grid">
+  <section class="card" id="status-card">
+    <h2>Status</h2>
+    <div id="status"><p class="muted">Loading…</p></div>
+  </section>
+
+  <section class="card danger" id="control-card">
+    <h2>Kill switch</h2>
+    <p class="muted">Stops new trading at the next check; exits and protective stops still go
+      through. There is no release here: that is <code>tb resume</code> at a terminal, with a
+      reason.</p>
+    <form id="kill-form">
+      <label>Why are you stopping it?
+        <input id="kill-reason" type="text" maxlength="500" autocomplete="off" required>
+      </label>
+      <button id="kill-button" type="submit" disabled>Engage kill switch</button>
+    </form>
+    <p id="kill-note" class="note" role="status"></p>
+  </section>
+
+  <section class="card" id="risk-card">
+    <h2>Risk budget</h2>
+    <div id="risk"><p class="muted">Loading…</p></div>
+  </section>
+
+  <section class="card wide" id="equity-card">
+    <h2>Equity</h2>
+    <div id="equity"><p class="muted">Loading…</p></div>
+  </section>
+
+  <section class="card wide" id="strategies-card">
+    <h2>Strategies</h2>
+    <div id="strategies"><p class="muted">Loading…</p></div>
+  </section>
+
+  <section class="card wide" id="sessions-card">
+    <h2>Sessions</h2>
+    <div id="sessions"><p class="muted">Loading…</p></div>
+  </section>
+
+  <section class="card wide" id="events-card">
+    <h2>Events</h2>
+    <div id="events"><p class="muted">Loading…</p></div>
+  </section>
+
+  <section class="card wide" id="journal-card">
+    <h2>Journal</h2>
+    <div id="journal"><p class="muted">Loading…</p></div>
+    <pre id="journal-page" class="page" hidden></pre>
+  </section>
+</main>
+</body>
+</html>

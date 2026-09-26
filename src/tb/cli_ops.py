@@ -26,6 +26,8 @@
     tb alerts                       what is new since the last pass, delivered
     tb alerts --follow              ...every --interval seconds, beside the loop
 
+    tb dashboard                    the views in a browser, and a kill switch button
+
 The streak `tb sessions` prints is the number `tb arm --live` will count,
 computed by the same function from the same ledger, so what an operator reads
 here is what the gate will see. The journal is the same record written down:
@@ -1015,3 +1017,121 @@ def alerts_command(
             if not follow or (passes and done >= passes):
                 return
             time.sleep(interval)
+
+
+# --------------------------------------------------------------------------
+# tb dashboard
+# --------------------------------------------------------------------------
+
+
+def dashboard_command(
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Address to listen on. Anything but loopback needs a token."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int, typer.Option("--port", min=1, max=65535, help="Port to listen on.")
+    ] = 8765,
+    allow_hosts: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--allow-host",
+            help="A host name browsers will use beyond loopback. Repeatable.",
+            show_default=False,
+        ),
+    ] = None,
+    journal: Annotated[
+        Path, typer.Option("--journal", help="Where the journal's pages are kept.")
+    ] = DEFAULT_DIR,
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """Serve the dashboard: read-only views, and a kill-switch button that only engages.
+
+    Loopback only unless TB_DASHBOARD_TOKEN is set; with it set, every request
+    needs the token. The button engages the switch and records a halt, as
+    `tb halt` does. Nothing on the page releases it: that is `tb resume`.
+    """
+    try:
+        import uvicorn
+
+        from tb.api.app import create_app
+        from tb.api.deps import (
+            LOOPBACK_HOSTS,
+            TOKEN_ENV,
+            DashboardError,
+            DashboardSettings,
+            check_token,
+            is_loopback,
+        )
+    except ImportError as exc:
+        err_console.print(
+            f"{BAD} the dashboard needs the api extra: `uv sync --extra api`.", soft_wrap=True
+        )
+        raise typer.Exit(2) from exc
+
+    pinned = _load(limits)
+    path = db or default_ledger_path()
+    if not path.exists():
+        err_console.print(f"{BAD} no ledger at {path}. Run `tb init` first.", soft_wrap=True)
+        raise typer.Exit(2)
+    token = os.environ.get(TOKEN_ENV) or None
+    if token is not None:
+        try:
+            check_token(token)
+        except DashboardError as exc:
+            err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+            raise typer.Exit(2) from exc
+
+    local = is_loopback(host)
+    wildcard = host in ("0.0.0.0", "::")  # noqa: S104 - refused below without a token and names
+    if not local and token is None:
+        err_console.print(
+            f"{BAD} listening on {escape(host)} needs {TOKEN_ENV}: without a token the "
+            "dashboard answers loopback only.",
+            soft_wrap=True,
+        )
+        raise typer.Exit(2)
+    if wildcard and not allow_hosts:
+        err_console.print(
+            f"{BAD} listening on every address needs --allow-host naming the host browsers "
+            "will use; any other Host is refused, which is what stops DNS rebinding.",
+            soft_wrap=True,
+        )
+        raise typer.Exit(2)
+    shown = f"[{host}]" if ":" in host else host
+    names = [*LOOPBACK_HOSTS]
+    if not local and not wildcard:
+        names.append(shown)
+    names.extend(allow_hosts or [])
+    settings = DashboardSettings(
+        db=path,
+        pinned=pinned,
+        journal_dir=journal,
+        token=token,
+        allowed_hosts=tuple(dict.fromkeys(names)),
+    )
+    console.print(
+        f"{OK} dashboard on http://{escape(shown)}:{port}/ reading {path}", soft_wrap=True
+    )
+    if token is None:
+        console.print(f"{WARN} kill switch button off: set {TOKEN_ENV} to enable it.")
+    else:
+        console.print(f"{OK} kill switch button on; every request needs the token.")
+    if not local:
+        console.print(
+            f"{WARN} plain HTTP: the token crosses the network in the clear. Prefer loopback "
+            f"and a tunnel: ssh -L {port}:127.0.0.1:{port} this-host",
+            soft_wrap=True,
+        )
+    uvicorn.run(
+        create_app(settings),
+        host=host,
+        port=port,
+        log_level="warning",
+        access_log=False,
+        # Not behind a proxy: a forwarded-for header must never change who a
+        # peer is, least of all into loopback.
+        proxy_headers=False,
+        server_header=False,
+    )

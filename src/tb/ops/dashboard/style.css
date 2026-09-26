@@ -1,0 +1,378 @@
+:root {
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --ink: #1d2330;
+  --muted: #667085;
+  --line: #e2e5ea;
+  --good: #1f7a3f;
+  --good-bg: #e3f4e8;
+  --bad: #b42318;
+  --bad-bg: #fde8e6;
+  --warn: #9a6700;
+  --warn-bg: #fff4d6;
+  --info: #175cd3;
+  --info-bg: #e5efff;
+  --drill: #6941c6;
+  --drill-bg: #efe9ff;
+  --accent: #175cd3;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1218;
+    --card: #171b24;
+    --ink: #e6e9ef;
+    --muted: #98a2b3;
+    --line: #2a3140;
+    --good: #6fd08f;
+    --good-bg: #13301f;
+    --bad: #ff8a80;
+    --bad-bg: #3a1614;
+    --warn: #f5c451;
+    --warn-bg: #3a2e0c;
+    --info: #84adff;
+    --info-bg: #13244a;
+    --drill: #b69cff;
+    --drill-bg: #291c4d;
+    --accent: #84adff;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* A class that sets `display` would otherwise win over the attribute. */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+code,
+pre,
+.seq,
+.ts {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--card);
+}
+
+.top h1 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.token {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 16px;
+  padding: 16px 20px 40px;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 16px;
+  min-width: 0;
+}
+
+.card.wide {
+  grid-column: 1 / -1;
+}
+
+.card.danger {
+  border-color: var(--bad);
+}
+
+.card h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+
+.card h3 {
+  margin: 14px 0 6px;
+  font-size: 13px;
+}
+
+.muted,
+.caveat {
+  color: var(--muted);
+}
+
+.caveat {
+  margin: 4px 0 0;
+  font-size: 12px;
+}
+
+.alert {
+  color: var(--bad);
+  background: var(--bad-bg);
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+
+.note {
+  min-height: 1.4em;
+  font-weight: 600;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  margin: 0;
+}
+
+.facts dt {
+  color: var(--muted);
+}
+
+.facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.facts.inline {
+  grid-template-columns: repeat(5, max-content max-content);
+  margin-top: 8px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  /* Break a long word only when it must: `anywhere` lets a column shrink to
+     a letter's width and split "Trigger" across two lines. */
+  overflow-wrap: break-word;
+}
+
+th {
+  white-space: nowrap;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--line);
+}
+
+.good,
+.state-trading,
+.verdict-clean,
+.status-promoted,
+.page-final {
+  color: var(--good);
+  background: var(--good-bg);
+}
+
+.bad,
+.state-halted,
+.state-halt_unreconciled,
+.verdict-faulted,
+.status-retired,
+.page-bad {
+  color: var(--bad);
+  background: var(--bad-bg);
+}
+
+.warn,
+.state-reconciling,
+.verdict-incomplete,
+.page-provisional {
+  color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.verdict-in_progress,
+.state-boot {
+  color: var(--info);
+  background: var(--info-bg);
+}
+
+.verdict-drill {
+  color: var(--drill);
+  background: var(--drill-bg);
+}
+
+.meter {
+  display: inline-block;
+  width: 90px;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--line);
+  vertical-align: middle;
+  overflow: hidden;
+}
+
+.meter .fill {
+  display: block;
+  height: 100%;
+  background: var(--good);
+}
+
+.meter.warm .fill {
+  background: var(--warn);
+}
+
+.meter.hot .fill {
+  background: var(--bad);
+}
+
+.meter.unknown {
+  background: repeating-linear-gradient(45deg, var(--line), var(--line) 4px, transparent 4px, transparent 8px);
+}
+
+.chart {
+  width: 100%;
+  height: auto;
+  max-height: 260px;
+}
+
+.chart .axis {
+  stroke: var(--line);
+}
+
+.chart .line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.chart text {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+form label {
+  display: block;
+  margin-bottom: 8px;
+}
+
+input[type="text"],
+input[type="password"],
+select {
+  font: inherit;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+#kill-reason {
+  width: 100%;
+  margin-top: 4px;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink);
+}
+
+#kill-button {
+  background: var(--bad);
+  border-color: var(--bad);
+  color: #fff;
+  font-weight: 700;
+}
+
+button:disabled,
+#kill-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+button.link {
+  border: none;
+  background: none;
+  color: var(--accent);
+  padding: 0;
+  text-decoration: underline;
+}
+
+.events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.events summary {
+  display: grid;
+  grid-template-columns: 70px 190px minmax(160px, 1fr) 90px minmax(120px, 1fr);
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.events .agg,
+.events .type {
+  overflow-wrap: anywhere;
+}
+
+.payload,
+.page {
+  margin: 6px 0 10px;
+  padding: 8px;
+  background: var(--bg);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 480px;
+  overflow: auto;
+  font-size: 12px;
+}
+
+.pages {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}

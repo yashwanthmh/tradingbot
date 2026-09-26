@@ -103,6 +103,7 @@ from tb.cli_ops import (  # noqa: E402
     alerts_command,
     arm_command,
     backup_app,
+    dashboard_command,
     disarm_command,
     drill_app,
     journal_app,
@@ -113,6 +114,7 @@ app.command("sessions")(sessions_command)
 app.command("arm")(arm_command)
 app.command("disarm")(disarm_command)
 app.command("alerts")(alerts_command)
+app.command("dashboard")(dashboard_command)
 app.add_typer(journal_app, name="journal")
 app.add_typer(backup_app, name="backup")
 app.add_typer(drill_app, name="drill")
