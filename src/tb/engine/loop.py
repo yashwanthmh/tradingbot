@@ -207,7 +207,7 @@ class TradingLoop:
         # decide about. Risk-reducing, and ahead of the exits a funded strategy
         # might ask for, because an unowned position is the only holding in the
         # account that nothing is managing.
-        unowned = self._flatten_unowned(at=at, submitted=submitted, refusals=refusals)
+        unowned, flattening = self._flatten_unowned(at=at, submitted=submitted, refusals=refusals)
         stood_down = {ticker for ticker, _, _ in unowned}
 
         # Protection follows the position, not the entry's response. Every
@@ -216,7 +216,14 @@ class TradingLoop:
         # market order fills asynchronously — the POST answers before the fill
         # — so a stop placed only "when the entry reports filled" would never
         # be placed at all, and nothing else would notice.
-        stops.extend(self._maintain_protection(at=at, skip=stood_down, refusals=refusals))
+        #
+        # Only a flatten actually sent stands a position down from this. One
+        # the risk engine refused — a position inside its minimum hold, say —
+        # leaves the holding exactly where it was, and skipping it here left an
+        # unowned position with no stop for as long as the refusal lasted: the
+        # one holding nothing manages, unprotected. Protecting it costs the
+        # retry nothing, since a flatten withdraws the stop before it sells.
+        stops.extend(self._maintain_protection(at=at, skip=flattening, refusals=refusals))
 
         # Two passes, risk-reducing first. An ordering rather than a queue
         # object: the per-cycle work is small and bounded, and the property
@@ -647,8 +654,11 @@ class TradingLoop:
         at: datetime,
         submitted: list[str],
         refusals: list[tuple[str, str]],
-    ) -> list[tuple[str, Ownership | None, str]]:
+    ) -> tuple[list[tuple[str, Ownership | None, str]], set[str]]:
         """Close positions no funded strategy will ever decide about.
+
+        Returns the unowned positions, and the tickers a flatten was actually
+        sent for.
 
         Two ways to arrive here: the strategy that opened the position has been
         retired, blocked or has run its lineage out of budget, or no entry in the
@@ -659,9 +669,11 @@ class TradingLoop:
 
         Flattened through the risk engine like any other order, so the refusal
         of a flatten is as recorded as its submission. A refusal is *not* a halt:
-        the minimum holding period blocks a young position's exit, and halting
-        the loop over a position it will be allowed to close in an hour would
-        stop it managing everything else in the meantime.
+        a symbol whose bars have stopped gives the order nothing to size from,
+        and halting the loop over one holding would stop it managing everything
+        else. The holding keeps its stop meanwhile (see `run_cycle`). The
+        minimum holding period is not a reason — it exempts flattens, as it
+        does protective stops.
 
         Scoped to `instruments` — the loop's own universe — and not to the whole
         account. A holding in something this run cannot even price is not the
@@ -671,7 +683,7 @@ class TradingLoop:
         the account as a whole.
         """
         if not self.instruments:
-            return []
+            return [], set()
         # One `get_positions` rather than a `get_position` per instrument. The
         # per-ticker endpoint is a network call each, so at 25 symbols this
         # sweep would double the portfolio calls every cycle makes against an
@@ -682,6 +694,7 @@ class TradingLoop:
             if position.quantity > 0 and position.ticker in self.instruments
         ]
         unowned = unowned_positions(self.ledger, book=self.book, held=held)
+        flattening: set[str] = set()
         for ticker, owner, reason in unowned:
             uid = self.instruments[ticker]
             state = self._position(ticker, uid)
@@ -703,9 +716,10 @@ class TradingLoop:
             )
             if intent_id is not None:
                 submitted.append(intent_id)
+                flattening.add(ticker)
             else:
                 refusals.append((ticker, f"unowned position not flattened: {action}"))
-        return unowned
+        return unowned, flattening
 
     def _flatten(
         self,

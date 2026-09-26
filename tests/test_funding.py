@@ -24,6 +24,7 @@ they both use lives in `conftest.py` for the same reason.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -766,6 +767,44 @@ def test_a_position_nobody_owns_is_flattened(env: dict[str, Any]) -> None:
     assert row is not None
     assert "stg_retired" in str(row["payload_json"])
     assert "flatten" in str(row["payload_json"])
+
+
+def test_an_orphan_whose_flatten_is_refused_is_still_protected(env: dict[str, Any]) -> None:
+    """A regression. The protection pass skipped every stood-down position,
+    including one whose flatten was refused — so an orphan with no stop stayed
+    without one for as long as the refusal lasted: the one holding nothing
+    manages, unprotected. The way there is a symbol whose bars have stopped:
+    the flatten has nothing to size from, but a stop is anchored on the price
+    the venue reports the position at."""
+    year = timedelta(days=365)
+    only_later = [
+        replace(
+            bar,
+            bar_open_utc=bar.bar_open_utc + year,
+            available_at_utc=bar.available_at_utc + year,
+        )
+        for bar in _rising_bars(days=5)
+    ]
+    _seed(env, only_later)
+    broker = _broker()
+    broker.seed_position(
+        TICKER,
+        quantity=Decimal("1"),
+        average_price=Decimal("150.00"),
+        entered_at=AS_OF - timedelta(days=30),
+    )
+    _own(env, strategy_id="stg_retired")
+
+    with Ledger(env["db"], config_hash=env["pinned"].config_hash) as ledger:
+        _promote(ledger, rung=0)
+        loop = _from_registry(env, ledger, broker)
+        loop.lock.acquire(at=AS_OF)
+        result = loop.run_cycle()
+
+    assert result.unowned and result.unowned[0][0] == TICKER
+    assert any("not flattened" in reason for _, reason in result.refusals), result.refusals
+    assert broker.get_position(TICKER) is not None, "vacuous: the flatten was not refused"
+    assert len(broker.protective_orders_for(TICKER)) == 1, "the orphan was left unprotected"
 
 
 def test_an_owned_position_is_not_flattened(env: dict[str, Any]) -> None:
