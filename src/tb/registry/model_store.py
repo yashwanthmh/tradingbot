@@ -70,6 +70,11 @@ def model_id_for(artifact_sha256: str) -> str:
     return f"mdl_{artifact_sha256[:16]}"
 
 
+def default_model_root(ledger_path: Path | str) -> Path:
+    """Where artifacts live unless told otherwise: beside the ledger, as bars do."""
+    return Path(ledger_path).parent / "models"
+
+
 @dataclass(frozen=True, slots=True)
 class TrainingProvenance:
     """Where a model's training rows came from, and the latest thing they knew."""

@@ -91,6 +91,12 @@ app.add_typer(promote_app, name="promote")
 app.add_typer(allocator_app, name="allocator")
 app.add_typer(research_app, name="research")
 
+# M7: the ML signal layer. A group of its own because a model has a life of its
+# own — trained, stored, verified — apart from the specs that read it.
+from tb.cli_ml import ml_app  # noqa: E402
+
+app.add_typer(ml_app, name="ml")
+
 
 @app.command("reconcile")
 def reconcile(

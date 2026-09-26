@@ -61,7 +61,7 @@ from tb.portfolio.allocator import allocation_as_of
 from tb.registry.ladder import notional_for
 from tb.registry.lineage import SpecRegistry
 from tb.strategy.base import Strategy
-from tb.strategy.dsl.ops import DslStrategy, pipeline_from_spec
+from tb.strategy.dsl.ops import DslStrategy, ModelSource, pipeline_from_spec
 from tb.strategy.dsl.schema import SpecError
 from tb.strategy.ml.model import ModelError
 
@@ -232,8 +232,13 @@ def funded_book(
     equity_ccy: Decimal | None = None,
     run_id: str | None = None,
     at: datetime | None = None,
+    models: ModelSource | None = None,
 ) -> Book:
     """The promoted strategies, each with the notional it may deploy per position.
+
+    `models` loads the models that promoted specs read, each checked against
+    the hash its spec pins. Without it such a spec is excluded with the reason,
+    like any other strategy whose pipeline cannot be built.
 
     Ordered by label rather than by promotion time. The loop resolves two
     strategies competing for one instrument by taking the first in book order,
@@ -294,7 +299,7 @@ def funded_book(
             )
             continue
         try:
-            pipeline = pipeline_from_spec(spec)
+            pipeline = pipeline_from_spec(spec, models=models)
         except (SpecError, ModelError, FeatureError) as exc:
             # A spec that parses but whose pipeline cannot be built — in
             # practice one reading a model that cannot be loaded as pinned. The

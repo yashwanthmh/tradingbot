@@ -16,6 +16,9 @@ This reads the chain and **checks** it rather than only printing it:
 * the spec hash recomputes from the stored spec;
 * the spec, run on those features, reaches the recorded action — the decision
   follows from its inputs rather than merely sitting beside them;
+* for a spec that reads a model, the model pinned by the spec, loaded through
+  the store's hash checks and fed the recorded inputs, gives the recorded score
+  — so "the model said 0.73" is checked, not quoted;
 * no blocking risk rule failed on the decision the order answered.
 
 The features are read from the `decision.made` event, not the `decisions`
@@ -39,11 +42,16 @@ from tb.core.errors import TbError
 from tb.data.adjustments import Series
 from tb.data.asof import UNKNOWN, BarWindow
 from tb.data.provider import Resolution
-from tb.features.pipeline import FeatureSnapshot, FeatureValue, snapshot_hash
+from tb.features.pipeline import (
+    FeatureSnapshot,
+    FeatureValue,
+    quantize_feature,
+    snapshot_hash,
+)
 from tb.ledger.store import Ledger
 from tb.ledger.verify import verify_chain
 from tb.strategy.base import Action, PositionState
-from tb.strategy.dsl.ops import DslStrategy
+from tb.strategy.dsl.ops import DslStrategy, ModelSource
 from tb.strategy.dsl.schema import SpecError, StrategySpec
 
 Row = Mapping[str, Any]
@@ -83,8 +91,13 @@ class FillReplay:
         return all(check.ok for check in self.checks)
 
 
-def replay_fill(ledger: Ledger, fill_id: str) -> FillReplay:
-    """Walk one fill back to its spec, checking each link that can be checked."""
+def replay_fill(ledger: Ledger, fill_id: str, *, models: ModelSource | None = None) -> FillReplay:
+    """Walk one fill back to its spec, checking each link that can be checked.
+
+    `models` is where a spec's model terms are loaded to check their scores;
+    without it a model-reading decision's score is reported unchecked, which
+    fails the replay rather than passing it on trust.
+    """
     fill = _one(ledger, "SELECT * FROM fills WHERE fill_id = ?", fill_id)
     if fill is None:
         raise ReplayError(f"there is no fill {fill_id!r} in this ledger")
@@ -130,6 +143,8 @@ def replay_fill(ledger: Ledger, fill_id: str) -> FillReplay:
         checks.append(spec_check)
         if spec is not None and values is not None:
             checks.append(_redecision_check(spec, decision, values))
+            if spec.model_refs:
+                checks.append(_model_check(spec, decision, values, models))
         trials = tuple(
             _all(
                 ledger,
@@ -287,6 +302,52 @@ def _redecision_check(spec: StrategySpec, decision: Row, values: dict[str, Featu
         f"the spec, run on the recorded features, decides {replayed.action.value}, "
         f"not the {recorded.value} that was recorded ({replayed.rationale})",
     )
+
+
+def _model_check(
+    spec: StrategySpec,
+    decision: Row,
+    values: dict[str, FeatureValue],
+    models: ModelSource | None,
+) -> Check:
+    """Each model the spec reads, re-scored from the recorded inputs.
+
+    Through the store, so the artifact is hash-checked against the ledger
+    before it is parsed; and rounded by the pipeline's own rule, so an exact
+    comparison is the right one.
+    """
+    if models is None:
+        return Check(
+            "model",
+            False,
+            f"the spec reads {[ref.model_id for ref in spec.model_refs]}, and no model store "
+            "was given to check the score it recorded",
+        )
+    as_of = datetime.fromisoformat(str(decision["as_of_utc"]))
+    lines: list[str] = []
+    for ref in spec.model_refs:
+        try:
+            scorer = models.scorer_for(ref.model_id, artifact_sha256=ref.artifact_sha256)
+        except TbError as exc:
+            return Check("model", False, f"{ref.model_id} cannot be loaded as pinned: {exc}")
+        recorded = values.get(ref.model_id)
+        inputs = [values.get(name) for name in scorer.inputs]
+        if any(not isinstance(value, Decimal) for value in inputs):
+            ok = recorded is UNKNOWN
+            detail = f"{ref.model_id} had an unknown input, so its score was UNKNOWN"
+        else:
+            row = [float(value) for value in inputs if isinstance(value, Decimal)]
+            score = scorer.score(row, as_of=as_of)
+            expected = UNKNOWN if score is None else quantize_feature(Decimal(score))
+            ok = recorded == expected
+            detail = (
+                f"{ref.model_id}, fed the recorded {', '.join(scorer.inputs)}, scores "
+                f"{expected}; recorded {recorded}"
+            )
+        if not ok:
+            return Check("model", False, f"{detail} — the recorded score is not this model's")
+        lines.append(detail)
+    return Check("model", True, "; ".join(lines))
 
 
 # --------------------------------------------------------------------------

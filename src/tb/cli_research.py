@@ -41,6 +41,7 @@ from tb.data.provider import Resolution
 from tb.data.snapshot import SnapshotStore
 from tb.ledger.store import Ledger, default_ledger_path
 from tb.registry.lineage import SpecRegistry
+from tb.registry.model_store import ModelStore, default_model_root
 from tb.registry.promotion import PromotionGate
 from tb.research.holdout import (
     DEFAULT_HOLDOUT_FRACTION,
@@ -51,6 +52,7 @@ from tb.research.holdout import (
     holdout_boundary,
 )
 from tb.research.llm.adapter import DEFAULT_MODEL, LLMError
+from tb.research.ml import check_holdout_unseen
 from tb.research.null_gate import measure_false_promotion_rate
 from tb.research.trials import TrialLog
 from tb.strategy.dsl.ops import DslStrategy, pipeline_from_spec
@@ -485,6 +487,14 @@ def holdout(
     limits: LimitsOpt = None,
     db: DbOpt = None,
     bars: RootOpt = None,
+    models: Annotated[
+        Path | None,
+        typer.Option(
+            "--models",
+            help="Directory holding model artifacts. Default: beside the ledger.",
+            show_default=False,
+        ),
+    ] = None,
     version: Annotated[int, typer.Option("--version", help="Spec version.")] = 1,
     fraction: Annotated[
         float, typer.Option("--fraction", help="Share of the window held back.")
@@ -506,6 +516,11 @@ def holdout(
     Exits 1 when the strategy fails the holdout, 2 when it cannot be evaluated
     at all — an unsealed vintage, a window too short, or an evaluation already
     spent.
+
+    A strategy that reads a model is evaluated with that model, loaded as its
+    spec pins it, and refused when the model's training labels reach into the
+    holdout: scored on prices it learned from, it would pass an in-sample test
+    that looks like the out-of-sample one.
     """
     pinned = _load(limits)
     with _ledger(db, pinned) as ledger:
@@ -560,13 +575,22 @@ def holdout(
             )
             raise typer.Exit(2)
 
+        model_store = ModelStore(ledger, models or default_model_root(ledger.path))
+        try:
+            check_holdout_unseen(spec, model_store, sealed_from=window.sealed_from)
+            pipeline = pipeline_from_spec(spec, models=model_store)
+        except TbError as exc:
+            err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+            raise typer.Exit(2) from exc
+
         source = snapshots.source_for(vintage_id)
         uids = tuple(vintage.instrument_uids)
         reader = evaluation_reader(
             source,
             resolution=Resolution.DAILY,
             instrument_uids=uids,
-            lookback=timedelta(days=max(400, spec.max_lookback * 2)),
+            # The pipeline's, which knows a model's inputs as well as the spec's.
+            lookback=timedelta(days=max(400, pipeline.max_lookback * 2)),
         )
         # The same schedule builder the search cycle uses for training, so the
         # statistics a candidate was selected on and the ones it is judged on
@@ -579,7 +603,7 @@ def holdout(
 
         engine = Backtester(
             cost_model=CostModel(pinned.limits),
-            pipeline=pipeline_from_spec(spec),
+            pipeline=pipeline,
             instruments={uid: InstrumentMeta(uid, "USD", Jurisdiction.US) for uid in uids},
             min_holding_minutes=spec.min_holding_minutes,
             # The adjusted history the search trained on, so the holdout judges

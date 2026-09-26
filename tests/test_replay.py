@@ -23,8 +23,10 @@ from tb.engine.funding import explicit_book, unfunded_notional
 from tb.engine.replay import replay_fill
 from tb.ledger.store import Ledger
 from tb.registry.lineage import SpecRegistry
+from tb.registry.model_store import ModelRecord, ModelStore, default_model_root
 from tb.registry.models import AuthorKind
 from tb.strategy.dsl.ops import DslStrategy, pipeline_from_spec
+from tests.ml_helpers import model_spec, momentum_model
 from tests.test_cli_registry import _out, runner
 from tests.test_funding import a_spec
 from tests.test_loop import AS_OF, _broker, _rising_bars, _seed
@@ -130,3 +132,98 @@ def test_tb_replay_prints_the_chain_and_exits_on_what_it_found(env: dict[str, An
     for part in (fill_id, strategy_id, "decision", "risk", "spec", "the spec, run on"):
         assert part in output, part
     assert missing.exit_code == 2, _out(missing)
+
+
+# --------------------------------------------------------------------------
+# A fill decided by a model
+# --------------------------------------------------------------------------
+
+
+def _model_entry_fill(env: dict[str, Any]) -> tuple[str, ModelRecord]:
+    """A registered spec reading a recorded model enters on rising bars; the
+    next cycle settles the fill. The model is scored inside the loop's own
+    pipeline, so the decision records the score like any feature."""
+    _seed(env, _rising_bars(days=140))
+    broker = _broker(price=Decimal("119.0"))
+    with Ledger(env["db"], config_hash=env["pinned"].config_hash) as ledger:
+        store = ModelStore(ledger, default_model_root(env["db"]))
+        model = momentum_model(store)
+        spec = model_spec(model)
+        registry = SpecRegistry(
+            ledger, per_lineage_budget_ccy=env["pinned"].limits.loss.per_lineage_budget_ccy
+        )
+        record = registry.register(spec, author_kind=AuthorKind.ML, at=AS_OF)
+        book = explicit_book(
+            DslStrategy(spec=spec, strategy_id=record.strategy_id, version=record.version),
+            pipeline_from_spec(spec, models=store),
+            notional_ccy=unfunded_notional(env["pinned"].limits, equity_ccy=Decimal("10000.00")),
+        )
+        entered = _cycle(env, ledger, broker, book, at=AS_OF, run_id="run_a")
+        assert entered.submitted, entered.refusals
+        settled = _cycle(env, ledger, broker, book, at=LATER, run_id="run_b")
+        assert settled.fills_recorded
+        (row,) = ledger.conn.execute(
+            "SELECT f.fill_id FROM fills f JOIN order_intents i ON f.intent_id = i.intent_id"
+            " WHERE i.purpose = 'entry'"
+        ).fetchall()
+    return str(row["fill_id"]), model
+
+
+def test_a_fill_a_model_decided_is_explained_back_to_the_model_and_rescored(
+    env: dict[str, Any],
+) -> None:
+    fill_id, model = _model_entry_fill(env)
+    with Ledger(env["db"]) as ledger:
+        replayed = replay_fill(
+            ledger, fill_id, models=ModelStore(ledger, default_model_root(env["db"]))
+        )
+
+    assert replayed.ok, [check for check in replayed.checks if not check.ok]
+    assert [check.name for check in replayed.checks] == [
+        "ledger",
+        "features",
+        "risk",
+        "spec",
+        "decision",
+        "model",
+    ]
+    (rescored,) = [check for check in replayed.checks if check.name == "model"]
+    assert model.model_id in rescored.detail and "return_pct_5" in rescored.detail
+    assert set(replayed.features) == {"return_pct_5", model.model_id}
+
+
+def test_a_model_score_is_not_passed_on_trust(env: dict[str, Any]) -> None:
+    """No store, no check — and an unchecked score fails the replay rather
+    than being quoted as though it had been verified."""
+    fill_id, _ = _model_entry_fill(env)
+    with Ledger(env["db"]) as ledger:
+        replayed = replay_fill(ledger, fill_id)
+    (rescored,) = [check for check in replayed.checks if check.name == "model"]
+    assert not rescored.ok and "no model store" in rescored.detail
+    assert not replayed.ok
+
+
+def test_a_model_edited_since_the_fill_is_caught(env: dict[str, Any]) -> None:
+    """The artifact behind the decision is swapped on disk after the fact: the
+    replay cannot re-score the fill with the model that made it, and says so."""
+    fill_id, model = _model_entry_fill(env)
+    artifact = default_model_root(env["db"]) / model.relative_path
+    text = artifact.read_text()
+    at = text.index("leaf_value=") + len("leaf_value=")
+    artifact.write_text(text[:at] + "9" + text[at:])
+
+    with Ledger(env["db"]) as ledger:
+        replayed = replay_fill(
+            ledger, fill_id, models=ModelStore(ledger, default_model_root(env["db"]))
+        )
+    (rescored,) = [check for check in replayed.checks if check.name == "model"]
+    assert not rescored.ok
+    assert "changed since it was admitted" in rescored.detail
+
+
+def test_tb_replay_rescores_a_model_fill_from_the_default_store(env: dict[str, Any]) -> None:
+    fill_id, model = _model_entry_fill(env)
+    args = ["--limits", str(env["limits"]), "--db", str(env["db"])]
+    result = runner.invoke(app, ["replay", "--fill", fill_id, *args])
+    assert result.exit_code == 0, _out(result)
+    assert model.model_id in _out(result)

@@ -65,6 +65,16 @@ _WORKING_PRECISION = 40
 FEATURE_PLACES = 10
 
 
+def quantize_feature(value: Decimal) -> Decimal:
+    """A feature value as snapshots hold and hash it: `FEATURE_PLACES` places.
+
+    A function rather than only the pipeline's own step, so `tb replay`
+    recomputing a model's score rounds it by the same rule that produced the
+    recorded one.
+    """
+    return value.quantize(Decimal(1).scaleb(-FEATURE_PLACES))
+
+
 class FeatureError(TbError):
     """A feature could not be computed for a reason that is not mere absence.
 
@@ -490,8 +500,7 @@ class FeaturePipeline:
     def _round(value: FeatureValue) -> FeatureValue:
         if value is UNKNOWN or not isinstance(value, Decimal):
             return value
-        quantum = Decimal(1).scaleb(-FEATURE_PLACES)
-        return value.quantize(quantum)
+        return quantize_feature(value)
 
     def _score(
         self, scorer: Scorer, values: Mapping[str, FeatureValue], *, as_of: datetime

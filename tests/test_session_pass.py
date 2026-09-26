@@ -25,6 +25,7 @@ from tb.ledger.store import Ledger
 from tb.portfolio.session import run_session_pass
 from tb.registry.ladder import notional_for
 from tb.registry.lineage import SpecRegistry
+from tb.registry.model_store import ModelStore, default_model_root
 from tb.strategy.trivial import specs
 from tests.test_funding import _promote, a_spec
 from tests.test_loop import AS_OF, _broker, _loop, _rising_bars, _seed
@@ -255,7 +256,12 @@ def test_tb_run_s_hook_reviews_rebuilds_and_records_the_book(env: dict[str, Any]
         for n in range(5):
             _trip(ledger, strategy_id, n=n, pnl="2.00", closed=PROMOTED + timedelta(days=n + 1))
         hook = _session_refresh(
-            ledger, env["pinned"], broker=broker, universe={}, run_id="run_hook"
+            ledger,
+            env["pinned"],
+            broker=broker,
+            universe={},
+            run_id="run_hook",
+            models=ModelStore(ledger, default_model_root(env["db"])),
         )
 
         book = hook(AS_OF)

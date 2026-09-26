@@ -704,3 +704,24 @@ jobs:
           # by the schema, and never executed or obeyed.
           set -o pipefail
           uv run pytest tests/test_llm_proposer.py -q 2>&1 | tail -5
+
+      - name: Shuffled labels show no skill
+        run: |
+          # M7's verification, as a release gate. Synthetic bars with a
+          # learnable rhythm go through the reader, the one pipeline, the label
+          # builder and purged, embargoed walk-forward folds. The same folds on
+          # shuffled labels must show no skill — skill there is the evaluation's
+          # own, and every out-of-sample number this build reports would be
+          # suspect — and the real labels must show it, or the null passed only
+          # by being unable to find anything. `tb ml calibrate` exits non-zero
+          # on either failure; the trainer runs the same null on every fit.
+          uv run tb ml calibrate
+
+      - name: A model is loaded only as its spec pins it, and never past its holdout
+        run: |
+          # The store refuses an artifact edited, deleted, planted or re-pointed
+          # by an edited catalog row; the holdout refuses a model that learned
+          # from the window it would be scored on; replay re-scores a fill with
+          # the model that made it. Trained end to end through the CLI.
+          set -o pipefail
+          uv run pytest tests/test_ml_model.py tests/test_cli_ml.py tests/test_replay.py -q 2>&1 | tail -5

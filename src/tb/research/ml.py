@@ -45,22 +45,22 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
 
 from tb.config.hard_limits import HardLimits
 from tb.core.clock import now_utc
 from tb.core.errors import TbError
 from tb.core.ids import deterministic_id, new_id
-from tb.data.asof import HoldoutViolation
-from tb.data.provider import Resolution
+from tb.data.asof import ForwardOnlyReader, HoldoutViolation, InMemoryBarSource
+from tb.data.provider import Bar, Provenance, Resolution, Session
 from tb.data.snapshot import SnapshotStore
 from tb.features.pipeline import FeatureError, FeaturePipeline, pipeline_for
 from tb.ledger.events import Actor
 from tb.ledger.store import Ledger
 from tb.registry.model_store import ModelRecord, ModelStore
 from tb.registry.models import AuthorKind
-from tb.research.holdout import DEFAULT_HOLDOUT_FRACTION, training_reader
+from tb.research.holdout import DEFAULT_HOLDOUT_FRACTION, decisions_between, training_reader
 from tb.research.loop import (
     DAILY_HOLD_MINUTES,
     CycleReport,
@@ -93,6 +93,10 @@ _EDGE_QUANTUM = Decimal("0.01")
 
 class TrainingError(TbError):
     """A model could not be trained, or its training cannot be trusted."""
+
+
+class NullShowsSkill(TrainingError):
+    """Shuffled labels scored as skill: the evaluation, not the market, supplied it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,7 +304,7 @@ class ModelTrainer:
             labels=shuffled(dataset.labels, seed=config.null_seed),
         )
         if null.shows_skill():
-            raise TrainingError(
+            raise NullShowsSkill(
                 f"on shuffled labels the same folds scored AUC {null.auc:.3f}, beyond the "
                 f"±{(null.auc_null_se or 0.0):.3f} a sample this size explains. The evaluation "
                 "is supplying skill — a fold scored on rows it was fitted on is the classic "
@@ -423,6 +427,127 @@ class ModelTrainer:
         return tuple(out)
 
 
+@dataclass(frozen=True, slots=True)
+class Calibration:
+    """The shuffled-label null, and the planted control that gives it meaning."""
+
+    control: OutOfSample
+    nulls: tuple[OutOfSample, ...]
+    n_samples: int
+
+    @property
+    def control_found_it(self) -> bool:
+        return self.control.shows_skill()
+
+    @property
+    def nulls_found_nothing(self) -> bool:
+        return not any(null.shows_skill() for null in self.nulls)
+
+    @property
+    def passed(self) -> bool:
+        return self.control_found_it and self.nulls_found_nothing
+
+
+def calibrate(
+    *,
+    n_nulls: int = 8,
+    days: int = 600,
+    params: ModelParams | None = None,
+    seed: int = 11,
+) -> Calibration:
+    """Run the M7 verification through the real data path, on synthetic bars.
+
+    Bars with a learnable rhythm — five sessions drifting up, five down, under
+    noise — go through the forward-only reader, the one pipeline, the label
+    builder and the purged folds, exactly as a vintage would. The control fits
+    the real labels and must find the rhythm; each null fits the same folds on
+    shuffled labels and must find nothing. A gate that only ran the nulls could
+    pass by being unable to find anything at all, so the control is part of it.
+
+    No ledger, no store, no network: `tb ml calibrate` is a statement about
+    this build's evaluation machinery, runnable anywhere, which is what a
+    release gate has to be.
+    """
+    import random
+
+    rng = random.Random(seed)  # noqa: S311 - synthetic prices, not a key
+    uid = "calibration:synthetic"
+    start = datetime(2020, 1, 6, tzinfo=UTC)
+    price = Decimal("100")
+    bars: list[Bar] = []
+    for day in range(days):
+        drift = 0.008 if (day // 5) % 2 == 0 else -0.008
+        step = Decimal(str(round(drift + rng.gauss(0, 0.006), 6)))
+        price = max((price * (1 + step)).quantize(Decimal("0.01")), Decimal("1.00"))
+        opened = start + timedelta(days=day)
+        bars.append(
+            Bar(
+                instrument_uid=uid,
+                resolution=Resolution.DAILY,
+                bar_open_utc=opened,
+                available_at_utc=opened + timedelta(days=1),
+                ingested_at_utc=opened + timedelta(days=1),
+                provider="calibration",
+                provenance=Provenance.BACKFILL,
+                session=Session.REGULAR,
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=1_000_000,
+            )
+        )
+    features = pipeline_for((("return_pct", 2), ("return_pct", 4), ("zscore", 10)))
+    dataset = build_dataset(
+        reader=ForwardOnlyReader(
+            source=InMemoryBarSource(bars=bars),
+            resolution=Resolution.DAILY,
+            instrument_uids=(uid,),
+            lookback=lookback_for(features.max_lookback),
+        ),
+        pipeline=features,
+        decision_times=decisions_between(bars),
+        instruments=(uid,),
+        label=LabelDefinition(horizon=2, cost_bps=Decimal(0)),
+    )
+    folds = walk_forward_folds(dataset.spans, n_folds=4, embargo=timedelta(days=3), min_train=60)
+    fitted = params or ModelParams()
+    control, _ = walk_forward(dataset, folds=folds, params=fitted)
+    nulls = tuple(
+        walk_forward(dataset, folds=folds, params=fitted, labels=shuffled(dataset.labels, seed=k))[
+            0
+        ]
+        for k in range(n_nulls)
+    )
+    return Calibration(control=control, nulls=nulls, n_samples=len(dataset.samples))
+
+
+def check_holdout_unseen(spec: StrategySpec, models: ModelStore, *, sealed_from: datetime) -> None:
+    """Refuse a holdout that a model the spec reads has already learned from.
+
+    A holdout is out of sample for a model only if every one of its training
+    labels was known before the holdout begins. The model's own seal guaranteed
+    that for the vintage it was trained on — but a spec can be evaluated
+    against another vintage, sealed earlier, whose holdout would then score the
+    model on the very prices it was fitted to. That would make the one
+    evaluation a strategy gets an in-sample one, and it would pass.
+    """
+    for ref in spec.model_refs:
+        record = models.get(ref.model_id)
+        if record is None:
+            raise TrainingError(
+                f"{ref.model_id} is not in the model store, so what it was trained on "
+                "cannot be checked against this holdout"
+            )
+        if record.trained_through >= sealed_from:
+            raise TrainingError(
+                f"{ref.model_id} learned from labels known through "
+                f"{record.trained_through.isoformat()}, inside this holdout, which starts "
+                f"{sealed_from.isoformat()}. Evaluate it on a vintage sealed after its "
+                "training, or the holdout scores the model on prices it was fitted to."
+            )
+
+
 def _quantile(sorted_scores: Sequence[float], q: float) -> Decimal:
     """The nearest-rank quantile, as a spec constant."""
     index = min(len(sorted_scores) - 1, max(0, math.floor(q * len(sorted_scores))))
@@ -499,10 +624,14 @@ def _describe(label: str, oos: OutOfSample) -> str:
 
 
 __all__ = [
+    "Calibration",
     "ModelTrainer",
+    "NullShowsSkill",
     "Threshold",
     "ThresholdProposer",
     "TrainingConfig",
     "TrainingError",
     "TrainingReport",
+    "calibrate",
+    "check_holdout_unseen",
 ]

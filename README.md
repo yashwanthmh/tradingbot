@@ -100,7 +100,10 @@ integrity theatre.
 The lineage `decisions → risk_verdicts → order_intents → fills` is complete, so for any fill
 the ledger alone answers: which strategy version, from which spec, proposed by which search
 run, on which feature snapshot, cleared by which gate evaluation, allowed by which risk rules
-with which observed values against which limits, filled at what price with which fees.
+with which observed values against which limits, filled at what price with which fees. For a
+strategy that reads a model, it also answers which artifact scored it, and replay re-scores
+the fill with that model — loaded through the store's hash checks — rather than quoting the
+recorded number.
 
 ```bash
 tb replay --fill <fill_id>     # reconstruct the entire decision from the ledger, and check it
@@ -129,7 +132,7 @@ data*, then *can I reconcile broker state*, then *is there any edge after costs*
 | M4 | Risk engine, live loop, crash drills | **done** |
 | M5 | Registry, promotion gate, capital allocator | **done** |
 | M6 | Self-strategising search (LLM optional) | **done** |
-| M7 | ML signal layer | |
+| M7 | ML signal layer — walk-forward, shuffled-label null, hash-pinned models | **done** |
 | M8 | Live at floor size, dashboard, daily journal | |
 | M9 | RL — interface stub only, deferred deliberately | |
 
@@ -486,6 +489,75 @@ process holding `T212_LIVE_API_KEY`. It needs the optional extra
 (`uv sync --extra llm`) and `ANTHROPIC_API_KEY`; nothing else in the system
 does.
 
+Where a model comes in — the ML signal layer:
+
+```bash
+tb ml train <vint> --feature return_pct:5 --feature zscore:20   # dry run: train, record, count
+tb ml train <vint> --feature ... --apply                        # register the surviving specs
+tb ml models                                                    # every recorded model
+tb ml show <mdl_id>                                             # its record, and a verified load
+tb ml verify                                                    # every artifact against the ledger
+tb ml calibrate                                                 # the shuffled-label release gate
+```
+
+A model is not a strategy. It is a scorer inside the one feature pipeline, and
+its score is one more term a spec can read — `{"kind": "model", "model_id",
+"artifact_sha256"}` beside features and constants — so the registry, the trials,
+the holdout, the gate, the allocator, the loop and replay treat a strategy that
+reads a model exactly as they treat any other, and none of them needed a second
+code path to do so. The interpreter never runs a model; it reads the score from
+the snapshot like a moving average, hashed with everything else.
+
+**Trained on rows the loop would have produced.** Every sample's features come
+from the pipeline's own `compute` on the forward-only reader at the decision
+time, and every label is the trade a strategy acting on it would have made: in
+at the next bar's open, out at the open `horizon` bars later, net of the cost
+model's round trip, following any split in between. Through the sealed reader,
+a label whose exit falls in the holdout never completes — those prices are never
+in memory — and a model whose labels reached the seal is refused at record time.
+
+**Scored walk-forward, purged and embargoed.** A label decided today is known a
+week later, so ordinary cross-validation trains on labels computed from the
+prices it is scored on. Each fold here is scored by a model fitted only on
+samples decided before it *and known* an embargo before it, with a decision
+time never split across a boundary; the properties are tested over random spans
+rather than hand-picked ones. The specs a training run proposes — thresholds on
+the model's out-of-sample scores, three by default, each a trial — are pinned to
+the final model but backtested with the fold models, because the final model
+has seen every label in the window and a backtest of it there would be
+in-sample. Its own out-of-sample test is the sealed holdout, spent once, which
+refuses a model whose training labels reach into the window it would be scored
+on.
+
+**The null runs on every fit.** The same folds on shuffled labels must show no
+skill: an AUC within four standard errors of 0.5, the error computed for the
+sample at hand. Skill there is the evaluation's own — a fold scored on rows it
+was fitted on is the classic cause — so a failing null records nothing at all:
+no model, no trial. `tb ml calibrate` is the same check as a release gate, run
+through the real reader, pipeline and labels on synthetic bars, beside a planted
+pattern the real labels must find; a null that passes because the model can
+find nothing is not a null.
+
+**A model exists when the ledger says so.** Artifacts are LightGBM's text
+format, parsed on load and never unpickled, trained deterministically so the
+same rows give the same bytes, and stored under their sha256. The
+`model.recorded` event, not the file, admits one: a file with no event is never
+loaded, and before any artifact is parsed its recording event must hash to its
+stored values and name the artifact the catalog row names, and the file must
+hash to it. An edited, deleted, planted or re-pointed model is refused by name,
+and a spec pinned to one hash is never handed another under the same id — a
+retrained model does not inherit a promotion it never earned.
+
+**Retraining is one growing search.** A training run's specs are filed under
+the idea's lineage — its features and label, whatever the parameters — so every
+retrain of one idea adds to one lineage's trial count, and "retrain until it
+passes" is deflated as the search it is. The searcher, for its part, may never
+propose a spec that reads a model: a model's trials are counted where it was
+trained, and a search composing models would stack a second, uncounted search
+on top of them. LightGBM is the optional `ml` extra (`uv sync --extra ml`),
+imported only where a model is fitted or parsed; strategies that read no model
+trade without it.
+
 ## Risk and honest limitations
 
 - **The fee schedule beats most intraday ideas before they start.** See constraint 2 above.
@@ -512,5 +584,10 @@ does.
   is the arithmetic working rather than a threshold to loosen, and its consequence for M6 is
   concrete: many small searches, with the trial count spent as a budget. See
   `docs/decisions/0002-search-size-and-provable-edge.md`.
+- **A model finds patterns, including the ones that are not there.** Walk-forward scoring,
+  purging, the embargo and the per-fit null remove the ways an evaluation manufactures skill;
+  none of them makes a real pattern persist. On free daily data the expected result of
+  `tb ml train` is a model that shows no out-of-sample skill and specs the edge band refuses,
+  which the trainer reports and counts rather than hides.
 - **Backtest results are not predictions**, and a strategy that cleared a gate is a strategy
   that cleared a gate.

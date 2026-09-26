@@ -58,6 +58,8 @@ from tb.ops.watchdog import (
     Watchdog,
 )
 from tb.portfolio.pnl import EquityCurve
+from tb.registry.model_store import ModelStore, default_model_root
+from tb.strategy.dsl.ops import ModelSource
 from tb.strategy.trivial import MovingAverageCross, specs
 
 engine_app = typer.Typer(help="Run the trading loop and its supervisor.", no_args_is_help=True)
@@ -79,6 +81,14 @@ DbOpt = Annotated[
 RootOpt = Annotated[
     Path | None,
     typer.Option("--bars", help="Directory holding the Parquet bar store.", show_default=False),
+]
+ModelsOpt = Annotated[
+    Path | None,
+    typer.Option(
+        "--models",
+        help="Directory holding model artifacts. Default: beside the ledger.",
+        show_default=False,
+    ),
 ]
 
 
@@ -103,6 +113,7 @@ def run(
     limits: LimitsOpt = None,
     db: DbOpt = None,
     bars: RootOpt = None,
+    models: ModelsOpt = None,
     mode: Annotated[
         str, typer.Option("--mode", help="paper (simulated broker) or demo (Trading 212).")
     ] = "paper",
@@ -201,7 +212,8 @@ def run(
         # either would name the least urgent problem. Read-only here; it is
         # recorded once the lease is held, so an instance that loses the lease
         # leaves no book behind.
-        book = _book(ledger, pinned, strategy=strategy, broker=broker)
+        model_store = ModelStore(ledger, models or default_model_root(ledger.path))
+        book = _book(ledger, pinned, strategy=strategy, broker=broker, models=model_store)
 
         store = BarStore(
             ledger,
@@ -252,7 +264,12 @@ def run(
                 None
                 if strategy is not None
                 else _session_refresh(
-                    ledger, pinned, broker=broker, universe=universe, run_id=run_id
+                    ledger,
+                    pinned,
+                    broker=broker,
+                    universe=universe,
+                    run_id=run_id,
+                    models=model_store,
                 )
             ),
         )
@@ -352,6 +369,7 @@ def _book(
     *,
     strategy: str | None,
     broker: Broker,
+    models: ModelSource,
 ) -> Book:
     """The funded book, or the one-strategy drill book `--strategy trivial` asks for.
 
@@ -383,7 +401,7 @@ def _book(
         )
         return book
 
-    book = funded_book(ledger, limits=pinned.limits, equity_ccy=equity)
+    book = funded_book(ledger, limits=pinned.limits, equity_ccy=equity, models=models)
     if not book.funded:
         for label, reason in book.excluded:
             err_console.print(f"{BAD} {escape(label)}: {escape(reason)}", soft_wrap=True)
@@ -446,6 +464,7 @@ def _session_refresh(
     broker: Broker,
     universe: dict[str, str],
     run_id: str,
+    models: ModelSource,
 ) -> Callable[[datetime], Book | None]:
     """The loop's once-a-session hook: the portfolio pass, then a fresh book.
 
@@ -483,7 +502,14 @@ def _session_refresh(
         )
         if passed.skipped:
             return None
-        book = funded_book(ledger, limits=pinned.limits, equity_ccy=equity, run_id=run_id, at=at)
+        book = funded_book(
+            ledger,
+            limits=pinned.limits,
+            equity_ccy=equity,
+            run_id=run_id,
+            at=at,
+            models=models,
+        )
         record_book(ledger, book, run_id=run_id)
         return book
 
@@ -571,6 +597,7 @@ def replay(
     ],
     limits: LimitsOpt = None,
     db: DbOpt = None,
+    models: ModelsOpt = None,
 ) -> None:
     """Explain one fill from the ledger alone, and check the chain behind it.
 
@@ -578,8 +605,9 @@ def replay(
     risk rule's verdict, the spec, the search trials, the holdout and the
     promotion behind it, and the round trip it closed. Each link that can be
     checked is: the hash chain, the feature hash, the spec hash, the spec
-    reaching the recorded action again on the recorded features, and no
-    blocking risk failure.
+    reaching the recorded action again on the recorded features, the score of
+    any model it read recomputed from the recorded inputs, and no blocking risk
+    failure.
 
     Exits 1 when a check fails, 2 when the fill is not in the ledger.
     """
@@ -588,7 +616,11 @@ def replay(
     pinned = _load(limits)
     with _ledger(db, pinned) as ledger:
         try:
-            replayed = replay_fill(ledger, fill)
+            replayed = replay_fill(
+                ledger,
+                fill,
+                models=ModelStore(ledger, models or default_model_root(ledger.path)),
+            )
         except ReplayError as exc:
             err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
             raise typer.Exit(2) from exc

@@ -27,6 +27,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -344,6 +345,28 @@ def test_a_spec_whose_pipeline_cannot_be_built_unfunds_one_strategy_not_the_book
     assert [s.strategy_id for s in book.funded] == [healthy]
     assert [label for label, _ in book.excluded] == [f"{unloadable}@v1"]
     assert "pipeline cannot be built" in book.excluded[0][1]
+
+
+def test_a_promoted_spec_reading_a_model_is_funded_with_its_model(
+    ledger: Ledger, pinned: PinnedLimits, tmp_path: Path
+) -> None:
+    """Given the store, the model is loaded as its spec pins it and scored inside
+    the funded strategy's pipeline — the same object the loop computes with."""
+    from tb.registry.model_store import ModelStore
+    from tests.ml_helpers import model_spec, momentum_model
+
+    store = ModelStore(ledger, tmp_path / "models")
+    model = momentum_model(store)
+    strategy_id, _ = _promote(ledger, spec=model_spec(model))
+
+    book = funded_book(
+        ledger, limits=pinned.limits, equity_ccy=Decimal("10000"), at=AS_OF, models=store
+    )
+
+    (funded,) = book.funded
+    assert funded.strategy_id == strategy_id
+    assert funded.pipeline.names == ("return_pct_5", model.model_id)
+    assert book.excluded == ()
 
 
 def test_the_book_is_ordered_by_identity_not_by_promotion_time(
