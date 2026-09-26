@@ -149,7 +149,24 @@ _HOSTILE_STRINGS = [
     "‮⁦gt",
 ]
 
-_KINDS = ["compare", "not", "all", "any", "feature", "const", "eval", "exec", "call", "attr"]
+_KINDS = [
+    "compare",
+    "not",
+    "all",
+    "any",
+    "feature",
+    "const",
+    "model",
+    "eval",
+    "exec",
+    "call",
+    "attr",
+]
+# A model term's two slots: well-formed and paired, well-formed and mismatched,
+# and hostile. The pairing rule is what a fuzzer is least likely to satisfy by
+# accident, so the valid pair is supplied rather than hoped for.
+_SHAS = ["0" * 64, "ab" * 32]
+_MODEL_IDS = ["mdl_" + "0" * 16, "mdl_" + "ab" * 8, "mdl_" + "f" * 16, "mdl_../../etc"]
 _OPS = ["gt", "gte", "lt", "lte", "eq", "ne", "exec", "__gt__", "is", "in"]
 _NAMES = [*sorted(FEATURE_LIBRARY), "__import__", "eval", "os", "sys", "open"]
 
@@ -186,6 +203,8 @@ def _node(children: st.SearchStrategy[Any]) -> st.SearchStrategy[Any]:
                 st.decimals(allow_nan=True, allow_infinity=True),
                 st.sampled_from(_HOSTILE_STRINGS),
             ),
+            "model_id": st.one_of(st.sampled_from(_MODEL_IDS), _scalars),
+            "artifact_sha256": st.one_of(st.sampled_from(_SHAS), _scalars),
             "__class__": _scalars,
         },
     )

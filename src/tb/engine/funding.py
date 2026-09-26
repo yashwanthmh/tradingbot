@@ -54,7 +54,7 @@ from tb.config.hard_limits import HardLimits
 from tb.core.clock import from_iso, now_utc, to_iso
 from tb.core.errors import TbError
 from tb.engine.intents import IntentState
-from tb.features.pipeline import FeaturePipeline
+from tb.features.pipeline import FeatureError, FeaturePipeline
 from tb.ledger.events import Actor, BookFundedPayload, EventType
 from tb.ledger.store import Ledger
 from tb.portfolio.allocator import allocation_as_of
@@ -63,6 +63,7 @@ from tb.registry.lineage import SpecRegistry
 from tb.strategy.base import Strategy
 from tb.strategy.dsl.ops import DslStrategy, pipeline_from_spec
 from tb.strategy.dsl.schema import SpecError
+from tb.strategy.ml.model import ModelError
 
 # The intent states in which an entry may have opened the position it names.
 # A positive list rather than a list of exclusions: `PENDING_SUBMIT` and
@@ -292,6 +293,15 @@ def funded_book(
                 )
             )
             continue
+        try:
+            pipeline = pipeline_from_spec(spec)
+        except (SpecError, ModelError, FeatureError) as exc:
+            # A spec that parses but whose pipeline cannot be built — in
+            # practice one reading a model that cannot be loaded as pinned. The
+            # same rule as a stale row: this strategy is unfunded, the rest of
+            # the book trades.
+            excluded.append((record.label, f"its feature pipeline cannot be built: {exc}"))
+            continue
 
         rung_cap = notional_for(record.rung, limits=limits, equity_ccy=equity_ccy)
         allocation = allocations.get(record.strategy_id)
@@ -316,7 +326,7 @@ def funded_book(
                     strategy_id=record.strategy_id,
                     version=record.version,
                 ),
-                pipeline=pipeline_from_spec(spec),
+                pipeline=pipeline,
                 # Kept even at zero. An allocation of nothing refuses entries
                 # through the risk rule and leaves exits alone; dropping the
                 # strategy here would strand whatever it already holds.

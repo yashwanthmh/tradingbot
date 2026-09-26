@@ -315,6 +315,37 @@ def test_a_spec_that_no_longer_parses_unfunds_one_strategy_not_the_book(
     assert "no longer validates" in book.excluded[0][1]
 
 
+def test_a_spec_whose_pipeline_cannot_be_built_unfunds_one_strategy_not_the_book(
+    ledger: Ledger, pinned: PinnedLimits
+) -> None:
+    """A spec that parses but reads a model this run cannot load as pinned.
+
+    The same rule as a stale row, for a failure that arrives later: the spec is
+    valid, its model is the problem, and one unloadable model must not stop the
+    strategies that read none.
+    """
+    sha = "ab" * 32
+    reads_a_model = StrategySpec.model_validate(
+        {
+            **a_spec(name="reads a model").model_dump(mode="json"),
+            "entry": {
+                "kind": "compare",
+                "op": "gt",
+                "left": {"kind": "model", "model_id": f"mdl_{sha[:16]}", "artifact_sha256": sha},
+                "right": {"kind": "const", "value": "0.6"},
+            },
+        }
+    )
+    unloadable, _ = _promote(ledger, spec=reads_a_model)
+    healthy, _ = _promote(ledger, spec=a_spec(name="healthy"))
+
+    book = funded_book(ledger, limits=pinned.limits, equity_ccy=Decimal("10000"), at=AS_OF)
+
+    assert [s.strategy_id for s in book.funded] == [healthy]
+    assert [label for label, _ in book.excluded] == [f"{unloadable}@v1"]
+    assert "pipeline cannot be built" in book.excluded[0][1]
+
+
 def test_the_book_is_ordered_by_identity_not_by_promotion_time(
     ledger: Ledger, pinned: PinnedLimits
 ) -> None:

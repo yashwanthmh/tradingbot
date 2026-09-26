@@ -30,7 +30,8 @@ from tb.backtest.engine import Backtester
 from tb.config.loader import load_hard_limits
 from tb.data.provider import Bar, Provenance, Resolution, Session
 from tb.ledger.store import Ledger
-from tb.registry.models import StrategyStatus
+from tb.registry.lineage import SpecRegistry
+from tb.registry.models import AuthorKind, StrategyStatus
 from tb.research.holdout import DECISION_OFFSET, decisions_between
 from tb.research.trials import TrialLog
 from tb.strategy.dsl.schema import StrategySpec
@@ -308,6 +309,40 @@ def test_an_unregistered_seed_is_a_setup_error(cli_env: dict[str, Any]) -> None:
     result = _cycle(cli_env, vintage_id, "--from", "stg_ghost")
     assert result.exit_code == 2
     assert "not registered" in _out(result)
+
+
+def test_a_seed_that_reads_a_model_is_a_setup_error(cli_env: dict[str, Any]) -> None:
+    """Refined by retraining, where the model's trials are counted — not by a
+    search whose every child the validator would refuse one trial at a time."""
+    vintage_id = _sealed_vintage(cli_env)
+    sha = "ab" * 32
+    model = {"kind": "model", "model_id": f"mdl_{sha[:16]}", "artifact_sha256": sha}
+    spec = StrategySpec.model_validate(
+        {
+            "name": "reads a model",
+            "entry": {
+                "kind": "compare",
+                "op": "gt",
+                "left": model,
+                "right": {"kind": "const", "value": "0.6"},
+            },
+            "exit": {
+                "kind": "compare",
+                "op": "lt",
+                "left": model,
+                "right": {"kind": "const", "value": "0.4"},
+            },
+            "expected_edge_bps": "300",
+            "min_holding_minutes": 1440,
+        }
+    )
+    with _ledger(cli_env) as ledger:
+        seed = SpecRegistry(ledger, per_lineage_budget_ccy=Decimal("100")).register(
+            spec, author_kind=AuthorKind.HUMAN
+        )
+    result = _cycle(cli_env, vintage_id, "--from", seed.strategy_id)
+    assert result.exit_code == 2
+    assert "refined by retraining" in _out(result)
 
 
 def test_an_unsealed_vintage_is_a_setup_error(cli_env: dict[str, Any]) -> None:

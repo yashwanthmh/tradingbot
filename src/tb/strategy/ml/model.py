@@ -199,3 +199,33 @@ class TrainedModel:
                 f"a row of {len(row)} value(s) for a model of {len(self.feature_names)} feature(s)"
             )
         return self.predict([row])[0]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelScorer:
+    """A loaded model as the pipeline sees it: a named score over named features.
+
+    `name` is the key the score is read under — the model id a spec's `model`
+    term names. `features` rebuilds the inputs as `(kind, lookback)`, from the
+    record, and must name exactly the columns the model was fitted on, in the
+    same order; anything else is refused here rather than scored.
+    """
+
+    name: str
+    features: tuple[tuple[str, int], ...]
+    model: TrainedModel
+
+    def __post_init__(self) -> None:
+        rebuilt = tuple(f"{kind}_{lookback}" for kind, lookback in self.features)
+        if rebuilt != self.model.feature_names:
+            raise ModelError(
+                f"{self.name} would be fed {list(rebuilt)} but was fitted on "
+                f"{list(self.model.feature_names)}"
+            )
+
+    @property
+    def inputs(self) -> tuple[str, ...]:
+        return self.model.feature_names
+
+    def score(self, row: Sequence[float]) -> float:
+        return self.model.score(row)

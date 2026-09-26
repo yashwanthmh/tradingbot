@@ -46,6 +46,7 @@ from tb.strategy.dsl.schema import (
     Comparison,
     Constant,
     FeatureRef,
+    ModelScore,
     Not,
     StrategySpec,
 )
@@ -208,7 +209,9 @@ def _eval_term(node: object, snapshot: FeatureSnapshot, budget: _Budget) -> Deci
     budget.spend()
     if isinstance(node, Constant):
         return node.value
-    if isinstance(node, FeatureRef):
+    # A model's score is read from the snapshot exactly as a feature is: the
+    # pipeline computed it, and the interpreter never runs a model itself.
+    if isinstance(node, FeatureRef | ModelScore):
         try:
             return snapshot.values[node.feature_key]
         except KeyError:
@@ -216,9 +219,9 @@ def _eval_term(node: object, snapshot: FeatureSnapshot, budget: _Budget) -> Deci
             # Refused rather than treated as absent: absence means "no data
             # yet" and would make the strategy look like it was working.
             raise EvaluationError(
-                f"spec reads feature {node.feature_key!r}, which this pipeline does not "
-                f"compute (it has {sorted(snapshot.values)}). Build the pipeline from "
-                "the spec's own feature_requests."
+                f"spec reads {node.feature_key!r}, which this pipeline does not compute "
+                f"(it has {sorted(snapshot.values)}). Build the pipeline with "
+                "`pipeline_from_spec`, and give it the model store if the spec reads a model."
             ) from None
     raise EvaluationError(f"not a term node: {type(node).__name__}")
 
@@ -226,7 +229,7 @@ def _eval_term(node: object, snapshot: FeatureSnapshot, budget: _Budget) -> Deci
 def _describe(node: object) -> str:
     if isinstance(node, Constant):
         return str(node.value)
-    if isinstance(node, FeatureRef):
+    if isinstance(node, FeatureRef | ModelScore):
         return node.feature_key
     return type(node).__name__
 

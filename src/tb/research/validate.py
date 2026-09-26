@@ -99,6 +99,9 @@ class SpecValidator:
     feed_noise_p95_bps: Decimal | None = None
     jurisdiction: Jurisdiction = Jurisdiction.US
     instrument_currency: str = "USD"
+    # Off for the searcher, on only for the trainer that recorded the model:
+    # see `_reads_a_model`.
+    allow_models: bool = False
 
     def check(
         self,
@@ -116,6 +119,7 @@ class SpecValidator:
         """
         for rejection in (
             self._duplicate(spec, seen=seen),
+            self._reads_a_model(spec),
             self._reads_a_feature(spec),
             self._edge_band(spec),
             self._holding_period(spec),
@@ -142,6 +146,30 @@ class SpecValidator:
                 observed=spec.spec_hash[:12],
             )
         return None
+
+    def _reads_a_model(self, spec: StrategySpec) -> Rejection | None:
+        """A searched spec may not read a model; only the trainer's may.
+
+        A model is the product of its own search — every fold, every candidate
+        threshold — and its trials are counted where it was trained. A searcher
+        that composed models into specs would run a second search on top of the
+        first and count only the second, which is the multiplicity leak this
+        module exists to close, one level up. It also cannot know which
+        artifacts exist, so any model term it proposes was copied or invented:
+        crossover grafting one from a parent is the innocent way in, a proposer
+        naming one it never trained is the other.
+        """
+        if self.allow_models or not spec.model_refs:
+            return None
+        return Rejection(
+            code="reads_a_model",
+            reason=(
+                "only the trainer that recorded a model may propose specs reading it: the "
+                "model's trials are counted where it was trained, and a search composing "
+                "models would stack a second search on them uncounted"
+            ),
+            observed=", ".join(ref.model_id for ref in spec.model_refs),
+        )
 
     @staticmethod
     def _reads_a_feature(spec: StrategySpec) -> Rejection | None:

@@ -469,6 +469,14 @@ class ResearchCycle:
                     "an earlier result, and its lineage is what carries that result's trial "
                     "count forward — an unregistered seed has neither."
                 )
+            if spec.model_refs:
+                # Every child would carry the model term and be refused by the
+                # validator one trial at a time; say so once, before the search.
+                raise CycleError(
+                    f"seed {strategy_id} reads model(s) "
+                    f"{[ref.model_id for ref in spec.model_refs]}. Specs reading a model are "
+                    "refined by retraining it, where its trials are counted, never by search."
+                )
             out.append((registered, spec))
         return out
 

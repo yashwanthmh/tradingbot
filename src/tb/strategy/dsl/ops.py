@@ -21,23 +21,64 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Protocol
 
 from tb.data.asof import UNKNOWN, BarWindow
-from tb.features.pipeline import FeaturePipeline, FeatureSnapshot, pipeline_for
+from tb.features.pipeline import FeaturePipeline, FeatureSnapshot, Scorer, pipeline_for
 from tb.strategy.base import Action, Decision, PositionState, hold
 from tb.strategy.dsl.interpreter import evaluate
-from tb.strategy.dsl.schema import StrategySpec
+from tb.strategy.dsl.schema import SpecError, StrategySpec
 
 
-def pipeline_from_spec(spec: StrategySpec) -> FeaturePipeline:
+class LoadedModel(Scorer, Protocol):
+    """A model ready to score, with the features it must be fed."""
+
+    @property
+    def features(self) -> tuple[tuple[str, int], ...]:
+        """`(kind, lookback)` for each input, in the order the model reads them."""
+        ...
+
+
+class ModelSource(Protocol):
+    """Where a spec's model terms are resolved: in practice the model store.
+
+    A protocol so that this package — the interpretation path, which may not
+    touch a file — names what it needs without importing what provides it.
+    """
+
+    def scorer_for(self, model_id: str, *, artifact_sha256: str) -> LoadedModel:
+        """The recorded model, refused unless its bytes hash to `artifact_sha256`."""
+        ...
+
+
+def pipeline_from_spec(spec: StrategySpec, *, models: ModelSource | None = None) -> FeaturePipeline:
     """Build the pipeline this spec needs, from the spec itself.
 
     Not a default pipeline the spec is hoped to fit. A spec reading a feature
     the pipeline does not compute evaluates to `UNKNOWN` at every decision and
     is recorded as a strategy that found no opportunities — a false negative
     that looks exactly like a true one.
+
+    A spec that reads a model gets that model as a scorer, and the model's own
+    inputs as features, from `models` — refused without one rather than built
+    without the model, for the same reason.
     """
-    return pipeline_for(spec.feature_requests)
+    refs = spec.model_refs
+    if not refs:
+        return pipeline_for(spec.feature_requests)
+    if models is None:
+        raise SpecError(
+            f"spec {spec.name!r} reads model(s) {[ref.model_id for ref in refs]} and no model "
+            "store was given to load them. Built without them, every decision would be "
+            "UNKNOWN — a strategy that never trades, recorded as one that looked and declined."
+        )
+    requests = set(spec.feature_requests)
+    scorers: list[LoadedModel] = []
+    for ref in refs:
+        loaded = models.scorer_for(ref.model_id, artifact_sha256=ref.artifact_sha256)
+        requests |= set(loaded.features)
+        scorers.append(loaded)
+    return pipeline_for(sorted(requests), scorers=scorers)
 
 
 @dataclass(frozen=True, slots=True)

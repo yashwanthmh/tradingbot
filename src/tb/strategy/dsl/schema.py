@@ -148,7 +148,43 @@ class Constant(_Node):
         return self
 
 
-Term = Annotated[FeatureRef | Constant, Field(discriminator="kind")]
+class ModelScore(_Node):
+    """A recorded model's score: its probability that a trade here profits after costs.
+
+    The model is not run by the interpreter. It is a scorer inside the feature
+    pipeline, fed that pipeline's own features at the same instant, and its
+    output arrives in the snapshot under `model_id` like any other feature — so
+    this term is read exactly as a `FeatureRef` is, and a generated spec gains
+    no new capability by naming one.
+
+    **Pinned twice.** `model_id` finds the record; `artifact_sha256` is the
+    bytes the spec was trained, backtested and gated with. A store holding
+    anything else under that id is refused when the pipeline is built, because
+    an id alone would let a retrained model inherit a promotion it never
+    earned. The id is derived from the hash (`mdl_` and its first sixteen hex
+    digits), and a pair that disagrees is refused here, so one model cannot be
+    named with another's hash.
+    """
+
+    kind: Literal["model"] = "model"
+    model_id: str = Field(pattern=r"^mdl_[0-9a-f]{16}$")
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _check_id_is_the_hash(self) -> ModelScore:
+        if self.model_id != f"mdl_{self.artifact_sha256[:16]}":
+            raise ValueError(
+                f"model id {self.model_id} is not the one artifact {self.artifact_sha256[:16]}… "
+                "derives: a model is named by its own hash, never by another's"
+            )
+        return self
+
+    @property
+    def feature_key(self) -> str:
+        return self.model_id
+
+
+Term = Annotated[FeatureRef | Constant | ModelScore, Field(discriminator="kind")]
 
 
 # --------------------------------------------------------------------------
@@ -199,7 +235,7 @@ Not.model_rebuild()
 
 
 def _depth(node: object) -> int:
-    if isinstance(node, (Comparison, FeatureRef, Constant)):
+    if isinstance(node, (Comparison, FeatureRef, Constant, ModelScore)):
         return 1
     if isinstance(node, Not):
         return 1 + _depth(node.operand)
@@ -211,7 +247,7 @@ def _depth(node: object) -> int:
 def _count(node: object) -> int:
     if isinstance(node, Comparison):
         return 3  # itself plus two terms
-    if isinstance(node, (FeatureRef, Constant)):
+    if isinstance(node, (FeatureRef, Constant, ModelScore)):
         return 1
     if isinstance(node, Not):
         return 1 + _count(node.operand)
@@ -220,10 +256,25 @@ def _count(node: object) -> int:
     return 1
 
 
+def _models_in(node: object) -> set[ModelScore]:
+    if isinstance(node, ModelScore):
+        return {node}
+    if isinstance(node, Comparison):
+        return _models_in(node.left) | _models_in(node.right)
+    if isinstance(node, Not):
+        return _models_in(node.operand)
+    if isinstance(node, (All, Any_)):
+        found: set[ModelScore] = set()
+        for operand in node.operands:
+            found |= _models_in(operand)
+        return found
+    return set()
+
+
 def _features_in(node: object) -> set[tuple[str, int]]:
     if isinstance(node, FeatureRef):
         return {(node.name, node.lookback)}
-    if isinstance(node, Constant):
+    if isinstance(node, (Constant, ModelScore)):
         return set()
     if isinstance(node, Comparison):
         return _features_in(node.left) | _features_in(node.right)
@@ -284,17 +335,35 @@ class StrategySpec(_Node):
 
     @property
     def required_features(self) -> tuple[str, ...]:
-        """Feature keys this spec reads, as the pipeline names them."""
+        """Snapshot keys this spec reads, as the pipeline names them: its
+        features and the scores of any models it reads."""
         pairs = _features_in(self.entry) | _features_in(self.exit)
-        return tuple(sorted(f"{name}_{lookback}" for name, lookback in pairs))
+        keys = {f"{name}_{lookback}" for name, lookback in pairs}
+        keys |= {model.feature_key for model in self.model_refs}
+        return tuple(sorted(keys))
 
     @property
     def feature_requests(self) -> tuple[tuple[str, int], ...]:
-        """`(kind, lookback)` pairs, for building the pipeline this spec needs."""
+        """`(kind, lookback)` pairs this spec reads directly.
+
+        Not the whole pipeline when the spec reads a model: the model's own
+        inputs are on its record, and `pipeline_from_spec` adds them.
+        """
         return tuple(sorted(_features_in(self.entry) | _features_in(self.exit)))
 
     @property
+    def model_refs(self) -> tuple[ModelScore, ...]:
+        """The models this spec reads, each once, pinned by artifact hash."""
+        found = _models_in(self.entry) | _models_in(self.exit)
+        return tuple(sorted(found, key=lambda model: model.model_id))
+
+    @property
     def max_lookback(self) -> int:
+        """The longest lookback among the features this spec reads directly.
+
+        A spec reading a model needs its model's inputs too, which only the
+        built pipeline knows; its `max_lookback` is the one to size a warm-up by.
+        """
         requests = self.feature_requests
         return max((lookback for _, lookback in requests), default=0)
 

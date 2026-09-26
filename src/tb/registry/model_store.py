@@ -55,7 +55,7 @@ from tb.ledger.chain import compute_chain_hash, compute_payload_hash
 from tb.ledger.events import Actor, EventType, ModelRecordedPayload
 from tb.ledger.store import Ledger
 from tb.strategy.ml.dataset import Dataset
-from tb.strategy.ml.model import MODEL_KIND, ModelError, ModelParams, TrainedModel
+from tb.strategy.ml.model import MODEL_KIND, ModelError, ModelParams, ModelScorer, TrainedModel
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ARTIFACT_SUFFIX = ".txt"
@@ -290,17 +290,38 @@ class ModelStore:
         name. The format is not a pickle, so parsing runs no code — but a
         tampered model is refused for being tampered, not for failing to parse.
         """
+        record = self._require(model_id)
+        self._check_event(record)
+        data = self._read(record)
+        return TrainedModel.from_artifact(data.decode("utf-8"), feature_names=record.feature_names)
+
+    def scorer_for(self, model_id: str, *, artifact_sha256: str) -> ModelScorer:
+        """The recorded model as a pipeline scorer, if it is the one pinned.
+
+        The pin is compared before anything is loaded. A spec is trained,
+        backtested and gated against one artifact; a store that now holds a
+        different one under the same id would hand the loop a model none of
+        that evidence was produced with.
+        """
+        record = self._require(model_id)
+        if record.artifact_sha256 != artifact_sha256:
+            raise ModelError(
+                f"the spec pins {model_id} to artifact {artifact_sha256}, but the store "
+                f"records {record.artifact_sha256}. A strategy trades only the model its "
+                "evidence was produced with."
+            )
+        return ModelScorer(name=model_id, features=record.features, model=self.load(model_id))
+
+    # -- internals ---------------------------------------------------------
+
+    def _require(self, model_id: str) -> ModelRecord:
         record = self.get(model_id)
         if record is None:
             raise ModelError(
                 f"{model_id} is not in the model store. A model exists when the ledger "
                 "records it; a file in the directory is not a model."
             )
-        self._check_event(record)
-        data = self._read(record)
-        return TrainedModel.from_artifact(data.decode("utf-8"), feature_names=record.feature_names)
-
-    # -- internals ---------------------------------------------------------
+        return record
 
     def _path(self, sha: str) -> Path:
         # Built from the hash rather than read from the row: the row's
@@ -378,15 +399,23 @@ class ModelStore:
                 "its stored values. Run `tb ledger verify`: the chain has been edited."
             )
         payload = json.loads(payload_json)
+        # The features too, not only the hash: they decide what the model is
+        # fed, and a row edited to a longer lookback under the same column
+        # names would feed a faithful artifact a different question.
+        recorded_features = tuple(
+            (str(item.get("kind")), item.get("lookback")) for item in payload.get("features", ())
+        )
         if (
             payload.get("model_id") != record.model_id
             or payload.get("artifact_sha256") != record.artifact_sha256
             or tuple(payload.get("feature_names", ())) != record.feature_names
+            or recorded_features != record.features
         ):
             raise ModelError(
                 f"{record.model_id}'s catalog row disagrees with the event that recorded it "
-                f"(seq {row['seq']}): the row names artifact {record.artifact_sha256}, the "
-                f"event {payload.get('artifact_sha256')}. The event is the fact."
+                f"(seq {row['seq']}): the row names artifact {record.artifact_sha256} fed "
+                f"{list(record.features)}, the event {payload.get('artifact_sha256')} fed "
+                f"{list(recorded_features)}. The event is the fact."
             )
 
 

@@ -39,12 +39,13 @@ lookback, and asking for a window shorter than the declared lookback returns
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, localcontext
 from itertools import pairwise
-from typing import TypeAlias
+from typing import Protocol, TypeAlias
 
 from tb.core.canonical import hash_payload
 from tb.core.errors import TbError
@@ -279,7 +280,31 @@ def make_spec(kind: str, lookback: int, *, name: str | None = None) -> FeatureSp
     return FeatureSpec(name=name or f"{kind}_{lookback}", lookback=lookback, compute=compute)
 
 
-def pipeline_for(requests: Iterable[tuple[str, int]]) -> FeaturePipeline:
+class Scorer(Protocol):
+    """A value computed from other features at the same instant: a model's score.
+
+    Evaluated after every feature, from those features' values alone — no bars,
+    no window, no clock — so a scorer sees exactly what a strategy reading the
+    same features sees, and nothing a strategy could not. It is the only way a
+    model's output enters a snapshot, which is what keeps models inside the one
+    pipeline: the backtest, the loop and `tb replay` all get the score from the
+    same `compute` call, hashed with everything else in the snapshot.
+    """
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def inputs(self) -> tuple[str, ...]:
+        """Feature names, in the order `score` reads them."""
+        ...
+
+    def score(self, row: Sequence[float]) -> float: ...
+
+
+def pipeline_for(
+    requests: Iterable[tuple[str, int]], *, scorers: Sequence[Scorer] = ()
+) -> FeaturePipeline:
     """The pipeline computing `(kind, lookback)` features, under their canonical names.
 
     `kind_lookback`, as `make_spec` names them and as the DSL's feature keys
@@ -287,7 +312,10 @@ def pipeline_for(requests: Iterable[tuple[str, int]]) -> FeaturePipeline:
     the name a model was fitted under and the name the loop computes for it are
     the same string by construction rather than by two callers agreeing.
     """
-    return FeaturePipeline(specs=tuple(make_spec(kind, lookback) for kind, lookback in requests))
+    return FeaturePipeline(
+        specs=tuple(make_spec(kind, lookback) for kind, lookback in requests),
+        scorers=tuple(scorers),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -306,6 +334,9 @@ class FeaturePipeline:
 
     specs: tuple[FeatureSpec, ...]
     series: Series = Series.SPLIT_ADJUSTED
+    # Computed after `specs`, from their values. Scorers read features and
+    # never each other: a score of a score is a model nobody trained.
+    scorers: tuple[Scorer, ...] = ()
 
     @property
     def max_lookback(self) -> int:
@@ -313,17 +344,27 @@ class FeaturePipeline:
 
     @property
     def names(self) -> tuple[str, ...]:
-        return tuple(spec.name for spec in self.specs)
+        """Every key a snapshot from this pipeline holds: features, then scores."""
+        return (*(spec.name for spec in self.specs), *(scorer.name for scorer in self.scorers))
 
     def __post_init__(self) -> None:
         seen: set[str] = set()
-        for spec in self.specs:
-            if spec.name in seen:
+        for name in self.names:
+            if name in seen:
                 raise FeatureError(
-                    f"duplicate feature name {spec.name!r}. Two features under one name "
+                    f"duplicate feature name {name!r}. Two features under one name "
                     "would make a snapshot ambiguous and its hash meaningless."
                 )
-            seen.add(spec.name)
+            seen.add(name)
+        features = {spec.name for spec in self.specs}
+        for scorer in self.scorers:
+            missing = [name for name in scorer.inputs if name not in features]
+            if missing:
+                raise FeatureError(
+                    f"scorer {scorer.name!r} reads {missing}, which this pipeline does not "
+                    "compute as features. A score over a missing input would be UNKNOWN at "
+                    "every decision, which reads as a model that never found anything."
+                )
 
     def compute(
         self,
@@ -369,6 +410,9 @@ class FeaturePipeline:
                 values[spec.name] = UNKNOWN
                 continue
             values[spec.name] = self._round(spec.compute([close.value for close in window_closes]))
+
+        for scorer in self.scorers:
+            values[scorer.name] = self._score(scorer, values)
 
         return FeatureSnapshot(
             as_of=window.as_of,
@@ -443,6 +487,27 @@ class FeaturePipeline:
             return value
         quantum = Decimal(1).scaleb(-FEATURE_PLACES)
         return value.quantize(quantum)
+
+    def _score(self, scorer: Scorer, values: Mapping[str, FeatureValue]) -> FeatureValue:
+        """A scorer's value, `UNKNOWN` whenever any input is.
+
+        Not imputed: the model was never fitted on a guessed input (the dataset
+        drops such rows), so a score over one would be an answer to a question
+        it was never asked. A non-finite score is a broken model, not absence,
+        and raises rather than reading as a cautious one.
+        """
+        inputs = [values[name] for name in scorer.inputs]
+        row: list[float] = []
+        for value in inputs:
+            if not isinstance(value, Decimal):
+                return UNKNOWN
+            row.append(float(value))
+        result = scorer.score(row)
+        if not math.isfinite(result):
+            raise FeatureError(f"scorer {scorer.name!r} returned {result} for {row}")
+        # Through the float's exact binary value, then the same rounding as
+        # every feature: the hash must not depend on how a float prints.
+        return self._round(Decimal(result))
 
     def _hash(
         self,
