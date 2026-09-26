@@ -439,24 +439,40 @@ class FeaturePipeline:
         instrument_uid: str,
         values: Mapping[str, FeatureValue],
     ) -> str:
-        """Hash over the canonical form, with `UNKNOWN` as an explicit marker.
-
-        `UNKNOWN` hashes as the string "UNKNOWN" rather than as null: a feature
-        that was absent and a feature that was omitted are different facts, and
-        a snapshot hash that conflated them would match across two genuinely
-        different decisions.
-        """
-        return hash_payload(
-            {
-                "as_of": as_of,
-                "instrument_uid": instrument_uid,
-                "series": self.series.value,
-                "features": {
-                    name: "UNKNOWN" if value is UNKNOWN else value
-                    for name, value in sorted(values.items())
-                },
-            }
+        return snapshot_hash(
+            as_of=as_of, instrument_uid=instrument_uid, series=self.series, values=values
         )
+
+
+def snapshot_hash(
+    *,
+    as_of: datetime,
+    instrument_uid: str,
+    series: Series,
+    values: Mapping[str, FeatureValue],
+) -> str:
+    """Hash over the canonical form, with `UNKNOWN` as an explicit marker.
+
+    `UNKNOWN` hashes as the string "UNKNOWN" rather than as null: a feature
+    that was absent and a feature that was omitted are different facts, and a
+    snapshot hash that conflated them would match across two genuinely
+    different decisions.
+
+    A module function rather than only a method, so `tb replay` recomputes the
+    hash from a decision's recorded features with the same code that produced
+    it, rather than with a second copy that could drift.
+    """
+    return hash_payload(
+        {
+            "as_of": as_of,
+            "instrument_uid": instrument_uid,
+            "series": series.value,
+            "features": {
+                name: "UNKNOWN" if value is UNKNOWN else value
+                for name, value in sorted(values.items())
+            },
+        }
+    )
 
 
 def default_pipeline() -> FeaturePipeline:

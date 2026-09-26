@@ -103,7 +103,7 @@ run, on which feature snapshot, cleared by which gate evaluation, allowed by whi
 with which observed values against which limits, filled at what price with which fees.
 
 ```bash
-tb replay --fill <fill_id>     # reconstruct the entire decision from the ledger
+tb replay --fill <fill_id>     # reconstruct the entire decision from the ledger, and check it
 ```
 
 Every broker response is archived raw as well, including failures. For a beta

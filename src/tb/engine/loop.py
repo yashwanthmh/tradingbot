@@ -64,6 +64,7 @@ over it.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -1380,7 +1381,10 @@ class TradingLoop:
                     decision.as_of.isoformat(),
                     self.resolution,
                     decision.feature_snapshot_hash,
-                    repr({k: str(v) for k, v in snapshot.values.items()}),
+                    # JSON, as the column says. It was a Python repr, which
+                    # nothing can read back without an eval — and an eval of
+                    # anything is the one thing this codebase never does.
+                    json.dumps({k: str(v) for k, v in snapshot.values.items()}, sort_keys=True),
                     decision.action.value,
                     float(decision.expected_edge_bps),
                     decision.rationale,

@@ -563,3 +563,141 @@ def _report(results: tuple[object, ...]) -> None:
         f"\n{OK} {len(results)} cycle(s), {total_orders} order(s). "
         "`tb reconcile` checks the three axes agree; `tb ledger verify` checks the chain."
     )
+
+
+def replay(
+    fill: Annotated[
+        str, typer.Option("--fill", help="The fill to explain, as settlement recorded it.")
+    ],
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """Explain one fill from the ledger alone, and check the chain behind it.
+
+    The fill, the order intent, the decision and the features it saw, every
+    risk rule's verdict, the spec, the search trials, the holdout and the
+    promotion behind it, and the round trip it closed. Each link that can be
+    checked is: the hash chain, the feature hash, the spec hash, the spec
+    reaching the recorded action again on the recorded features, and no
+    blocking risk failure.
+
+    Exits 1 when a check fails, 2 when the fill is not in the ledger.
+    """
+    from tb.engine.replay import ReplayError, replay_fill
+
+    pinned = _load(limits)
+    with _ledger(db, pinned) as ledger:
+        try:
+            replayed = replay_fill(ledger, fill)
+        except ReplayError as exc:
+            err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+            raise typer.Exit(2) from exc
+
+    row = replayed.fill
+    console.print(
+        f"[bold]fill[/bold] {row['fill_id']}  {row['t212_ticker']} {row['side']} "
+        f"{row['quantity']} @ {row['price'] or 'unpriced'} on {row['filled_at'] or '-'}  "
+        f"({row['source']}, {'admissible' if row['admissible_for_pnl'] else 'not admissible'} "
+        "for P&L)"
+    )
+    if row["fees_json"]:
+        console.print(f"  charges {escape(str(row['fees_json']))}")
+
+    intent = replayed.intent
+    if intent is None:
+        console.print(
+            f"  {WARN} no order intent: history reported an order this ledger never placed"
+        )
+    else:
+        stop = f" stop {intent['stop_price']}" if intent["stop_price"] else ""
+        console.print(
+            f"[bold]intent[/bold] {intent['intent_id']}  {intent['purpose']} "
+            f"{intent['order_type']} {intent['side']} {intent['quantity']}{stop}, "
+            f"{intent['state']}; broker order {intent['broker_order_id'] or '-'}"
+        )
+
+    decision = replayed.decision
+    if intent is not None and decision is None:
+        console.print(f"  {WARN} no decision: a {intent['purpose']} answers none")
+    if decision is not None:
+        console.print(
+            f"[bold]decision[/bold] {decision['decision_id']}  "
+            f"{decision['strategy_id']}@v{decision['strategy_version']} "
+            f"{decision['action']} at {decision['as_of_utc']}, declared edge "
+            f"{decision['expected_edge_bps']}bps, regime {decision['regime_state']} "
+            f"x{decision['regime_exposure_factor']}"
+        )
+        console.print(f"  {escape(str(decision['rationale'] or ''))}", soft_wrap=True)
+        features = "  ".join(f"{name}={value}" for name, value in sorted(replayed.features.items()))
+        console.print(f"  features  {escape(features)}", soft_wrap=True)
+
+    if replayed.verdicts:
+        table = Table(title="risk", show_header=True, box=None, padding=(0, 2, 0, 0))
+        table.add_column("rule")
+        table.add_column("verdict")
+        table.add_column("observed", justify="right")
+        table.add_column("limit", justify="right")
+        for verdict in replayed.verdicts:
+            table.add_row(
+                str(verdict["rule_name"]),
+                str(verdict["verdict"]),
+                str(verdict["observed_value"] or ""),
+                str(verdict["limit_value"] or ""),
+            )
+        console.print(table)
+
+    spec = replayed.spec
+    if decision is not None and spec is None:
+        console.print(
+            f"  {WARN} {decision['strategy_id']} is not a registered spec (the drill "
+            "strategy is built in), so there is no search, holdout or gate behind it"
+        )
+    if spec is not None:
+        console.print(
+            f"[bold]spec[/bold] {spec['strategy_id']}@v{spec['version']}  lineage "
+            f"{spec['lineage_id']}, {spec['author_kind']}-authored, registered "
+            f"{spec['registered_at']}"
+        )
+        console.print(f"  {escape(str(spec['spec_json']))}", soft_wrap=True)
+        searches = sorted({str(trial["search_id"]) for trial in replayed.trials})
+        console.print(
+            f"  {len(replayed.trials)} trial(s) of this spec, in "
+            f"{', '.join(searches) if searches else 'no recorded search'}"
+        )
+        holdout = replayed.holdout
+        console.print(
+            "  holdout "
+            + (
+                "never evaluated"
+                if holdout is None
+                else f"{'passed' if holdout['passed'] else 'failed'} on {holdout['vintage_id']}: "
+                f"{holdout['n_trades']} trades, net Sharpe {holdout['net_sharpe']}"
+            )
+        )
+        promotion = replayed.promotion
+        console.print(
+            "  gate "
+            + (
+                "never run"
+                if promotion is None
+                else f"{promotion['decision']} ({promotion['n_failed']} of {promotion['n_gates']} "
+                f"failed), deflated Sharpe {promotion['deflated_sharpe']}, "
+                f"at {promotion['decided_at']}"
+            )
+        )
+
+    trip = replayed.round_trip
+    if trip is not None:
+        owner = f"charged to {trip['strategy_id']}" if trip["charged"] else "charged to nobody"
+        console.print(
+            f"[bold]round trip[/bold] closed {trip['quantity']} at {trip['exit_price']} against "
+            f"a basis of {trip['cost_basis']}: {trip['pnl_ccy']}, {owner}"
+        )
+
+    console.print("")
+    for check in replayed.checks:
+        console.print(
+            f"{OK if check.ok else BAD} {check.name}: {escape(check.detail)}", soft_wrap=True
+        )
+    if not replayed.ok:
+        raise typer.Exit(1)

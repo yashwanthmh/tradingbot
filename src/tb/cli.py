@@ -69,11 +69,16 @@ app.add_typer(backtest_app, name="backtest")
 # commands rather than a group, because they are two processes: the watchdog
 # exists to catch a wedged trader, and a wedged process cannot supervise
 # itself.
+from tb.cli_engine import replay as _replay_command  # noqa: E402
 from tb.cli_engine import run as _run_command  # noqa: E402
 from tb.cli_engine import watchdog as _watchdog_command  # noqa: E402
 
 app.command("run")(_run_command)
 app.command("watchdog")(_watchdog_command)
+# Read-only, and top-level for the same reason as `tb reconcile`: it answers a
+# question about the whole system ("why did it buy that") rather than about one
+# subsystem.
+app.command("replay")(_replay_command)
 
 # M5: the registry, the promotion gate and the allocator. `promote` is its own
 # group rather than a bare command because the gate has two useful verbs —
