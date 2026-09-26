@@ -182,6 +182,12 @@ class TradingLoop:
     # the day it started. A test, or `--strategy trivial`, passes nothing and
     # the book it was given stands.
     on_new_session: Callable[[datetime], Book | None] | None = None
+    # Asked every cycle, straight after the self-check: may this run still
+    # trade? A reason halts it. `tb run --mode live` passes the arming check
+    # (`tb.ops.arming.live_permit`), so a disarm, a lapse or a change of
+    # limits stops a real-money run at its next cycle rather than its next
+    # restart. Paper and demo runs pass nothing.
+    permit: Callable[[datetime], str | None] | None = None
     _cycle: int = field(default=0, init=False)
     _session: date | None = field(default=None, init=False)
 
@@ -315,6 +321,10 @@ class TradingLoop:
             self.self_check.assert_alive(at=at)
         except WatchdogError as exc:
             self._halt(f"self-check failed: {exc}")
+        if self.permit is not None:
+            refused = self.permit(at)
+            if refused is not None:
+                self._halt(refused)
 
         # 2. The lease. Renewed rather than re-acquired: a renew that fails
         #    means another instance took over, which is the two-instance state

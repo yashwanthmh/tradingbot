@@ -338,14 +338,20 @@ jobs:
           TB_VAR_DIR: var-m4
           T212_LIVE_API_KEY: "not-a-real-key-and-must-never-be-used"
         run: |
-          # `tb run --mode demo` passes require_demo=True, so a live key is
-          # refused before any network call. There is deliberately no live
-          # mode in this CLI at all — arming a real-money account is a
-          # reviewed change, not a flag.
-          if uv run tb run --mode live --cycles 1; then
-            echo "::error::tb run accepted a live mode that should not exist"
+          # `--mode live` refuses before any client exists: the shipped limits
+          # keep `live.enabled: false`, and even with it on the ledger must hold
+          # a current arming recorded by `tb arm --live` against evidence.
+          # Asserted by message, so the step fails if the refusal ever comes
+          # from somewhere other than the limits file.
+          if uv run tb run --mode live --cycles 1 2>&1 | grep -q "live trading is disabled"; then
+            echo "live mode refused: disabled in the shipped limits"
+          else
+            echo "::error::tb run --mode live was not refused by the limits file"
+            uv run tb run --mode live --cycles 1 2>&1 | tail -5
             exit 1
           fi
+          # `tb run --mode demo` passes require_demo=True, so a live key is
+          # refused before any network call.
           # Asserts the *credential* refusal specifically, not merely that
           # nothing traded. An earlier version of this step grepped for the
           # absence of "placed" and passed because `tb run` exited at the

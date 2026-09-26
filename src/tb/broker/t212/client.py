@@ -159,12 +159,17 @@ class T212Client:
         ledger: Ledger | None = None,
         run_id: str | None = None,
         require_demo: bool = False,
+        live_writes_armed: bool = False,
     ) -> T212Client:
         """Build a client from whichever key is in the environment.
 
         `require_demo` is passed by anything that must not be able to reach a
         real-money account regardless of what is set — the probe's default, and
         later the research and backtest paths.
+
+        `live_writes_armed` is passed by one caller only: `tb run --mode live`,
+        after the limits file enables live trading and the ledger holds a
+        current arming. It means nothing against the demo account.
         """
         report = inspect_secrets()
         if not report.usable:
@@ -195,6 +200,7 @@ class T212Client:
                 api_key=api_key,
                 base_url=base_url,
                 environment=report.environment.value,
+                live_writes_armed=live_writes_armed,
             ),
             transport=transport,
             governor=governor,
@@ -672,6 +678,13 @@ class T212Client:
             purpose=token.purpose,
             at=now_utc(),
         )
+        # Armed like a placement. Cancelling a protective stop on a real-money
+        # account raises its risk exactly as an entry does.
+        if self._config.environment == "live" and not self._config.live_writes_armed:
+            raise BrokerError(
+                "this client is connected to a real-money account and has not been armed "
+                "for writes; a cancel is a write, and cancelling a stop adds risk."
+            )
         try:
             self._request(
                 Endpoint.ORDER_CANCEL,

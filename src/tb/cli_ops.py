@@ -19,6 +19,10 @@
     tb drill watchdog               freeze the loop until the watchdog notices
     tb drill list                   every drill, and whether it passed
 
+    tb arm                          the evidence live trading needs, and the state
+    tb arm --live --strategy S      arm real money, once all of it is in the ledger
+    tb disarm --reason R            end an arming; a live run halts next cycle
+
 The streak `tb sessions` prints is the number `tb arm --live` will count,
 computed by the same function from the same ledger, so what an operator reads
 here is what the gate will see. The journal is the same record written down:
@@ -48,6 +52,14 @@ from tb.core.ids import new_run_id
 from tb.data.calendar import TradingCalendar
 from tb.ledger.anchor import GitAnchorSink, anchor_head
 from tb.ledger.store import Ledger, default_ledger_path
+from tb.ops.arming import (
+    ArmingError,
+    arm_live,
+    arming_state,
+    disarm,
+    live_evidence,
+    resolve_strategies,
+)
 from tb.ops.backup import (
     DEFAULT_DESTINATION,
     RECEIPT,
@@ -765,3 +777,122 @@ def drill_list(db: DbOpt = None) -> None:
             outcome,
         )
     console.print(table)
+
+
+# --------------------------------------------------------------------------
+# tb arm / tb disarm
+# --------------------------------------------------------------------------
+
+CONFIRMATION = "arm live"
+
+
+def _who() -> str:
+    return os.environ.get("USER") or f"uid:{os.getuid()}"
+
+
+def arm_command(
+    live: Annotated[
+        bool,
+        typer.Option("--live", help="Arm real-money trading. Without it, only report."),
+    ] = False,
+    strategies: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--strategy",
+            help="A promoted strategy to arm, as id or id@vN. Repeat for more, within the cap.",
+            show_default=False,
+        ),
+    ] = None,
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """The evidence live trading needs; with --live, arm it after confirmation.
+
+    Every requirement is read from the ledger: the clean demo streak and the
+    trades closed across it, both drills, a restore verified on another
+    machine, an intact chain, and the limits file's own `live.enabled`.
+    Arming asks you to type the phrase it names, and lapses on its own.
+    """
+    pinned = _load(limits)
+    live_limits = pinned.limits.live
+    with _ledger(db, writer=pinned if live else None) as ledger:
+        evidence = live_evidence(ledger, limits=pinned.limits)
+        state = arming_state(ledger, config_hash=pinned.config_hash)
+
+        table = Table("requirement", "observed", "required", "", title="live trading needs")
+        for requirement in evidence.requirements:
+            table.add_row(
+                requirement.name,
+                escape(requirement.observed),
+                escape(requirement.required),
+                OK if requirement.met else BAD,
+            )
+        console.print(table)
+        for note in evidence.notes:
+            console.print(f"{WARN} {escape(note)}", soft_wrap=True)
+        if state.arming is not None:
+            console.print(
+                f"{OK} armed: {', '.join(state.arming.strategies)}, {escape(state.reason)} "
+                f"(arming {state.arming.arming_id} by {state.arming.armed_by})"
+            )
+        else:
+            console.print(f"{WARN} not armed: {escape(state.reason)}", soft_wrap=True)
+
+        if not live:
+            if not evidence.ready:
+                raise typer.Exit(1)
+            return
+
+        if not evidence.ready:
+            err_console.print(
+                f"\n{BAD} not armed: {len(evidence.unmet)} requirement(s) unmet.",
+                soft_wrap=True,
+            )
+            raise typer.Exit(1)
+        try:
+            resolved = resolve_strategies(ledger, strategies or [], limits=pinned.limits)
+        except ArmingError as exc:
+            err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+            raise typer.Exit(2) from exc
+
+        capital = pinned.limits.capital
+        console.print(
+            f"\n[bold]Real money.[/bold] Trading 212 live, with {', '.join(resolved)} at no "
+            f"rung above {live_limits.max_rung} (floor {capital.floor_notional_ccy} "
+            f"{pinned.limits.currency} a position), never more than "
+            f"{capital.absolute_ceiling_ccy} {pinned.limits.currency} in all, for "
+            f"{live_limits.arming_valid_days} day(s) unless disarmed sooner. Every other "
+            "limit in the file still binds."
+        )
+        typed = typer.prompt(f"Type '{CONFIRMATION}' to arm, anything else to stop")
+        if typed.strip() != CONFIRMATION:
+            console.print(f"{WARN} not armed.")
+            raise typer.Exit(1)
+        try:
+            arming = arm_live(ledger, pinned=pinned, strategies=resolved, armed_by=_who())
+        except ArmingError as exc:
+            err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+            raise typer.Exit(1) from exc
+    console.print(
+        f"{OK} armed {', '.join(arming.strategies)} until "
+        f"{arming.expires_at:%Y-%m-%d %H:%M} UTC (arming {arming.arming_id}). Start it with "
+        "`tb run --mode live --cycles 0` beside `tb watchdog`; `tb disarm` ends it."
+    )
+
+
+def disarm_command(
+    reason: Annotated[str, typer.Option("--reason", "-r", help="Why live trading stops.")],
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """End the live arming. A running live loop halts at its next cycle."""
+    pinned = _load(limits)
+    with _ledger(db, writer=pinned) as ledger:
+        ended = disarm(ledger, disarmed_by=_who(), reason=reason)
+    if ended is None:
+        console.print(f"{OK} nothing was armed; the disarm is recorded anyway.")
+    else:
+        console.print(
+            f"{OK} disarmed {ended}. A running live loop halts at its next cycle; its stops "
+            "stay at the broker."
+        )

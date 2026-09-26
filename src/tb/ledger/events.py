@@ -235,6 +235,10 @@ class EventType(StrEnum):
     # hours, and what was seen at the broker before and after.
     DRILL_STARTED = "drill.started"
     DRILL_COMPLETED = "drill.completed"
+    # Real money: armed by a person against recorded evidence, for named
+    # strategies, until a stated time; and disarmed.
+    LIVE_ARMED = "live.armed"
+    LIVE_DISARMED = "live.disarmed"
 
 
 class EventPayload(BaseModel):
@@ -1540,6 +1544,32 @@ class DrillCompletedPayload(EventPayload):
     holdings_after: list[dict[str, str]] = Field(default_factory=list)
 
 
+class LiveArmedPayload(EventPayload):
+    """A person armed real-money trading, and everything they armed it on.
+
+    The evidence is copied onto the event rather than referenced: "the streak
+    was thirty sessions when this was armed" must stay true after the next
+    session breaks it. `config_hash` is the limits the arming was judged
+    under; a run under any other limits is not armed.
+    """
+
+    arming_id: str
+    strategies: list[str]
+    expires_at: str
+    config_hash: str
+    max_rung: int
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    armed_by: str
+    host: str
+    code_git_sha: str | None = None
+
+
+class LiveDisarmedPayload(EventPayload):
+    arming_id: str | None = None
+    disarmed_by: str
+    reason: str
+
+
 # --------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------
@@ -1623,6 +1653,8 @@ EVENT_PAYLOADS: dict[EventType, type[EventPayload]] = {
     EventType.BACKUP_RESTORE_VERIFIED: BackupRestoreVerifiedPayload,
     EventType.DRILL_STARTED: DrillStartedPayload,
     EventType.DRILL_COMPLETED: DrillCompletedPayload,
+    EventType.LIVE_ARMED: LiveArmedPayload,
+    EventType.LIVE_DISARMED: LiveDisarmedPayload,
 }
 
 # The default aggregate each event type is filed under, so callers do not have
@@ -1723,6 +1755,8 @@ EVENT_AGGREGATES: dict[EventType, AggregateType] = {
     EventType.BACKUP_RESTORE_VERIFIED: AggregateType.LEDGER,
     EventType.DRILL_STARTED: AggregateType.SAFETY,
     EventType.DRILL_COMPLETED: AggregateType.SAFETY,
+    EventType.LIVE_ARMED: AggregateType.SAFETY,
+    EventType.LIVE_DISARMED: AggregateType.SAFETY,
 }
 
 

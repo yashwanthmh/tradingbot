@@ -754,6 +754,14 @@ _SAFETY_LINES: dict[EventType, Callable[[dict[str, Any]], str]] = {
             else "failed: " + "; ".join(str(f) for f in p.get("failures", []))
         )
     ),
+    EventType.LIVE_ARMED: lambda p: (
+        f"live trading armed by {p.get('armed_by')} for "
+        f"{', '.join(str(s) for s in p.get('strategies', []))} until {p.get('expires_at')} "
+        f"(arming {p.get('arming_id')})"
+    ),
+    EventType.LIVE_DISARMED: lambda p: (
+        f"live trading disarmed by {p.get('disarmed_by')}: {p.get('reason')}"
+    ),
 }
 
 _DATA_LINES: dict[EventType, Callable[[dict[str, Any]], str]] = {

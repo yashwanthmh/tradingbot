@@ -8,11 +8,16 @@ the appearance of supervision with none of it.
     tb watchdog          supervise a trader; engage the kill switch on a stall
     tb run --mode paper  the trading loop, against the simulated broker
     tb run --mode demo   the trading loop, against the Trading 212 demo account
+    tb run --mode live   real money, and only once a person has armed it
 
-There is deliberately no `--mode live`. Reaching a real-money account needs
-`live_writes_armed` on the client *and* the live key present, and neither is
-settable from this CLI — arming live trading should be a reviewed change, not
-a flag someone can pass at 2am.
+`--mode live` is not a switch someone can flip at 2am. It refuses unless the
+limits file enables live trading (a reviewed edit to a file the bot cannot
+write), the ledger holds a current arming recorded by `tb arm --live` against
+evidence — clean demo sessions, drills, a verified restore — under exactly
+the limits in force, and the only key present is `T212_LIVE_API_KEY`. It is
+the one place a client armed for real-money writes is built. The book is
+narrowed to the armed strategies at no rung above the cap, and the loop
+re-reads the arming every cycle, halting the moment it lapses or is disarmed.
 """
 
 from __future__ import annotations
@@ -49,6 +54,7 @@ from tb.engine.loop import LoopHalted, TradingLoop, build_instrument_map
 from tb.engine.orders import OrderSubmitter
 from tb.features.pipeline import FeaturePipeline
 from tb.ledger.store import Ledger, default_ledger_path
+from tb.ops.arming import Arming, arming_state, live_book, live_permit
 from tb.ops.state import StateMachine
 from tb.ops.watchdog import (
     WATCHDOG_STALE_SECONDS,
@@ -115,7 +121,11 @@ def run(
     bars: RootOpt = None,
     models: ModelsOpt = None,
     mode: Annotated[
-        str, typer.Option("--mode", help="paper (simulated broker) or demo (Trading 212).")
+        str,
+        typer.Option(
+            "--mode",
+            help="paper (simulated broker), demo (Trading 212 demo), or live (armed only).",
+        ),
     ] = "paper",
     cycles: Annotated[
         int, typer.Option("--cycles", help="Stop after this many cycles. 0 means forever.")
@@ -174,17 +184,26 @@ def run(
             soft_wrap=True,
         )
         raise typer.Exit(2)
-    if mode not in ("paper", "demo"):
+    if mode not in ("paper", "demo", "live"):
         err_console.print(
-            f"{BAD} unknown mode {mode!r}. Use paper (simulated broker) or demo "
-            "(Trading 212 demo account). There is no live mode here: arming a real-money "
-            "account is a reviewed change, not a CLI flag.",
+            f"{BAD} unknown mode {mode!r}. Use paper (simulated broker), demo (Trading 212 "
+            "demo account) or live (real money, once armed with `tb arm --live`).",
             soft_wrap=True,
         )
         raise typer.Exit(2)
+    if mode == "live":
+        _refuse_unsafe_live(pinned, strategy=strategy, no_watchdog=no_watchdog)
 
     run_id = new_run_id()
     with _ledger(db, pinned) as ledger:
+        arming: Arming | None = None
+        if mode == "live":
+            # Before any client exists: an unarmed live run never builds one.
+            state = arming_state(ledger, config_hash=pinned.config_hash)
+            if state.arming is None:
+                err_console.print(f"{BAD} {escape(state.reason)}", soft_wrap=True)
+                raise typer.Exit(2)
+            arming = state.arming
         # The broker first, and specifically before the universe check. That
         # ordering is deliberate: `_broker` is where a live key is refused,
         # and a live key present is a more serious condition than an empty
@@ -214,6 +233,25 @@ def run(
         # leaves no book behind.
         model_store = ModelStore(ledger, models or default_model_root(ledger.path))
         book = _book(ledger, pinned, strategy=strategy, broker=broker, models=model_store)
+        narrow: Callable[[Book], Book] | None = None
+        if arming is not None:
+            armed = arming
+
+            def narrow(candidate: Book) -> Book:
+                return live_book(
+                    candidate, armed, limits=pinned.limits, equity_ccy=candidate.equity_ccy
+                )
+
+            book = narrow(book)
+            if not book.funded:
+                for label, reason in book.excluded:
+                    err_console.print(f"{BAD} {escape(label)}: {escape(reason)}", soft_wrap=True)
+                err_console.print(
+                    f"{BAD} none of the armed strategies ({', '.join(armed.strategies)}) is "
+                    "funded now, so there is nothing to trade live.",
+                    soft_wrap=True,
+                )
+                raise typer.Exit(2)
 
         store = BarStore(
             ledger,
@@ -282,7 +320,11 @@ def run(
                         universe=universe,
                         run_id=run_id,
                         models=model_store,
+                        narrow=narrow,
                     )
+                ),
+                permit=(
+                    None if arming is None else live_permit(ledger, config_hash=pinned.config_hash)
                 ),
             )
             _price_paper_venue(broker, store=store, universe=universe, resolution=loop.resolution)
@@ -476,15 +518,52 @@ def _broker(mode: str, pinned: PinnedLimits, *, equity: Decimal) -> Broker:
 
     run_dir = Path(pinned.limits.safety.heartbeat_path).parent
     try:
-        return T212Client.from_env(
+        client = T212Client.from_env(
             governor=RateGovernor(state_path=run_dir / "ratelimit.json"),
-            # Refuses a live key outright. `tb run` never reaches a real-money
-            # account, whatever is in the environment.
-            require_demo=True,
+            # Demo refuses a live key outright. Live is the only caller that
+            # arms a client for real-money writes, and it is reached only
+            # after the limits file and a current arming have both said yes.
+            require_demo=mode != "live",
+            live_writes_armed=mode == "live",
         )
     except TbError as exc:
         err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
         raise typer.Exit(2) from exc
+    if mode == "live" and not client.is_real_money:
+        client.close()
+        err_console.print(
+            f"{BAD} --mode live needs T212_LIVE_API_KEY; the key present is for the demo "
+            "account. Which account an order reaches must never depend on a mode flag "
+            "disagreeing with a key.",
+            soft_wrap=True,
+        )
+        raise typer.Exit(2)
+    return client
+
+
+def _refuse_unsafe_live(pinned: PinnedLimits, *, strategy: str | None, no_watchdog: bool) -> None:
+    """The live refusals that need no ledger: the limits file, and two flags."""
+    if not pinned.limits.live.enabled:
+        err_console.print(
+            f"{BAD} live trading is disabled in {pinned.source_path}. Enabling it is a "
+            "reviewed change to that file — `live.enabled: true` — made by a person, "
+            "and `tb arm --live` still requires the evidence after that.",
+            soft_wrap=True,
+        )
+        raise typer.Exit(2)
+    if strategy is not None:
+        err_console.print(
+            f"{BAD} --strategy {strategy} is for drilling the loop on paper or demo. Live "
+            "trades only strategies the gate cleared and a person armed.",
+            soft_wrap=True,
+        )
+        raise typer.Exit(2)
+    if no_watchdog:
+        err_console.print(
+            f"{BAD} live never runs unsupervised: start `tb watchdog` and drop --no-watchdog.",
+            soft_wrap=True,
+        )
+        raise typer.Exit(2)
 
 
 def _session_refresh(
@@ -495,8 +574,12 @@ def _session_refresh(
     universe: dict[str, str],
     run_id: str,
     models: ModelSource,
+    narrow: Callable[[Book], Book] | None = None,
 ) -> Callable[[datetime], Book | None]:
     """The loop's once-a-session hook: the portfolio pass, then a fresh book.
+
+    `narrow` is applied to each fresh book before it is recorded or traded: a
+    live run's book is only ever what was armed, at the capped rung.
 
     The pass reviews, re-rungs and re-allocates (`tb.portfolio.session`); the
     book is then rebuilt from the registry, so a loop left running trades the
@@ -540,6 +623,8 @@ def _session_refresh(
             at=at,
             models=models,
         )
+        if narrow is not None:
+            book = narrow(book)
         record_book(ledger, book, run_id=run_id)
         return book
 
