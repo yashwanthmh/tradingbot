@@ -1,12 +1,18 @@
-"""`tb sessions` — the M8 operator's view of how the loop has been running.
+"""The M8 operator's commands: how the loop has been running, and its record.
 
-    tb sessions                  the recent demo sessions, and the clean streak
-    tb sessions --mode paper     the same for paper
+    tb sessions                     the recent demo sessions, and the clean streak
+    tb sessions --mode paper        the same for paper
     tb sessions --date 2026-09-25   one session in full: every fault and note
 
-The streak it prints is the number `tb arm --live` will count, computed by the
-same function from the same ledger, so what an operator reads here is what
-the gate will see.
+    tb journal write                the latest finished session's page
+    tb journal write --commit       ...committed to git with the chain head
+    tb journal verify               every page, regenerated and compared
+    tb journal show --date D        one page, printed rather than written
+
+The streak `tb sessions` prints is the number `tb arm --live` will count,
+computed by the same function from the same ledger, so what an operator reads
+here is what the gate will see. The journal is the same record written down:
+one page per session, reproducible byte for byte from the ledger it names.
 """
 
 from __future__ import annotations
@@ -23,8 +29,22 @@ from rich.markup import escape
 from rich.table import Table
 
 from tb.config.loader import PinnedLimits, load_hard_limits
+from tb.core.clock import now_utc
 from tb.core.errors import TbError
+from tb.data.calendar import TradingCalendar
+from tb.ledger.anchor import GitAnchorSink, anchor_head
 from tb.ledger.store import Ledger, default_ledger_path
+from tb.ops.journal import (
+    DEFAULT_DIR,
+    HEADS_FILE,
+    JournalError,
+    WriteOutcome,
+    ensure_pinned,
+    latest_final_session,
+    render_page,
+    verify_page,
+    write_page,
+)
 from tb.ops.sessions import TRADING_MODES, SessionHealth, SessionVerdict, read_sessions
 
 _WIDTH: int | None = None if sys.stdout.isatty() else int(os.environ.get("COLUMNS") or 120)
@@ -58,16 +78,27 @@ def _load(limits: Path | None) -> PinnedLimits:
         raise typer.Exit(2) from exc
 
 
-def _ledger(db: Path | None) -> Ledger:
-    """Read-only: a report has no business writing the record it reports on."""
+def _ledger(db: Path | None, *, writer: PinnedLimits | None = None) -> Ledger:
+    """Read-only unless a command must write: a report has no business writing
+    the record it reports on."""
     path = db or default_ledger_path()
     if not path.exists():
         err_console.print(f"{BAD} no ledger at {path}. Run `tb init` first.", soft_wrap=True)
         raise typer.Exit(2)
     try:
-        return Ledger(path, read_only=True).open()
+        if writer is None:
+            return Ledger(path, read_only=True).open()
+        return Ledger(path, config_hash=writer.config_hash).open()
     except TbError as exc:
         err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+        raise typer.Exit(2) from exc
+
+
+def _day(text: str, flag: str) -> date:
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        err_console.print(f"{BAD} {flag} wants YYYY-MM-DD, got {text!r}.", soft_wrap=True)
         raise typer.Exit(2) from exc
 
 
@@ -91,13 +122,7 @@ def sessions_command(
             f"{BAD} unknown mode {mode!r}; one of {', '.join(TRADING_MODES)}.", soft_wrap=True
         )
         raise typer.Exit(2)
-    wanted: date | None = None
-    if day is not None:
-        try:
-            wanted = date.fromisoformat(day)
-        except ValueError as exc:
-            err_console.print(f"{BAD} --date wants YYYY-MM-DD, got {day!r}.", soft_wrap=True)
-            raise typer.Exit(2) from exc
+    wanted = None if day is None else _day(day, "--date")
 
     pinned = _load(limits)
     live = pinned.limits.live
@@ -189,3 +214,190 @@ def _print_session(session: SessionHealth) -> None:
                 f"{escape(f'[{finding.kind}]')} {escape(finding.detail)}",
                 soft_wrap=True,
             )
+
+
+# --------------------------------------------------------------------------
+# tb journal
+# --------------------------------------------------------------------------
+
+journal_app = typer.Typer(
+    help="The daily journal: one markdown page per session, written from the ledger.",
+    no_args_is_help=True,
+)
+
+DirOpt = Annotated[Path, typer.Option("--dir", help="Where the pages are kept.")]
+
+_ACTION_MARK = {"written": OK, "rewritten": OK, "unchanged": OK, "refused": BAD}
+
+
+@journal_app.command("write")
+def journal_write(
+    day: Annotated[
+        str | None,
+        typer.Option("--date", help="The session to write (YYYY-MM-DD).", show_default=False),
+    ] = None,
+    since: Annotated[
+        str | None,
+        typer.Option(
+            "--since",
+            help="Write every session from this one to the latest finished (YYYY-MM-DD).",
+            show_default=False,
+        ),
+    ] = None,
+    directory: DirOpt = DEFAULT_DIR,
+    commit: Annotated[
+        bool,
+        typer.Option(
+            "--commit",
+            help="Commit the pages to git with the chain head, and record the anchor.",
+        ),
+    ] = False,
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """Write the latest finished session's page, or the sessions asked for.
+
+    Safe to schedule: a final page already written and still verified is left
+    alone, a provisional one is replaced, and one the ledger no longer produces
+    is never overwritten — that page is the evidence.
+    """
+    if day is not None and since is not None:
+        err_console.print(f"{BAD} --date and --since are exclusive.", soft_wrap=True)
+        raise typer.Exit(2)
+    pinned = _load(limits)
+    calendar = TradingCalendar()
+    moment = now_utc()
+    latest = latest_final_session(calendar, now=moment, limits=pinned.limits.live)
+    if day is not None:
+        days = [_day(day, "--date")]
+    elif latest is None:
+        err_console.print(f"{BAD} no session has finished yet to write a page for.", soft_wrap=True)
+        raise typer.Exit(2)
+    elif since is not None:
+        start = _day(since, "--since")
+        days = (
+            [s.day for s in calendar.sessions_between(start, latest.day)]
+            if start <= latest.day
+            else []
+        )
+        if not days:
+            console.print(f"{WARN} no finished session from {start} on to write.")
+    else:
+        days = [latest.day]
+
+    outcomes: list[WriteOutcome] = []
+    with _ledger(db, writer=pinned) as ledger:
+        if ensure_pinned(ledger, pinned):
+            console.print(
+                f"{OK} pinned the limits {pinned.config_hash[:12]} in the ledger, so the "
+                "pages judged by them can be checked against them later"
+            )
+        for session in days:
+            try:
+                page = render_page(
+                    ledger,
+                    session=session,
+                    limits=pinned.limits,
+                    limits_hash=pinned.config_hash,
+                    as_of=moment,
+                    calendar=calendar,
+                )
+            except JournalError as exc:
+                err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+                raise typer.Exit(2) from exc
+            outcome = write_page(ledger, page, directory=directory, calendar=calendar)
+            outcomes.append(outcome)
+            console.print(
+                f"{_ACTION_MARK[outcome.action]} {outcome.session} {outcome.action}: "
+                f"{outcome.path} ({escape(outcome.detail)})",
+                soft_wrap=True,
+            )
+
+        changed = [o.path for o in outcomes if o.action in ("written", "rewritten")]
+        if commit and changed:
+            names = ", ".join(o.session.isoformat() for o in outcomes if o.path in changed)
+            sink = GitAnchorSink(
+                directory / HEADS_FILE,
+                repo_root=directory,
+                also=changed,
+                message=f"journal: {names}",
+            )
+            try:
+                anchored = anchor_head(ledger, sink)
+            except (TbError, OSError) as exc:
+                err_console.print(
+                    f"{BAD} the pages are written but not committed: {escape(str(exc))}",
+                    soft_wrap=True,
+                )
+                raise typer.Exit(1) from exc
+            console.print(
+                f"{OK} committed {len(changed)} page(s) with the chain head at seq "
+                f"{anchored.seq}: {anchored.external_ref}. It is evidence once pushed."
+            )
+        elif commit:
+            console.print(f"{OK} nothing new to commit.")
+
+    if any(o.action == "refused" for o in outcomes):
+        raise typer.Exit(1)
+
+
+@journal_app.command("verify")
+def journal_verify(
+    pages: Annotated[
+        list[Path] | None,
+        typer.Argument(help="Pages to check. Default: every page in --dir.", show_default=False),
+    ] = None,
+    directory: DirOpt = DEFAULT_DIR,
+    db: DbOpt = None,
+) -> None:
+    """Regenerate each page from the ledger it names, and compare byte for byte."""
+    targets = list(pages or sorted(directory.glob("????-??-??.md")))
+    if not targets:
+        console.print(f"{WARN} no pages in {directory}.")
+        return
+    failed = 0
+    with _ledger(db) as ledger:
+        for target in targets:
+            try:
+                text = target.read_text(encoding="utf-8")
+            except OSError as exc:
+                failed += 1
+                console.print(f"{BAD} {target}: {escape(str(exc))}", soft_wrap=True)
+                continue
+            check = verify_page(ledger, text)
+            if check.ok and check.header is not None:
+                console.print(
+                    f"{OK} {target}: {check.header.status}, through seq {check.header.through_seq}"
+                )
+                continue
+            failed += 1
+            for problem in check.problems:
+                console.print(f"{BAD} {target}: {escape(problem)}", soft_wrap=True)
+    if failed:
+        console.print(f"\n{BAD} {failed} of {len(targets)} page(s) failed verification.")
+        raise typer.Exit(1)
+    console.print(f"\n{OK} {len(targets)} page(s) are what the ledger produces.")
+
+
+@journal_app.command("show")
+def journal_show(
+    day: Annotated[str, typer.Option("--date", help="The session to show (YYYY-MM-DD).")],
+    limits: LimitsOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """Print a session's page without writing it."""
+    session = _day(day, "--date")
+    pinned = _load(limits)
+    with _ledger(db) as ledger:
+        try:
+            page = render_page(
+                ledger,
+                session=session,
+                limits=pinned.limits,
+                limits_hash=pinned.config_hash,
+                as_of=now_utc(),
+            )
+        except JournalError as exc:
+            err_console.print(f"{BAD} {escape(str(exc))}", soft_wrap=True)
+            raise typer.Exit(2) from exc
+    typer.echo(page.text, nl=False)

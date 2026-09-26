@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import subprocess
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -107,6 +108,9 @@ class GitAnchorSink:
     Genuinely useful once the branch is pushed: the commit hash covers the
     anchor content, and rewriting it on a remote you do not control is not
     something the bot can do. Requires a git checkout with a usable identity.
+
+    `also` commits other files in the same commit — the journal's pages, so a
+    page and the head it was written from arrive on the remote together.
     """
 
     def __init__(
@@ -114,9 +118,13 @@ class GitAnchorSink:
         path: str | Path = "journal/chain-heads.jsonl",
         *,
         repo_root: str | Path = ".",
+        also: Sequence[str | Path] = (),
+        message: str | None = None,
     ) -> None:
         self.path = Path(path)
         self.repo_root = Path(repo_root)
+        self.also = tuple(Path(extra) for extra in also)
+        self.message = message
 
     @property
     def name(self) -> str:
@@ -145,7 +153,10 @@ class GitAnchorSink:
     def publish(self, *, seq: int, chain_hash: str, anchored_at: str) -> str | None:
         FileAnchorSink(self.path).publish(seq=seq, chain_hash=chain_hash, anchored_at=anchored_at)
 
-        added = self._git("add", "--", str(self.path))
+        # Absolute, so the paths mean the same thing whichever directory git
+        # is pointed at.
+        paths = [str(p.resolve()) for p in (self.path, *self.also)]
+        added = self._git("add", "--", *paths)
         if added.returncode != 0:
             raise LedgerError(f"git add failed while anchoring: {added.stderr.strip()}")
 
@@ -153,9 +164,9 @@ class GitAnchorSink:
             "commit",
             "--no-verify",
             "-m",
-            f"ledger: anchor chain head at seq={seq}",
+            self.message or f"ledger: anchor chain head at seq={seq}",
             "--",
-            str(self.path),
+            *paths,
         )
         if committed.returncode != 0:
             raise LedgerError(f"git commit failed while anchoring: {committed.stderr.strip()}")

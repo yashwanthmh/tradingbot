@@ -99,9 +99,10 @@ app.add_typer(ml_app, name="ml")
 
 # M8: operating it. Which sessions ran cleanly is the first question an
 # operator asks each morning and the one the live gate counts.
-from tb.cli_ops import sessions_command  # noqa: E402
+from tb.cli_ops import journal_app, sessions_command  # noqa: E402
 
 app.command("sessions")(sessions_command)
+app.add_typer(journal_app, name="journal")
 
 
 @app.command("reconcile")

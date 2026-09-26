@@ -481,6 +481,8 @@ class Ledger:
         end_seq: int | None = None,
         event_type: EventType | None = None,
         event_types: Collection[EventType] | None = None,
+        after_ts: str | None = None,
+        until_ts: str | None = None,
         batch_size: int = 1000,
     ) -> Iterator[sqlite3.Row]:
         """Stream events in sequence order.
@@ -488,13 +490,20 @@ class Ledger:
         Batched rather than `fetchall`, because verification has to walk a
         ledger that will eventually be far larger than memory. `event_types`
         narrows to several types in one ordered pass, for a reader that needs
-        how they interleave.
+        how they interleave. `after_ts` (exclusive) and `until_ts` (inclusive)
+        bound the recorded time, as canonical ISO text, which sorts as time does.
         """
         sql = "SELECT * FROM event_log WHERE seq >= ?"
         params: list[Any] = [start_seq]
         if end_seq is not None:
             sql += " AND seq <= ?"
             params.append(end_seq)
+        if after_ts is not None:
+            sql += " AND ts_utc > ?"
+            params.append(after_ts)
+        if until_ts is not None:
+            sql += " AND ts_utc <= ?"
+            params.append(until_ts)
         if event_type is not None:
             sql += " AND event_type = ?"
             params.append(event_type.value)

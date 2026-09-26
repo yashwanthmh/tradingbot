@@ -299,19 +299,68 @@ def read_sessions(
     mode: str,
     calendar: TradingCalendar | None = None,
     now: datetime | None = None,
+    through_seq: int | None = None,
 ) -> ModeRecord:
     """Every session of `mode` in the ledger, judged as of `now`."""
-    if mode not in TRADING_MODES:
-        raise ValueError(f"no such trading mode: {mode!r}; one of {', '.join(TRADING_MODES)}")
+    return read_all_sessions(
+        ledger,
+        limits=limits,
+        modes=(mode,),
+        calendar=calendar,
+        now=now,
+        through_seq=through_seq,
+    )[mode]
+
+
+def read_all_sessions(
+    ledger: Ledger,
+    *,
+    limits: LiveLimits,
+    modes: Sequence[str] = TRADING_MODES,
+    calendar: TradingCalendar | None = None,
+    now: datetime | None = None,
+    through_seq: int | None = None,
+) -> dict[str, ModeRecord]:
+    """Every session of each mode, from one pass over the ledger.
+
+    `through_seq` reads the ledger as it stood at that event and no later, so
+    a record computed from it can be computed again, identically, tomorrow.
+    """
+    unknown = [mode for mode in modes if mode not in TRADING_MODES]
+    if unknown:
+        raise ValueError(f"no such trading mode: {unknown[0]!r}; one of {', '.join(TRADING_MODES)}")
+    events = [_parse(row) for row in ledger.iter_events(end_seq=through_seq, event_types=_READ)]
+    runs = _runs(events)
     cal = calendar or TradingCalendar()
     moment = now or now_utc()
-    reach = timedelta(seconds=limits.session_max_cycle_gap_seconds)
-    # How long a run may be silent before it is presumed dead. Never shorter
-    # than the lease: until the lease lapses, the run may still hold it.
-    silence = max(reach, timedelta(seconds=LEASE_SECONDS))
+    return {
+        mode: _record(mode, events, runs, limits=limits, cal=cal, moment=moment) for mode in modes
+    }
 
-    events = [_parse(row) for row in ledger.iter_events(event_types=_READ)]
-    runs = _runs(events)
+
+def silence_bound(limits: LiveLimits) -> timedelta:
+    """How long a run may be silent before it is presumed dead.
+
+    Never shorter than the lease: until the lease lapses, the run may still
+    hold it. A session is judged once its close is this far behind.
+    """
+    return max(
+        timedelta(seconds=limits.session_max_cycle_gap_seconds),
+        timedelta(seconds=LEASE_SECONDS),
+    )
+
+
+def _record(
+    mode: str,
+    events: Sequence[_Event],
+    runs: dict[str, _Run],
+    *,
+    limits: LiveLimits,
+    cal: TradingCalendar,
+    moment: datetime,
+) -> ModeRecord:
+    reach = timedelta(seconds=limits.session_max_cycle_gap_seconds)
+    silence = silence_bound(limits)
     ordered = sorted(runs.values(), key=lambda r: (r.started_at, r.run_id))
 
     def owner(event: _Event) -> _Run | None:
