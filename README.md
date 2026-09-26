@@ -133,7 +133,7 @@ data*, then *can I reconcile broker state*, then *is there any edge after costs*
 | M5 | Registry, promotion gate, capital allocator | **done** |
 | M6 | Self-strategising search (LLM optional) | **done** |
 | M7 | ML signal layer — walk-forward, shuffled-label null, hash-pinned models | **done** |
-| M8 | Live at floor size, dashboard, daily journal | |
+| M8 | Session record, journal, alerts, backups, drills, live arming, dashboard | **done** — the evidence it asks for is [the operator's to collect](#what-remains-is-the-operators) |
 | M9 | RL — interface stub only, deferred deliberately | |
 
 ## Setup
@@ -341,8 +341,9 @@ tb research null-gate            # re-measure the false-promotion rate
 ```
 
 `paper_shadow_sessions` is 0, so a strategy that clears `tb promote evaluate`
-is funded at floor notional with no human approval. Four things carry that
-weight:
+is funded at floor notional with no human approval — on paper and demo. Real
+money waits for a person as well (see [Arming real money](#arming-real-money)).
+Four things carry that weight:
 
 **The gate runs every check and does not short-circuit.** "Refused by one check
 at 99% of its threshold" and "refused by six" call for opposite responses from
@@ -558,6 +559,146 @@ on top of them. LightGBM is the optional `ml` extra (`uv sync --extra ml`),
 imported only where a model is fitted or parsed; strategies that read no model
 trade without it.
 
+## Operating it
+
+Everything above decides *what* trades. This is how a person runs it from day to
+day, and what the ledger must show before any of it touches real money. It all
+reads the one ledger; nothing here keeps a second record of its own.
+
+A trading day is four processes side by side, each able to stop without taking
+the others with it:
+
+```bash
+tb watchdog                           # the other half of the dead-man switch
+tb run --mode demo                    # the loop, on the demo account
+tb alerts --follow --sink webhook     # what a person must act on, delivered once
+tb dashboard                          # the same record, in a browser
+```
+
+and after the close:
+
+```bash
+tb sessions                           # was today clean, and how long is the streak
+tb journal write --commit             # the day's page, committed with the chain head
+tb backup create                      # a verified copy of everything the ledger names
+```
+
+**A session is clean or it is not, and the ledger decides.** `tb sessions`
+judges each trading day once it is over, per mode: *clean* when the loop
+covered at least 90% of the regular session and nothing halted, crashed,
+drifted or left a position unprotected past its bound; *faulted* when something
+did; *incomplete* when the loop simply was not there enough. The live gate
+counts the streak with the same function from the same ledger, so the number an
+operator reads each morning is the number `tb arm` will count. A day with a
+passed drill is judged *drill*: neither clean nor a break.
+
+**The journal is the ledger written down, and checkable.** One markdown page per
+session under `journal/`: what ran, the orders, fills and stops, the trades
+closed, the safety events and the account. Each page names the sequence number
+and chain hash it was written from, so `tb journal verify` regenerates it byte
+for byte and names a page edited after the fact — or a ledger rewritten beneath
+one. `--commit` puts the pages and the chain head in git, which is the anchor
+across a trust boundary that a hash chain needs.
+
+**Alerts run out of process, read-only.** A notifier inside the trader would go
+quiet exactly when the trader wedged. `tb alerts --follow` reads from a saved
+cursor and delivers at least once (a webhook that is down gets the batch again
+next pass), counts a repeat instead of re-sending it, and on its first run
+starts from now: a year of history replayed would teach anyone to mute the
+channel. The webhook URL, usually a credential itself, is read from
+`TB_ALERT_WEBHOOK_URL` only and never printed.
+
+**The dashboard can stop trading and can do nothing else.** `tb dashboard`
+(the `api` extra) shows the status panel, the equity curve with the three
+breaker readings, the risk budget read the way each breaker reads it,
+per-strategy attribution within one account, the session record, a live event
+tail and the journal. Every view opens the ledger read-only. The one write is a
+kill switch button, which throws the switch and records a manual halt exactly
+as `tb halt` does; there is no release, so resuming stays `tb resume` at a
+terminal, with a reason. It listens on loopback. Setting `TB_DASHBOARD_TOKEN`
+(24 characters or more) turns the button on and makes every request need the
+token; without one the button is off, only loopback is served, and `tb
+dashboard` refuses to listen anywhere else. To watch from another machine,
+tunnel rather than bind: `ssh -L 8765:127.0.0.1:8765 this-host`. Ledger text —
+a ticker, a model's words on a proposal — reaches the page as text, never as
+markup, under a policy that runs no script but the page's own.
+
+**A backup is evidence once it has been restored somewhere else.**
+
+```bash
+tb backup create                          # ledger, bar files, models and limits, hashed
+tb backup verify var/backups/bkp_...      # every file, the chain, and the catalogues
+# copy the directory to another machine, and there:
+tb backup restore bkp_... --to /srv/tb    # refuses a non-empty target; replays recent fills
+# then, back where the backup was made:
+tb backup receipt restore-receipt.json    # the proof, recorded where the live gate reads it
+```
+
+A restore on the machine that made the backup proves the files are intact, not
+that the state survives losing that machine, so the gate does not count one.
+CI does the whole round trip across two runners on every push (`backup` →
+`restore-elsewhere` → `receipt-home`), and fails if they share a host name.
+
+**Drills fire the real mechanisms at a real loop.** Each runs against a demo
+loop that holds the lease, in market hours, with a position held and every
+position covered by a broker-side stop. A kill switch tested on a quiet evening
+proves that a file is read; one tested with a position open in a moving market
+proves that stopping the bot leaves what it holds protected.
+
+```bash
+tb drill killswitch     # engage the switch: the loop must halt, send nothing, keep every stop
+tb drill watchdog       # freeze the loop: the watchdog must notice and engage the switch
+tb drill list           # every drill, and whether it passed
+```
+
+Neither restarts trading. Each ends with the switch engaged and the loop
+stopped, and resuming is a person's call.
+
+### Arming real money
+
+Three things stand between this system and a real trade, and no one of them is
+enough on its own:
+
+1. **The limits file enables it.** `live.enabled` is `false` as shipped. The
+   file is read-only to the bot and hash-pinned, so turning it on is a person's
+   edit that every run records.
+2. **A person arms it, against evidence the ledger holds.** `tb arm` prints each
+   requirement, observed against required, and exits 1 while any is unmet:
+   thirty clean demo sessions in a row with at least five trades closed across
+   them; a passed kill-switch drill and a passed watchdog drill, each on demo, in
+   market hours, with a position held, within 30 days; a restore verified on
+   another machine within 90 days; a chain that verifies. `tb arm --live
+   --strategy S` says what will happen and arms only on the typed phrase
+   `arm live`. An arming names at most one promoted strategy, holds it to rung 0
+   — floor notional — lapses after seven days, and is bound to the limits hash
+   in force: change the limits and it no longer holds. `tb disarm --reason`
+   ends it at any time.
+3. **The live key, and only it.** `tb run --mode live` refuses without a
+   current arming under exactly these limits, with `--strategy` or
+   `--no-watchdog`, or with the demo key. While it runs it re-checks the arming
+   every cycle, so a lapse, a disarm or a change of limits halts it at the next
+   cycle, with its stops left at the broker.
+
+The thresholds are the `live:` section of `config/hard_limits.yaml`, beside
+every other number that gates money.
+
+### What remains is the operator's
+
+The M8 software is built and each property above is tested; what the plan's M8
+verification asks for is evidence that only a real demo account can produce. In
+order:
+
+1. Run the loop on demo — `tb watchdog`, `tb run --mode demo`, `tb alerts
+   --follow` — until `tb sessions` shows **thirty clean sessions in a row** with
+   at least five trades closed.
+2. In market hours, with a position open: **`tb drill killswitch`**, then
+   `tb resume`; **`tb drill watchdog`**, then `tb resume`.
+3. **Restore a backup on another machine** and bring the receipt home.
+4. `tb arm`: every row met except the limits file.
+5. Review, and set `live.enabled: true` in `config/hard_limits.yaml` yourself.
+6. `tb arm --live --strategy <one gate-cleared strategy>`, then `tb run --mode
+   live` with `T212_LIVE_API_KEY` alone in the environment.
+
 ## Risk and honest limitations
 
 - **The fee schedule beats most intraday ideas before they start.** See constraint 2 above.
@@ -567,12 +708,16 @@ trade without it.
   1-minute history and silently back-adjusts it, which breaks reproducibility and is itself
   a lookahead channel; Alpaca's free tier is IEX only, a few percent of consolidated volume.
   `tb data bakeoff` exists to make the "should I pay for data" decision on evidence.
-- **Promotion to live capital is autonomous.** A strategy clearing the gate goes live at
-  floor notional with no human approval. The gate is therefore the only thing between a
-  noise strategy and real money, which is why it carries a sealed holdout, deflated-Sharpe
-  accounting over the full trial count including rejections, and a release-gating test that
-  asserts a population of randomly generated strategies gets promoted at approximately zero
-  rate. Set `promotion.paper_shadow_sessions` above zero to reinstate a demo period first.
+- **Promotion is autonomous; real money is not.** A strategy clearing the gate is funded at
+  floor notional on the paper and demo books with no human approval, so the gate is the only
+  thing between a noise strategy and the demo account's capital. That is why it carries a
+  sealed holdout, deflated-Sharpe accounting over the full trial count including rejections,
+  and a release-gating test that asserts a population of randomly generated strategies gets
+  promoted at approximately zero rate. Real money needs more: the limits file's
+  `live.enabled`, thirty clean demo sessions, both drills, a restore on another machine, and
+  a person's `tb arm --live` naming the strategy, capped at floor size and lapsing weekly.
+  Set `promotion.paper_shadow_sessions` above zero to reinstate a demo period before a
+  promotion funds anything at all.
 - **The unprotected window is real.** With no bracket orders, an entry fill always precedes
   its protective stop. Position size is capped so a gap across that window is survivable
   inside the daily loss budget; the config validator refuses limits where it is not.

@@ -731,3 +731,308 @@ jobs:
           # the model that made it. Trained end to end through the CLI.
           set -o pipefail
           uv run pytest tests/test_ml_model.py tests/test_cli_ml.py tests/test_replay.py -q 2>&1 | tail -5
+
+      # ------------------------------------------------------------------
+      # M8: operating it
+      # ------------------------------------------------------------------
+
+      - name: An operating day runs end to end from the command line
+        run: |
+          # The commands an operator runs around a trading day, against a
+          # ledger of their own: the alert follower, a halt and a resume, the
+          # session record, the journal page written and verified, the live
+          # gate naming what is missing, and a backup verified, restored and
+          # its receipt brought home. Everything lives under m8/, including
+          # its kill switch: the limits are the shipped ones with only the
+          # runtime paths moved. Output goes to files before it is searched,
+          # so a reader that stops early cannot fail a pipeline for a reason
+          # unrelated to the claim.
+          set -euo pipefail
+          mkdir -p m8
+          sed "s#var/run/#m8/var/run/#" config/hard_limits.yaml > m8/limits.yaml
+          export TB_VAR_DIR=m8/var
+          LIM=(--limits m8/limits.yaml)
+          uv run tb init "${LIM[@]}" > /dev/null
+
+          # The follower starts from now; after that, a halt is news once.
+          uv run tb alerts "${LIM[@]}" > m8/first.txt
+          grep -q "history, not news" m8/first.txt
+          uv run tb halt -r "operating-day drill" "${LIM[@]}" > /dev/null
+          uv run tb alerts "${LIM[@]}" > m8/alerts.txt
+          grep -q "halt raised \[manual\]" m8/alerts.txt
+          grep -q "kill switch engaged" m8/alerts.txt
+          uv run tb alerts "${LIM[@]}" > m8/again.txt
+          grep -q "0 alert(s) delivered" m8/again.txt
+          uv run tb resume -r "drill complete" "${LIM[@]}" > /dev/null
+
+          # The session record, and the page written from it and verified.
+          uv run tb sessions "${LIM[@]}" > /dev/null
+          uv run tb journal write "${LIM[@]}" --dir m8/journal > /dev/null
+          uv run tb journal verify --dir m8/journal > /dev/null
+
+          # The live gate names every missing piece and refuses.
+          if uv run tb arm "${LIM[@]}" > m8/arm.txt 2>&1; then
+            echo "::error::tb arm reported ready on an empty ledger"; cat m8/arm.txt; exit 1
+          fi
+          for requirement in "live trading enabled in the limits file" \
+              "clean demo sessions in a row" "kill-switch drill passed" \
+              "watchdog drill passed" "a restore verified on another machine"; do
+            grep -q "$requirement" m8/arm.txt \
+              || { echo "::error::tb arm did not name: $requirement"; exit 1; }
+          done
+
+          # A backup, verified, restored, and its receipt brought home. This is
+          # one machine, so the gate must not count it; the restore-elsewhere
+          # jobs below do the same across two.
+          uv run tb backup create "${LIM[@]}" --to m8/backups > /dev/null
+          backup=$(ls -d m8/backups/bkp_*)
+          uv run tb backup verify "$backup" > /dev/null
+          uv run tb backup restore "$backup" --to m8/restored > /dev/null
+          uv run tb backup receipt m8/restored/restore-receipt.json "${LIM[@]}" > /dev/null
+          uv run tb backup list > m8/list.txt
+          grep -q "same host, so the live gate does not count it" m8/list.txt
+          uv run tb ledger verify "${LIM[@]}" > /dev/null
+          echo "an operating day ran end to end from the command line"
+
+      - name: The dashboard serves read-only views and a button that only engages
+        run: |
+          # The real server, not a test client: it must refuse to listen beyond
+          # loopback without a token, want the token for every view, refuse a
+          # Host it was not started for (DNS rebinding) and a cross-site
+          # request, offer no way to release the switch, and engage it — with
+          # the halt on the record — when asked properly. The token is made
+          # here, never printed, and must appear in nothing the server says.
+          set -euo pipefail
+          mkdir -p m8d
+          sed "s#var/run/#m8d/var/run/#" config/hard_limits.yaml > m8d/limits.yaml
+          export TB_VAR_DIR=m8d/var
+          LIM=(--limits m8d/limits.yaml)
+          uv run tb init "${LIM[@]}" > /dev/null
+
+          if env -u TB_DASHBOARD_TOKEN uv run tb dashboard "${LIM[@]}" --host 0.0.0.0 \
+              > m8d/refused.txt 2>&1; then
+            echo "::error::tb dashboard listened on every address without a token"; exit 1
+          fi
+          grep -q "needs TB_DASHBOARD_TOKEN" m8d/refused.txt
+
+          TB_DASHBOARD_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          export TB_DASHBOARD_TOKEN
+          # Through the environment's own entry point rather than `uv run`, so
+          # the PID is the server's and stopping it stops it.
+          .venv/bin/tb dashboard "${LIM[@]}" --port 8765 > m8d/server.txt 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            curl -fsS -o /dev/null http://127.0.0.1:8765/ 2>/dev/null && break
+            sleep 0.5
+          done
+          base=http://127.0.0.1:8765
+          auth=(-H "Authorization: Bearer $TB_DASHBOARD_TOKEN")
+          expect() {
+            local want=$1; shift
+            local got; got=$(curl -s -o /dev/null -w "%{http_code}" "$@")
+            [ "$got" = "$want" ] || { echo "::error::expected $want, got $got"; exit 1; }
+          }
+          expect 200 "$base/"
+          expect 401 "$base/api/status"
+          expect 200 "${auth[@]}" "$base/api/status"
+          expect 400 -H "Host: attacker.example" "$base/api/status"
+          expect 405 -X DELETE "${auth[@]}" "$base/api/killswitch"
+          expect 403 -X POST "${auth[@]}" -H "Origin: http://attacker.example" \
+            -H "Content-Type: application/json" -d '{"reason":"forged"}' "$base/api/killswitch"
+          curl -fsS "${auth[@]}" "$base/api/status" > m8d/before.json
+          grep -q '"kill_switch":{"state":"clear"' m8d/before.json
+
+          curl -fsS "${auth[@]}" -H "Content-Type: application/json" \
+            -d '{"reason":"CI drill of the button"}' "$base/api/killswitch" > m8d/engaged.json
+          grep -q '"recorded":true' m8d/engaged.json
+          test -f m8d/var/run/KILL
+          uv run tb status "${LIM[@]}" > m8d/status.txt 2>&1 || true
+          grep -q "kill switch is engaged" m8d/status.txt
+          curl -fsS "${auth[@]}" "$base/api/status" > m8d/after.json
+          grep -q '"state":"halted"' m8d/after.json
+
+          for said in m8d/server.txt m8d/before.json m8d/engaged.json m8d/after.json; do
+            if grep -qF "$TB_DASHBOARD_TOKEN" "$said"; then
+              echo "::error::the token appeared in $said"; exit 1
+            fi
+          done
+          echo "the dashboard served its views, refused what it should, and its button engaged the switch"
+
+      - name: Real money needs the limits file, the evidence and a person
+        run: |
+          # Switching `live.enabled` on is the one edit a person makes, and it
+          # must not be enough: on a ledger with no evidence, `tb arm --live`
+          # refuses even given the confirmation phrase, and `tb run --mode
+          # live` refuses for want of an arming before any client exists.
+          # The full matrix — every requirement, lapses, the rung cap, the
+          # per-cycle permit halting a running loop — is test_arming.py.
+          set -euo pipefail
+          mkdir -p m8l
+          uv run python - config/hard_limits.yaml m8l/limits.yaml <<'PY'
+          import sys
+
+          import yaml
+
+          limits = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+          limits["live"]["enabled"] = True
+          limits["safety"]["kill_switch_path"] = "m8l/var/run/KILL"
+          limits["safety"]["heartbeat_path"] = "m8l/var/run/heartbeat"
+          open(sys.argv[2], "w", encoding="utf-8").write(yaml.safe_dump(limits, sort_keys=True))
+          PY
+          export TB_VAR_DIR=m8l/var
+          LIM=(--limits m8l/limits.yaml)
+          uv run tb init "${LIM[@]}" > /dev/null
+          if printf 'arm live\n' | uv run tb arm --live --strategy anything "${LIM[@]}" \
+              > m8l/arm.txt 2>&1; then
+            echo "::error::tb arm --live armed on an empty ledger"; cat m8l/arm.txt; exit 1
+          fi
+          grep -q "requirement(s) unmet" m8l/arm.txt
+          if T212_LIVE_API_KEY=not-a-real-key uv run tb run --mode live --cycles 1 "${LIM[@]}" \
+              > m8l/run.txt 2>&1; then
+            echo "::error::tb run --mode live started with no arming"; cat m8l/run.txt; exit 1
+          fi
+          grep -q "never been armed" m8l/run.txt
+          uv run pytest tests/test_arming.py -q -p no:cacheprovider > m8l/pytest.txt 2>&1 \
+            || { cat m8l/pytest.txt; exit 1; }
+          tail -1 m8l/pytest.txt
+
+      - name: A drill proves a stopped loop leaves its positions protected
+        run: |
+          # The plan's "kill-switch and watchdog drills during market hours
+          # with open positions", against the real loop, the simulated broker
+          # and the real watchdog on one pinned clock: the switch halts the loop
+          # within a cycle and every stop stays at the broker; a frozen loop is
+          # noticed by the watchdog and thawed; a lost stop, a loop that never
+          # halts and an absent watchdog each fail the drill. On the demo
+          # account it is `tb drill killswitch` and `tb drill watchdog`.
+          set -o pipefail
+          uv run pytest tests/test_drills.py tests/test_sessions.py -q 2>&1 | tail -3
+
+  # M8's "restore-from-backup on a clean machine", on two machines. Every job
+  # here gets a fresh runner with its own host name, so the backup is made on
+  # one, restored on another that has never seen the ledger, and the receipt
+  # carried back must be counted by the live gate. A restore on the machine
+  # that made the backup proves the files are intact, not that the state
+  # survives losing that machine, and the gate does not count one.
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.11"
+
+      - name: Sync dependencies
+        run: uv sync --all-extras
+
+      - name: A backup is made where the ledger lives
+        env:
+          TB_VAR_DIR: m8/var
+        run: |
+          set -euo pipefail
+          mkdir -p m8
+          sed "s#var/run/#m8/var/run/#" config/hard_limits.yaml > m8/limits.yaml
+          uv run tb init --limits m8/limits.yaml
+          # Something on the record beyond the genesis, so the restored chain
+          # has a history to verify.
+          uv run tb halt -r "restore drill" --limits m8/limits.yaml
+          uv run tb resume -r "restore drill" --limits m8/limits.yaml
+          uv run tb backup create --limits m8/limits.yaml --to m8/backups
+          uv run tb backup verify m8/backups/bkp_*
+          hostname > m8/made-on
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m8-origin
+          path: m8/
+          retention-days: 1
+          if-no-files-found: error
+          # A re-run of this job must replace its own earlier upload.
+          overwrite: true
+
+  restore-elsewhere:
+    needs: backup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.11"
+
+      - name: Sync dependencies
+        run: uv sync --all-extras
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: m8-origin
+          path: m8/
+
+      - name: The backup restores on a machine that has never seen the ledger
+        run: |
+          set -euo pipefail
+          if [ "$(hostname)" = "$(cat m8/made-on)" ]; then
+            echo "::error::restored on the host that made the backup, which proves nothing here"
+            exit 1
+          fi
+          # Only the backup directory is read; the origin ledger is not opened.
+          uv run tb backup restore m8/backups/bkp_* --to restored
+          test -f restored/restore-receipt.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m8-receipt
+          path: restored/restore-receipt.json
+          retention-days: 1
+          if-no-files-found: error
+          # A re-run of this job must replace its own earlier upload.
+          overwrite: true
+
+  receipt-home:
+    needs: restore-elsewhere
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.11"
+
+      - name: Sync dependencies
+        run: uv sync --all-extras
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: m8-origin
+          path: m8/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: m8-receipt
+          path: receipt/
+
+      - name: The restore is counted where the live gate reads it
+        env:
+          TB_VAR_DIR: m8/var
+          # Wide enough that no table cell wraps a requirement away from its mark.
+          COLUMNS: "300"
+        run: |
+          set -euo pipefail
+          uv run tb backup receipt receipt/restore-receipt.json --limits m8/limits.yaml
+          uv run tb backup list > list.txt
+          cat list.txt
+          grep -q "on another machine" list.txt
+          # The gate reads it: of everything `tb arm` asks for, this is the one
+          # requirement a CI ledger can meet, and it must show as met.
+          uv run tb arm --limits m8/limits.yaml > arm.txt 2>&1 || true
+          grep "a restore verified on another machine" arm.txt > restore-row.txt
+          cat restore-row.txt
+          grep -q "✓" restore-row.txt
